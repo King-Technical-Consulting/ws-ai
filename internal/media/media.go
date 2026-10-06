@@ -8,8 +8,10 @@
 // job media.generate, so a gallery card survives a page reload and the
 // worker can fail over between endpoints like the text gateway does.
 //
-// Engines: OpenAI Images (hosted) now; ComfyUI (local), fal.ai and
-// Google's Imagen and Veo are planned behind the same interface.
+// Engines: OpenAI Images and OpenAI Videos (hosted), fal.ai (hosted, any
+// of its image and video models) and ComfyUI (local, a workflow template
+// per endpoint); Google's Imagen and Veo are planned behind the same
+// interface.
 package media
 
 import (
@@ -35,10 +37,13 @@ import (
 // Job kinds (media_jobs.kind).
 const (
 	KindImage   = "image"
-	KindVideo   = "video"
-	KindEdit    = "edit"    // planned: image plus prompt and mask
-	KindUpscale = "upscale" // planned
+	KindVideo   = "video"   // text to video, or image to video with a source
+	KindEdit    = "edit"    // a source image plus a prompt to a new image
+	KindUpscale = "upscale" // a source image to a larger one; the prompt is optional guidance
 )
+
+// MaxSourceBytes bounds a source image read for edit and image-to-video.
+const MaxSourceBytes = 32 << 20
 
 // Job statuses (media_jobs.status).
 const (
@@ -69,6 +74,10 @@ type Store interface {
 	FailMediaJob(ctx context.Context, arg store.FailMediaJobParams) error
 	CreateAttachment(ctx context.Context, arg store.CreateAttachmentParams) (store.Attachment, error)
 	ListAttachmentsByIDs(ctx context.Context, ids []uuid.UUID) ([]store.Attachment, error)
+	GetAttachment(ctx context.Context, id uuid.UUID) (store.Attachment, error)
+	// AttachmentMediaProjects lists the projects whose media jobs produced
+	// an attachment (a source image may be another job's output).
+	AttachmentMediaProjects(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
 }
 
 // Inputs is media_jobs.inputs: what the job was asked for. The prompt is
@@ -80,14 +89,21 @@ type Inputs struct {
 	N       int    `json:"n,omitempty"`       // images per job
 	Quality string `json:"quality,omitempty"` // engine-specific: low | medium | high for OpenAI
 	Seconds int    `json:"seconds,omitempty"` // video length
-	// SourceAttachmentID is the input image for edit, upscale and
-	// image-to-video jobs (planned).
-	SourceAttachmentID string  `json:"source_attachment_id,omitempty"`
-	EstimateUSD        float64 `json:"estimate_usd,omitempty"`
+	// SourceAttachmentID is the input image of an edit job or an
+	// image-to-video job: an attachment the user owns or one a media job in
+	// the project produced.
+	SourceAttachmentID string `json:"source_attachment_id,omitempty"`
+	// MaskAttachmentID, on an edit, is an image whose transparent (or
+	// white, engine-dependent) area marks where the edit applies.
+	MaskAttachmentID string `json:"mask_attachment_id,omitempty"`
+	// Scale, on an upscale, is the factor: 2 (default) or 4.
+	Scale       int     `json:"scale,omitempty"`
+	EstimateUSD float64 `json:"estimate_usd,omitempty"`
 }
 
 // Request is what an engine runs: the inputs plus the model name the
-// endpoint declared. Kind is image or video.
+// endpoint declared. Kind is image, edit or video; Source is set for edit
+// and for image-to-video.
 type Request struct {
 	Kind    string
 	Model   string
@@ -96,6 +112,13 @@ type Request struct {
 	N       int
 	Quality string
 	Seconds int
+	// Source is the input image (edit, upscale, image to video), read from
+	// the blob store by the service.
+	Source *Output
+	// Mask, on an edit, marks where the edit applies (nil: everywhere).
+	Mask *Output
+	// Scale is the upscale factor (2 or 4).
+	Scale int
 }
 
 // Output is one generated file.
@@ -149,9 +172,16 @@ type Service struct {
 	Now func() time.Time
 }
 
-// DefaultEngines returns the engines this build ships.
-func DefaultEngines() map[string]Engine {
-	return map[string]Engine{EngineOpenAIImages: &OpenAIImages{}}
+// DefaultEngines returns the engines this build ships. workflows is the
+// directory ComfyUI workflow templates are read from.
+func DefaultEngines(workflows string) map[string]Engine {
+	return map[string]Engine{
+		EngineOpenAIImages: &OpenAIImages{},
+		EngineOpenAIVideos: &OpenAIVideos{},
+		EngineFal:          &Fal{},
+		EngineComfyUI:      &ComfyUI{Workflows: workflows},
+		EngineGoogle:       &Google{},
+	}
 }
 
 // EngineInfo describes an engine for the admin UI: what a media endpoint
@@ -163,6 +193,7 @@ type EngineInfo struct {
 	ImageEdit    bool     `json:"image_edit"`
 	Video        bool     `json:"video"`
 	ImageToVideo bool     `json:"image_to_video"`
+	Upscale      bool     `json:"upscale"`
 	Sizes        []string `json:"sizes"`         // sizes the engine is known to accept, as a starting point
 	ProviderKind string   `json:"provider_kind"` // the provider kind the engine speaks through
 	Note         string   `json:"note"`
@@ -170,10 +201,34 @@ type EngineInfo struct {
 
 var engineCatalog = map[string]EngineInfo{
 	EngineOpenAIImages: {
-		ID: EngineOpenAIImages, Name: "OpenAI Images API", Image: true, ImageEdit: false,
+		ID: EngineOpenAIImages, Name: "OpenAI Images API", Image: true, ImageEdit: true,
 		Sizes:        []string{"1024x1024", "1536x1024", "1024x1536", "auto"},
 		ProviderKind: string(gateway.ProviderOpenAICompat),
-		Note:         "POST /images/generations on the provider's base URL (OpenAI, or any server that mirrors it). gpt-image-1 reports token usage, so set the per-token rates for exact pricing; per_image is the estimate shown before a job runs.",
+		Note:         "POST /images/generations and /images/edits on the provider's base URL (OpenAI, or any server that mirrors it). gpt-image-1 reports token usage, so set the per-token rates for exact pricing; per_image is the estimate shown before a job runs.",
+	},
+	EngineOpenAIVideos: {
+		ID: EngineOpenAIVideos, Name: "OpenAI Videos API (Sora)", Video: true, ImageToVideo: true,
+		Sizes:        []string{"1280x720", "720x1280", "1792x1024", "1024x1792"},
+		ProviderKind: string(gateway.ProviderOpenAICompat),
+		Note:         "POST /videos on the provider's base URL, polled until the render completes, then /videos/{id}/content. Sora takes 4, 8 or 12 seconds (list them under seconds) and bills per second: set per_second.",
+	},
+	EngineFal: {
+		ID: EngineFal, Name: "fal.ai (queue API)", Image: true, ImageEdit: true, Video: true, ImageToVideo: true, Upscale: true,
+		Sizes:        []string{"1024x1024", "1344x768", "768x1344", "landscape_16_9", "portrait_16_9", "square_hd"},
+		ProviderKind: string(gateway.ProviderOpenAICompat),
+		Note:         "The model name is the fal model id (fal-ai/flux/dev, fal-ai/wan/v2.2-a14b/text-to-video, fal-ai/clarity-upscaler, …) on a provider whose base URL is https://queue.fal.run with the fal key. ws sends prompt, num_images, image_size, image_url (a data URL of the source), mask_url, upscale_factor and duration; model-specific fields go in extra_body. Priced per image or per second from this endpoint.",
+	},
+	EngineComfyUI: {
+		ID: EngineComfyUI, Name: "ComfyUI (local)", Image: true, ImageEdit: true, Video: true, ImageToVideo: true, Upscale: true,
+		Sizes:        []string{"1024x1024", "1344x768", "768x1344"},
+		ProviderKind: string(gateway.ProviderOpenAICompat),
+		Note:         "A local ComfyUI server (base URL http://host:8188). extra_body.workflow names an API-format workflow template under the workflows directory (infra/comfyui/workflows) whose placeholders {{prompt}}, {{negative}}, {{width}}, {{height}}, {{seed}}, {{batch}}, {{seconds}}, {{frames}}, {{source}}, {{mask}} and {{scale}} ws fills in. Free; mark the endpoint local.",
+	},
+	EngineGoogle: {
+		ID: EngineGoogle, Name: "Google Gemini API (Imagen, Veo)", Image: true, Video: true, ImageToVideo: true,
+		Sizes:        []string{"1:1", "3:4", "4:3", "9:16", "16:9"},
+		ProviderKind: string(gateway.ProviderOpenAICompat),
+		Note:         "Imagen through models/{model}:predict and Veo through models/{model}:predictLongRunning on a provider whose base URL is https://generativelanguage.googleapis.com/v1beta with the Gemini key (sent as x-goog-api-key). Sizes are aspect ratios; a WxH is mapped to the nearest. Veo takes 8 seconds (list it under seconds) and bills per second; Imagen per image.",
 	},
 }
 
@@ -213,7 +268,7 @@ type CreateParams struct {
 func (s *Service) Create(ctx context.Context, p CreateParams) (*store.MediaJob, error) {
 	in := p.Inputs
 	in.Prompt = strings.TrimSpace(in.Prompt)
-	if in.Prompt == "" {
+	if in.Prompt == "" && p.Kind != KindUpscale {
 		return nil, fmt.Errorf("%w: prompt is required", ErrInvalid)
 	}
 	if len(in.Prompt) > 32_000 {
@@ -222,9 +277,43 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (*store.MediaJob, 
 	switch p.Kind {
 	case "":
 		p.Kind = KindImage
-	case KindImage, KindVideo:
+		if in.SourceAttachmentID != "" {
+			p.Kind = KindEdit
+		}
+	case KindImage, KindVideo, KindEdit, KindUpscale:
 	default:
-		return nil, fmt.Errorf("%w: kind %q is not supported yet", ErrInvalid, p.Kind)
+		return nil, fmt.Errorf("%w: kind %q is not supported", ErrInvalid, p.Kind)
+	}
+	if (p.Kind == KindEdit || p.Kind == KindUpscale) && in.SourceAttachmentID == "" {
+		return nil, fmt.Errorf("%w: %s needs source_attachment_id", ErrInvalid, p.Kind)
+	}
+	if p.Kind == KindImage && in.SourceAttachmentID != "" {
+		p.Kind = KindEdit
+	}
+	if in.SourceAttachmentID != "" {
+		if _, err := s.source(ctx, p.UserID, p.ProjectID, in.SourceAttachmentID); err != nil {
+			return nil, err
+		}
+	}
+	if in.MaskAttachmentID != "" {
+		if p.Kind != KindEdit {
+			return nil, fmt.Errorf("%w: only an edit takes a mask", ErrInvalid)
+		}
+		if _, err := s.source(ctx, p.UserID, p.ProjectID, in.MaskAttachmentID); err != nil {
+			return nil, fmt.Errorf("%w (mask)", err)
+		}
+	}
+	if p.Kind == KindUpscale {
+		switch in.Scale {
+		case 0:
+			in.Scale = 2
+		case 2, 4:
+		default:
+			return nil, fmt.Errorf("%w: scale must be 2 or 4", ErrInvalid)
+		}
+		in.N = 1
+	} else {
+		in.Scale = 0
 	}
 	if p.Selector == "" {
 		p.Selector = "auto"
@@ -235,13 +324,25 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (*store.MediaJob, 
 	if in.N > MaxImagesPerJob {
 		return nil, fmt.Errorf("%w: at most %d images per job", ErrInvalid, MaxImagesPerJob)
 	}
-	cands, _, err := s.route(ctx, p.UserID, p.ConversationID, p.Selector, p.Kind)
+	cands, _, err := s.route(ctx, p.UserID, p.ConversationID, p.Selector, p.Kind, in.SourceAttachmentID != "")
 	if err != nil {
 		return nil, err
 	}
-	ep := cands[0].Endpoint
-	if err := check(ep, &in, p.Kind); err != nil {
-		return nil, err
+	// The first candidate that can take the job prices it; the router
+	// already kept text models out.
+	var ep *gateway.Endpoint
+	var cerr error
+	for _, c := range cands {
+		if cerr = check(c.Endpoint, &in, p.Kind); cerr == nil {
+			ep = c.Endpoint
+			break
+		}
+	}
+	if ep == nil {
+		return nil, cerr
+	}
+	if p.Kind == KindVideo {
+		in.Seconds = defaultSeconds(ep, in.Seconds)
 	}
 	in.EstimateUSD = estimate(ep, in, p.Kind)
 	raw, _ := json.Marshal(in)
@@ -268,7 +369,28 @@ func check(ep *gateway.Endpoint, in *Inputs, kind string) error {
 	if m == nil {
 		return fmt.Errorf("%w: %s is not a media endpoint", ErrInvalid, ep.ID)
 	}
-	if kind == KindImage {
+	switch kind {
+	case KindImage:
+		if !m.Image {
+			return fmt.Errorf("%w: %s does not make images from text", ErrInvalid, ep.ID)
+		}
+	case KindEdit:
+		if !m.ImageEdit {
+			return fmt.Errorf("%w: %s does not edit images", ErrInvalid, ep.ID)
+		}
+	case KindUpscale:
+		if !m.Upscale {
+			return fmt.Errorf("%w: %s does not upscale images", ErrInvalid, ep.ID)
+		}
+	case KindVideo:
+		if in.SourceAttachmentID != "" && !m.ImageToVideo {
+			return fmt.Errorf("%w: %s does not animate an image", ErrInvalid, ep.ID)
+		}
+		if in.SourceAttachmentID == "" && !m.Video {
+			return fmt.Errorf("%w: %s does not make video from text", ErrInvalid, ep.ID)
+		}
+	}
+	if kind != KindVideo {
 		max := m.MaxImages
 		if max <= 0 {
 			max = 1
@@ -279,13 +401,35 @@ func check(ep *gateway.Endpoint, in *Inputs, kind string) error {
 	} else if in.N > 1 {
 		return fmt.Errorf("%w: one video per job", ErrInvalid)
 	}
-	if in.Size != "" && len(m.Sizes) > 0 && !containsFold(m.Sizes, in.Size) {
+	if in.Size != "" && kind != KindUpscale && len(m.Sizes) > 0 && !containsFold(m.Sizes, in.Size) {
 		return fmt.Errorf("%w: %s accepts sizes %s", ErrInvalid, ep.ID, strings.Join(m.Sizes, ", "))
 	}
-	if kind == KindVideo && m.MaxSeconds > 0 && in.Seconds > m.MaxSeconds {
-		return fmt.Errorf("%w: %s makes at most %d seconds", ErrInvalid, ep.ID, m.MaxSeconds)
+	if kind == KindVideo && in.Seconds > 0 {
+		if m.MaxSeconds > 0 && in.Seconds > m.MaxSeconds {
+			return fmt.Errorf("%w: %s makes at most %d seconds", ErrInvalid, ep.ID, m.MaxSeconds)
+		}
+		if len(m.Seconds) > 0 && !containsInt(m.Seconds, in.Seconds) {
+			return fmt.Errorf("%w: %s makes videos of %s seconds", ErrInvalid, ep.ID, joinInts(m.Seconds))
+		}
 	}
 	return nil
+}
+
+// defaultSeconds fills in a video length: the endpoint's first listed
+// length, else 5 capped by max_seconds.
+func defaultSeconds(ep *gateway.Endpoint, want int) int {
+	if want > 0 {
+		return want
+	}
+	m := ep.Capabilities.Media
+	if m != nil && len(m.Seconds) > 0 {
+		return m.Seconds[0]
+	}
+	s := 5
+	if m != nil && m.MaxSeconds > 0 && m.MaxSeconds < s {
+		s = m.MaxSeconds
+	}
+	return s
 }
 
 // Estimate prices a job on an endpoint before it runs.
@@ -294,9 +438,55 @@ func estimate(ep *gateway.Endpoint, in Inputs, kind string) float64 {
 		return 0
 	}
 	if kind == KindVideo {
-		return ep.Pricing.MediaCost(0, float64(in.Seconds))
+		return ep.Pricing.MediaCost(0, float64(defaultSeconds(ep, in.Seconds)))
 	}
 	return ep.Pricing.MediaCost(in.N, 0)
+}
+
+// source checks the user may use an attachment as a job input: their own,
+// or one a media job in the project produced.
+func (s *Service) source(ctx context.Context, userID, projectID uuid.UUID, id string) (*store.Attachment, error) {
+	aid, err := uuid.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("%w: bad source_attachment_id", ErrInvalid)
+	}
+	att, err := s.DB.GetAttachment(ctx, aid)
+	if err != nil {
+		return nil, fmt.Errorf("%w: source attachment not found", ErrInvalid)
+	}
+	if !strings.HasPrefix(att.Mime, "image/") {
+		return nil, fmt.Errorf("%w: the source must be an image, not %s", ErrInvalid, att.Mime)
+	}
+	if att.Bytes > MaxSourceBytes {
+		return nil, fmt.Errorf("%w: the source is larger than 32 MB", ErrInvalid)
+	}
+	if att.UserID == userID {
+		return &att, nil
+	}
+	projects, _ := s.DB.AttachmentMediaProjects(ctx, aid)
+	for _, pid := range projects {
+		if pid == projectID {
+			return &att, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: source attachment not found", ErrInvalid)
+}
+
+// loadSource reads the source image for an engine.
+func (s *Service) loadSource(ctx context.Context, job store.MediaJob, id string) (*Output, error) {
+	att, err := s.source(ctx, job.UserID, job.ProjectID, id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := blob.GetBytes(ctx, s.Blobs, att.BlobKey)
+	if err != nil {
+		return nil, fmt.Errorf("read source: %w", err)
+	}
+	o := Decode(data)
+	if att.Mime != "" {
+		o.MIME = att.Mime
+	}
+	return &o, nil
 }
 
 // Estimate is estimate for callers outside the package (the models list).
@@ -305,12 +495,22 @@ func Estimate(ep *gateway.Endpoint, in Inputs, kind string) float64 { return est
 // route asks the gateway for media candidates: the budget middleware and
 // the policies apply as for text, and the task class keeps text endpoints
 // out.
-func (s *Service) route(ctx context.Context, userID uuid.UUID, conv uuid.NullUUID, selector, kind string) ([]gateway.Candidate, gateway.Decision, error) {
+func (s *Service) route(ctx context.Context, userID uuid.UUID, conv uuid.NullUUID, selector, kind string, hasSource bool) ([]gateway.Candidate, gateway.Decision, error) {
+	// The task class keeps text models out; the precise need (edit, image
+	// to video) keeps endpoints that cannot take this job out too.
 	tc := gateway.TaskImage
-	if kind == KindVideo {
-		tc = gateway.TaskVideo
+	need := &gateway.MediaCaps{Image: true}
+	switch {
+	case kind == KindEdit:
+		need = &gateway.MediaCaps{ImageEdit: true}
+	case kind == KindUpscale:
+		need = &gateway.MediaCaps{Upscale: true}
+	case kind == KindVideo && hasSource:
+		tc, need = gateway.TaskVideo, &gateway.MediaCaps{ImageToVideo: true}
+	case kind == KindVideo:
+		tc, need = gateway.TaskVideo, &gateway.MediaCaps{Video: true}
 	}
-	req := &gateway.Request{Model: selector, Metadata: gateway.Metadata{UserID: userID.String(), TaskClass: tc}}
+	req := &gateway.Request{Model: selector, Media: need, Metadata: gateway.Metadata{UserID: userID.String(), TaskClass: tc}}
 	if conv.Valid {
 		req.Metadata.ConversationID = conv.UUID.String()
 	}
@@ -366,14 +566,30 @@ func (s *Service) Run(ctx context.Context, id uuid.UUID) error {
 		_ = s.DB.FailMediaJob(ctx, store.FailMediaJobParams{ID: job.ID, EndpointID: epp, Error: &msg})
 		log.Warn("media: job failed", "job", job.ID, "kind", job.Kind, "endpoint", ep, "err", msg)
 	}
-	cands, dec, err := s.route(ctx, job.UserID, job.ConversationID, job.Selector, job.Kind)
+	cands, dec, err := s.route(ctx, job.UserID, job.ConversationID, job.Selector, job.Kind, in.SourceAttachmentID != "")
 	if err != nil {
 		fail("", err)
 		return nil
 	}
-	req := &Request{Kind: job.Kind, Prompt: in.Prompt, Size: in.Size, N: in.N, Quality: in.Quality, Seconds: in.Seconds}
+	req := &Request{Kind: job.Kind, Prompt: in.Prompt, Size: in.Size, N: in.N, Quality: in.Quality, Seconds: in.Seconds, Scale: in.Scale}
 	if req.N <= 0 {
 		req.N = 1
+	}
+	if in.SourceAttachmentID != "" {
+		src, err := s.loadSource(ctx, job, in.SourceAttachmentID)
+		if err != nil {
+			fail("", err)
+			return nil
+		}
+		req.Source = src
+	}
+	if in.MaskAttachmentID != "" {
+		mask, err := s.loadSource(ctx, job, in.MaskAttachmentID)
+		if err != nil {
+			fail("", fmt.Errorf("mask: %w", err))
+			return nil
+		}
+		req.Mask = mask
 	}
 	var lastErr error
 	var lastEP string
@@ -391,6 +607,9 @@ func (s *Service) Run(ctx context.Context, id uuid.UUID) error {
 			continue
 		}
 		req.Model = ep.ModelName
+		if job.Kind == KindVideo {
+			req.Seconds = defaultSeconds(ep, in.Seconds)
+		}
 		progress := func(f float64, pid string) {
 			var pidp *string
 			if pid != "" {
@@ -546,8 +765,16 @@ func (s *Service) Endpoints(kind string) []*gateway.Endpoint {
 			if !m.Image {
 				continue
 			}
+		case KindEdit:
+			if !m.ImageEdit {
+				continue
+			}
+		case KindUpscale:
+			if !m.Upscale {
+				continue
+			}
 		case KindVideo:
-			if !m.Video {
+			if !m.Video && !m.ImageToVideo {
 				continue
 			}
 		}
@@ -572,6 +799,37 @@ func containsFold(list []string, s string) bool {
 	return false
 }
 
+func containsInt(list []int, n int) bool {
+	for _, x := range list {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+func joinInts(list []int) string {
+	parts := make([]string, len(list))
+	for i, n := range list {
+		parts[i] = fmt.Sprint(n)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Dimensions parses "WxH"; ok is false for keywords such as "auto".
+func Dimensions(size string) (w, h int, ok bool) {
+	i := strings.IndexAny(size, "xX×")
+	if i <= 0 {
+		return 0, 0, false
+	}
+	_, err1 := fmt.Sscanf(size[:i], "%d", &w)
+	_, err2 := fmt.Sscanf(size[i+1:], "%d", &h)
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
 func extFor(mime string) string {
 	switch mime {
 	case "image/png":
@@ -586,6 +844,8 @@ func extFor(mime string) string {
 		return ".mp4"
 	case "video/webm":
 		return ".webm"
+	case "video/quicktime":
+		return ".mov"
 	}
 	return ""
 }

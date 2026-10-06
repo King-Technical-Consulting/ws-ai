@@ -2,22 +2,30 @@ import { useEffect, useRef } from 'react'
 import type { UIMessage } from 'ai'
 import { Streamdown } from 'streamdown'
 import clsx from 'clsx'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, ThumbsDown, ThumbsUp } from 'lucide-react'
 import { Callout } from './ui'
 import { ArtifactCard } from './ArtifactPanel'
 
 type OnApproval = (approvalId: string, approved: boolean) => void
+// A rating: 1, -1, or null to clear.
+type OnRate = (messageId: string, score: 1 | -1 | null) => void
 
 export function MessageList({
   messages,
   status,
   error,
   onApproval,
+  ratings,
+  onRate,
 }: {
   messages: UIMessage[]
   status: string
   error?: Error
   onApproval?: OnApproval
+  // The caller's ratings by message id, and the handler; absent means no
+  // thumbs (the agent monitor, a transcript).
+  ratings?: Record<string, number>
+  onRate?: OnRate
 }) {
   const bottom = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -31,7 +39,7 @@ export function MessageList({
           <p className="tagline text-fg-3 text-center pt-24">Say something to begin.</p>
         )}
         {messages.map((m) => (
-          <Message key={m.id} m={m} streaming={status === 'streaming' && m === messages[messages.length - 1]} onApproval={onApproval} />
+          <Message key={m.id} m={m} streaming={status === 'streaming' && m === messages[messages.length - 1]} onApproval={onApproval} rating={ratings?.[m.id]} onRate={onRate} />
         ))}
         {status === 'submitted' && <div className="thinking">Thinking…</div>}
         {error && <Callout kind="error">{error.message}</Callout>}
@@ -41,9 +49,10 @@ export function MessageList({
   )
 }
 
-function Message({ m, streaming, onApproval }: { m: UIMessage; streaming: boolean; onApproval?: OnApproval }) {
+function Message({ m, streaming, onApproval, rating, onRate }: { m: UIMessage; streaming: boolean; onApproval?: OnApproval; rating?: number; onRate?: OnRate }) {
   const isUser = m.role === 'user'
   const meta = (m.metadata ?? {}) as { model?: string; endpoint?: string }
+  const canRate = !isUser && !streaming && !!onRate && m.parts.some((p) => p.type === 'text')
   return (
     <div className={clsx('flex reading', isUser ? 'justify-end' : 'justify-start')}>
       <div className={clsx('max-w-[85%]', isUser ? 'rounded-2xl bg-bg-3 px-4 py-2.5' : '')}>
@@ -72,9 +81,9 @@ function Message({ m, streaming, onApproval }: { m: UIMessage; streaming: boolea
                 const tp = p as unknown as { output?: unknown; state: string }
                 return <ArtifactCard key={i} output={tp.output} state={tp.state} />
               }
-              if (p.type === 'tool-generate_image') {
+              if (p.type === 'tool-generate_image' || p.type === 'tool-generate_video') {
                 const tp = p as unknown as { input?: unknown; output?: unknown; state: string; errorText?: string }
-                return <GeneratedImages key={i} input={tp.input} output={tp.output} state={tp.state} errorText={tp.errorText} />
+                return <GeneratedMedia key={i} video={p.type === 'tool-generate_video'} input={tp.input} output={tp.output} state={tp.state} errorText={tp.errorText} />
               }
               if (p.type.startsWith('tool-') || p.type === 'dynamic-tool') {
                 const tp = p as unknown as {
@@ -90,7 +99,33 @@ function Message({ m, streaming, onApproval }: { m: UIMessage; streaming: boolea
               return null
           }
         })}
-        {!isUser && meta.endpoint && <div className="meta mt-1">routed to {meta.endpoint}</div>}
+        {!isUser && (meta.endpoint || canRate) && (
+          <div className="meta mt-1 flex items-center gap-3">
+            {meta.endpoint && <span>routed to {meta.endpoint}</span>}
+            {canRate && (
+              <span className="flex items-center gap-1 not-italic">
+                <button
+                  onClick={() => onRate!(m.id, rating === 1 ? null : 1)}
+                  className={clsx('p-1 rounded-md hover:bg-bg-3', rating === 1 ? 'text-accent' : 'text-fg-4 hover:text-fg')}
+                  title={rating === 1 ? 'Rated good; click to clear' : 'Good answer (a training signal)'}
+                  aria-label="Good answer"
+                  aria-pressed={rating === 1}
+                >
+                  <ThumbsUp size={13} />
+                </button>
+                <button
+                  onClick={() => onRate!(m.id, rating === -1 ? null : -1)}
+                  className={clsx('p-1 rounded-md hover:bg-bg-3', rating === -1 ? 'text-danger' : 'text-fg-4 hover:text-fg')}
+                  title={rating === -1 ? 'Rated poor; click to clear' : 'Poor answer'}
+                  aria-label="Poor answer"
+                  aria-pressed={rating === -1}
+                >
+                  <ThumbsDown size={13} />
+                </button>
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -120,32 +155,41 @@ function ToolCall({ name, state, input, output, errorText }: { name: string; sta
   )
 }
 
-/** generate_image: the images inline, the tool's JSON only when it failed. */
-function GeneratedImages({ input, output, state, errorText }: { input: unknown; output: unknown; state: string; errorText?: string }) {
-  const out = (output ?? {}) as { images?: { url: string; width?: number; height?: number }[]; endpoint?: string; cost_usd?: number }
-  const prompt = ((input ?? {}) as { prompt?: string }).prompt
-  if (state === 'output-error' || (state === 'output-available' && !out.images?.length)) {
-    return <ToolCall name="generate_image" state={state} input={input} output={output} errorText={errorText} />
+/** generate_image and generate_video: the files inline, the tool's JSON only when it failed. */
+function GeneratedMedia({ video, input, output, state, errorText }: { video: boolean; input: unknown; output: unknown; state: string; errorText?: string }) {
+  type File = { url: string; width?: number; height?: number; mime?: string }
+  const out = (output ?? {}) as { images?: File[]; videos?: File[]; kind?: string; endpoint?: string; cost_usd?: number }
+  const files = video ? out.videos : out.images
+  const inp = (input ?? {}) as { prompt?: string; source_attachment_id?: string }
+  const name = video ? 'generate_video' : 'generate_image'
+  if (state === 'output-error' || (state === 'output-available' && !files?.length)) {
+    return <ToolCall name={name} state={state} input={input} output={output} errorText={errorText} />
   }
   if (state !== 'output-available') {
     return (
       <div className="my-2 font-sans text-sm text-fg-2">
-        <span className="thinking">Generating an image…</span>
-        {prompt && <div className="meta mt-1 truncate">{prompt}</div>}
+        <span className="thinking">{video ? (inp.source_attachment_id ? 'Animating the image…' : 'Rendering a video…') : inp.source_attachment_id ? 'Editing the image…' : 'Generating an image…'}</span>
+        {inp.prompt && <div className="meta mt-1 truncate">{inp.prompt}</div>}
+        {video && <div className="meta mt-1">Video takes a few minutes; it also lands in the project's gallery.</div>}
       </div>
     )
   }
   return (
     <div className="my-2">
       <div className="flex flex-wrap gap-2">
-        {out.images!.map((im) => (
-          <a key={im.url} href={im.url} target="_blank" rel="noopener">
-            <img src={im.url} alt={prompt ?? 'generated image'} width={im.width ?? undefined} height={im.height ?? undefined} className="max-h-80 w-auto rounded-lg border border-line" />
-          </a>
-        ))}
+        {files!.map((f) =>
+          video ? (
+            <video key={f.url} src={f.url} controls playsInline preload="metadata" width={f.width ?? undefined} height={f.height ?? undefined} className="max-h-80 w-auto rounded-lg border border-line bg-bg-2" />
+          ) : (
+            <a key={f.url} href={f.url} target="_blank" rel="noopener">
+              <img src={f.url} alt={inp.prompt ?? 'generated image'} width={f.width ?? undefined} height={f.height ?? undefined} className="max-h-80 w-auto rounded-lg border border-line" />
+            </a>
+          ),
+        )}
       </div>
       <div className="meta mt-1">
-        {out.endpoint ? `made with ${out.endpoint}` : 'generated'}
+        {out.kind === 'edit' ? 'edited' : 'made'}
+        {out.endpoint ? ` with ${out.endpoint}` : ''}
         {out.cost_usd ? ` · $${out.cost_usd.toFixed(3)}` : ''}
       </div>
     </div>

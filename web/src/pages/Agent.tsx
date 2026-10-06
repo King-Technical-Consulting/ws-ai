@@ -9,7 +9,7 @@ import { MessageList } from '../components/MessageList'
 import { AgentForm, ago, until } from './Agents'
 import { useMe } from '../App'
 
-const OPEN = new Set(['queued', 'running', 'paused_approval', 'paused_steer'])
+const OPEN = new Set(['queued', 'running', 'paused_approval', 'paused_steer', 'paused_manual'])
 
 /**
  * Agent monitor (PLAN M7): one agent's triggers, runs, approvals inbox,
@@ -107,7 +107,7 @@ export default function AgentMonitor() {
             <AgentForm initial={a} projects={projects.data ?? []} models={models.data} pending={update.isPending} error={update.error as Error | null} onCancel={() => setEditing(false)} onSubmit={(input) => update.mutate(input)} />
           )}
 
-          <Budget usd={d.spend.usd} since={d.spend.since} limit={budget?.limit_usd} onExceed={budget?.on_exceed} owner={me.data?.role === 'owner'} />
+          <Budget agentID={id} usd={d.spend.usd} since={d.spend.since} budget={budget} owner={me.data?.role === 'owner'} onChange={refresh} />
 
           {d.pending_approvals.length > 0 && <Inbox approvals={d.pending_approvals} onDecided={refresh} onOpenRun={setSelectedRun} />}
 
@@ -144,28 +144,86 @@ export default function AgentMonitor() {
 }
 
 function RunState({ s }: { s: AgentRun['status'] }) {
-  const label = s === 'paused_approval' ? 'needs approval' : s === 'paused_steer' ? 'needs input' : s
+  const label = s === 'paused_approval' ? 'needs approval' : s === 'paused_steer' ? 'needs input' : s === 'paused_manual' ? 'paused' : s
   return <span className={clsx('section-head border-0 shrink-0', OPEN.has(s) ? 'text-fg' : 'text-fg-3')}>{label}</span>
 }
 
-function Budget({ usd, since, limit, onExceed, owner }: { usd: number; since: string; limit?: number; onExceed?: string; owner?: boolean }) {
+type AgentBudget = { id: string; period: string; limit_usd: number; on_exceed: string }
+
+/**
+ * This month's spend against the agent's budget. The owner sets or
+ * changes the budget here (it is the same row Admin → budgets shows with
+ * scope agent).
+ */
+function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: string; usd: number; since: string; budget?: AgentBudget; owner?: boolean; onChange: () => void }) {
   const month = new Date(since).toLocaleDateString(undefined, { month: 'long' })
-  if (!limit) {
-    return (
-      <p className="meta">
-        ${usd.toFixed(2)} spent in {month}. No agent budget is set{owner ? ' (Admin → budgets, scope agent)' : '; the owner can set one'}.
-      </p>
-    )
-  }
-  const pct = Math.min(100, Math.round((usd / limit) * 100))
+  const [editing, setEditing] = useState(false)
+  const [limit, setLimit] = useState(budget?.limit_usd ?? 10)
+  const [onExceed, setOnExceed] = useState(budget?.on_exceed ?? 'block')
+  const save = useMutation({
+    mutationFn: () => api.put('/api/admin/budgets', { scope: 'agent', scope_id: agentID, period: budget?.period ?? 'month', limit_usd: limit, on_exceed: onExceed }),
+    onSuccess: () => {
+      setEditing(false)
+      onChange()
+    },
+  })
+  const remove = useMutation({
+    mutationFn: () => api.del(`/api/admin/budgets/${budget!.id}`),
+    onSuccess: () => {
+      setEditing(false)
+      onChange()
+    },
+  })
+  const pct = budget ? Math.min(100, Math.round((usd / budget.limit_usd) * 100)) : 0
   return (
     <div className="space-y-1.5">
       <p className="meta">
-        ${usd.toFixed(2)} of ${limit.toFixed(2)} in {month} ({pct}%). At the limit runs {onExceed === 'block' ? 'stop' : 'fall back to local models'}.
+        {budget ? (
+          <>
+            ${usd.toFixed(2)} of ${budget.limit_usd.toFixed(2)} {budget.period === 'month' ? `in ${month}` : `per ${budget.period}`} ({pct}%). At the limit runs {budget.on_exceed === 'block' ? 'stop' : 'fall back to local models'}.
+          </>
+        ) : (
+          <>
+            ${usd.toFixed(2)} spent in {month}. No budget is set for this agent{owner ? '' : '; the owner can set one'}.
+          </>
+        )}
+        {owner && (
+          <button type="button" onClick={() => setEditing((v) => !v)} className="ml-2 text-xs text-fg-2 hover:text-fg">
+            {editing ? 'cancel' : budget ? 'change' : 'set a budget'}
+          </button>
+        )}
       </p>
-      <div className="h-px w-full bg-line relative" aria-hidden>
-        <div className="absolute inset-y-0 left-0 bg-fg-3" style={{ width: `${pct}%`, height: '1px' }} />
-      </div>
+      {budget && (
+        <div className="h-px w-full bg-line relative" aria-hidden>
+          <div className="absolute inset-y-0 left-0 bg-fg-3" style={{ width: `${pct}%`, height: '1px' }} />
+        </div>
+      )}
+      {editing && owner && (
+        <form
+          className="flex flex-wrap items-center gap-2 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault()
+            if (limit > 0) save.mutate()
+          }}
+        >
+          <label className="flex items-center gap-1 text-xs text-fg-2">
+            $<input type="number" min={0.01} step={0.5} value={limit} onChange={(e) => setLimit(Number(e.target.value))} className={`${inputSm} w-24 tnum`} aria-label="Monthly limit in dollars" /> per month
+          </label>
+          <select value={onExceed} onChange={(e) => setOnExceed(e.target.value)} className={`${inputSm} w-auto`} aria-label="At the limit">
+            <option value="block">at the limit, stop runs</option>
+            <option value="downgrade">at the limit, use local models</option>
+          </select>
+          <button type="submit" disabled={save.isPending || limit <= 0} className={btn.secondarySm}>
+            Save
+          </button>
+          {budget && (
+            <button type="button" onClick={() => remove.mutate()} disabled={remove.isPending} className={btn.danger}>
+              remove budget
+            </button>
+          )}
+          {(save.error || remove.error) && <span className="text-xs text-danger">{((save.error ?? remove.error) as Error).message}</span>}
+        </form>
+      )}
     </div>
   )
 }
@@ -203,22 +261,33 @@ function Inbox({ approvals, onDecided, onOpenRun }: { approvals: Approval[]; onD
   )
 }
 
+type TriggerKind = 'cron' | 'webhook' | 'repo_push'
+
 function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: AgentTrigger[]; onChange: () => void }) {
-  const [kind, setKind] = useState<'cron' | 'webhook'>('cron')
+  const [kind, setKind] = useState<TriggerKind>('cron')
   const [name, setName] = useState('')
   const [expr, setExpr] = useState('0 * * * *')
   const [input, setInput] = useState('')
-  const [secretURL, setSecretURL] = useState<string | null>(null)
+  const [repo, setRepo] = useState('')
+  const [branches, setBranches] = useState('main')
+  const [events, setEvents] = useState('push')
+  const [secretURL, setSecretURL] = useState<{ url: string; github: boolean } | null>(null)
+  const list = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean)
   const create = useMutation({
     mutationFn: () =>
       api.post<{ trigger: AgentTrigger; url?: string }>(`/api/agents/${agentID}/triggers`, {
         kind,
         name,
-        spec: kind === 'cron' ? { expr, input: input || undefined } : {},
+        spec:
+          kind === 'cron'
+            ? { expr, input: input || undefined }
+            : kind === 'repo_push'
+              ? { repo: repo.trim() || undefined, branches: list(branches), events: list(events), input: input || undefined }
+              : {},
       }),
     onSuccess: (r) => {
       setName('')
-      setSecretURL(r.url ? `${location.origin}${r.url}` : null)
+      setSecretURL(r.url ? { url: `${location.origin}${r.url}`, github: kind === 'repo_push' } : null)
       onChange()
     },
   })
@@ -235,7 +304,10 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
           <li key={t.id} className="px-3 py-2 space-y-0.5">
             <div className="flex items-center justify-between gap-3">
               <span className="truncate">
-                {t.name || t.kind} <span className="font-mono text-xs text-fg-3">{t.kind === 'cron' ? t.spec.expr : t.kind}</span>
+                {t.name || t.kind}{' '}
+                <span className="font-mono text-xs text-fg-3">
+                  {t.kind === 'cron' ? t.spec.expr : t.kind === 'repo_push' ? `github ${[t.spec.repo, t.spec.branches?.join('|'), t.spec.events?.join('|')].filter(Boolean).join(' · ')}` : t.kind}
+                </span>
               </span>
               <span className="flex items-center gap-3 shrink-0">
                 <button onClick={() => toggle.mutate({ tid: t.id, enabled: !t.enabled })} className="text-xs text-fg-2 hover:text-fg">
@@ -257,8 +329,8 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
       </ListGroup>
       {secretURL && (
         <Callout kind="note">
-          Webhook created. Its URL carries the secret and is shown once:
-          <code className="block font-mono text-xs mt-1 break-all select-all">{secretURL}</code>
+          {secretURL.github ? 'GitHub trigger created. In the repository, add a webhook with this payload URL (it carries the secret and is shown once), content type application/json, the events you listed, and the part after the last slash as the webhook secret so GitHub signs each delivery and ws checks the signature:' : 'Webhook created. Its URL carries the secret and is shown once:'}
+          <code className="block font-mono text-xs mt-1 break-all select-all">{secretURL.url}</code>
         </Callout>
       )}
       <form
@@ -268,9 +340,10 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
           create.mutate()
         }}
       >
-        <select value={kind} onChange={(e) => setKind(e.target.value as 'cron' | 'webhook')} className={`${inputSm} w-auto`} aria-label="Kind">
+        <select value={kind} onChange={(e) => setKind(e.target.value as TriggerKind)} className={`${inputSm} w-auto`} aria-label="Kind">
           <option value="cron">cron</option>
           <option value="webhook">webhook</option>
+          <option value="repo_push">github</option>
         </select>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="name" className={`${inputSm} w-32`} />
         {kind === 'cron' && (
@@ -279,12 +352,22 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
             <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="message for each run (optional)" className={`${inputSm} flex-1 min-w-40`} />
           </>
         )}
+        {kind === 'repo_push' && (
+          <>
+            <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="owner/repo (optional)" className={`${inputSm} w-40 font-mono text-xs`} aria-label="Repository" />
+            <input value={branches} onChange={(e) => setBranches(e.target.value)} placeholder="branches: main, release/*" className={`${inputSm} w-40 font-mono text-xs`} aria-label="Branches" />
+            <input value={events} onChange={(e) => setEvents(e.target.value)} placeholder="events: push, pull_request" className={`${inputSm} w-44 font-mono text-xs`} aria-label="Events" />
+            <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="instructions put before each event (optional)" className={`${inputSm} flex-1 min-w-40`} />
+          </>
+        )}
         <button type="submit" disabled={create.isPending || (kind === 'cron' && !expr.trim())} className={btn.secondarySm}>
           Add
         </button>
       </form>
       {create.error && <Callout kind="error">{(create.error as Error).message}</Callout>}
-      <p className="meta">Cron is five fields in UTC (or @hourly, @daily). A firing is skipped while a run is still open.</p>
+      <p className="meta">
+        Cron is five fields in UTC (or @hourly, @daily). A firing is skipped while a run is still open. A github trigger is a webhook GitHub posts to: pushes to the listed branches (and any other events you list, such as pull_request or issues) start a run with the event summarized; pings and other branches are ignored.
+      </p>
     </section>
   )
 }
@@ -378,6 +461,10 @@ function RunView({ run, onChange }: { run: AgentRun; onChange: () => void }) {
     },
   })
   const cancel = useMutation({ mutationFn: () => api.post(`/api/runs/${run.id}/cancel`, {}), onSuccess: onChange })
+  const pause = useMutation({ mutationFn: () => api.post(`/api/runs/${run.id}/pause`, {}), onSuccess: onChange })
+  const resume = useMutation({ mutationFn: () => api.post(`/api/runs/${run.id}/resume`, {}), onSuccess: onChange })
+  const pausable = run.status === 'queued' || run.status === 'running'
+  const paused = run.status === 'paused_manual'
   const decide = useMutation({
     mutationFn: ({ id, approved }: { id: string; approved: boolean }) => api.post(`/api/approvals/${id}`, { approved }),
     onSuccess: () => {
@@ -400,6 +487,16 @@ function RunView({ run, onChange }: { run: AgentRun; onChange: () => void }) {
           <Link to={`/c/${run.conversation_id}`} className="text-xs text-fg-2 hover:text-fg">
             open as chat
           </Link>
+          {pausable && (
+            <button onClick={() => pause.mutate()} disabled={pause.isPending} className="text-xs text-fg-2 hover:text-fg" title="Stop between steps and keep the run's place">
+              pause
+            </button>
+          )}
+          {paused && (
+            <button onClick={() => resume.mutate()} disabled={resume.isPending} className={btn.secondarySm}>
+              resume
+            </button>
+          )}
           {open && (
             <button onClick={() => cancel.mutate()} disabled={cancel.isPending} className={btn.danger}>
               cancel
@@ -407,6 +504,11 @@ function RunView({ run, onChange }: { run: AgentRun; onChange: () => void }) {
           )}
         </div>
       </div>
+      {(pause.error || resume.error) && (
+        <div className="px-4 pt-3">
+          <Callout kind="error">{((pause.error ?? resume.error) as Error).message}</Callout>
+        </div>
+      )}
       {run.error && (
         <div className="px-4 pt-3">
           <Callout kind="error">{run.error}</Callout>

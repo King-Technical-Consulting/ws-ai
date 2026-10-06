@@ -3,8 +3,8 @@ import { Outlet, NavLink, useNavigate, Link } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type Project, type Conversation } from '../api'
 import { useMe } from '../App'
-import { btn, inputSm } from '../components/ui'
-import { Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive } from 'lucide-react'
+import { WsMark, btn, inputSm } from '../components/ui'
+import { Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive, Palette, FlaskConical } from 'lucide-react'
 import clsx from 'clsx'
 
 /** "https://github.com/a/repo.git" -> "repo" */
@@ -60,6 +60,22 @@ export default function Shell() {
     },
   })
 
+  // A design project: conversations in design mode, where the assistant
+  // makes design artifacts under the conversation's design system.
+  const newDesign = useMutation({
+    mutationFn: async () => {
+      const name = prompt('Design project name', 'Design')
+      if (name === null) throw new Error('cancelled')
+      const p = await api.post<Project>('/api/projects', { name: name.trim() || 'Design', kind: 'design' })
+      await qc.invalidateQueries({ queryKey: ['projects'] })
+      return api.post<Conversation>(`/api/projects/${p.id}/conversations`, {})
+    },
+    onSuccess: (c) => {
+      qc.invalidateQueries({ queryKey: ['convs'] })
+      nav(`/c/${c.id}`)
+    },
+  })
+
   const rename = useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => api.patch(`/api/conversations/${id}`, { title }),
     onSuccess: (_r, v) => {
@@ -85,7 +101,10 @@ export default function Shell() {
     <div className="h-full flex">
       <aside className="w-64 shrink-0 border-r border-line bg-bg-2 flex flex-col">
         <div className="px-3 pt-3 pb-2 flex items-center justify-between">
-          <Link to="/" className="wordmark">ws</Link>
+          <Link to="/" className="wordmark inline-flex items-center gap-2">
+            <WsMark size={22} className="text-fg" />
+            ws
+          </Link>
           <button
             onClick={() => newChat.mutate()}
             disabled={newChat.isPending}
@@ -116,6 +135,9 @@ export default function Shell() {
               <Code2 size={14} /> New code project
             </button>
           )}
+          <button onClick={() => newDesign.mutate()} disabled={newDesign.isPending} className={clsx(navItem({ isActive: false }), 'text-xs')}>
+            <Palette size={14} /> New design project
+          </button>
         </div>
         <div className="px-3">
           <h2 className="section-head">conversations</h2>
@@ -155,8 +177,8 @@ export default function Shell() {
           {convs.data?.length === 0 && <p className="meta px-2 py-4">No conversations yet.</p>}
         </nav>
         <div className="p-2 border-t border-line text-sm space-y-0.5">
-          <NavLink to="/images" className={navItem}>
-            <ImageIcon size={14} /> Images
+          <NavLink to="/media" className={navItem}>
+            <ImageIcon size={14} /> Media
           </NavLink>
           <NavLink to="/agents" className={navItem}>
             <Bot size={14} /> Agents
@@ -168,6 +190,9 @@ export default function Shell() {
             <>
               <NavLink to="/jobs" className={navItem}>
                 <SquareTerminal size={14} /> Jobs
+              </NavLink>
+              <NavLink to="/training" className={navItem}>
+                <FlaskConical size={14} /> Training
               </NavLink>
               <NavLink to="/admin" className={navItem}>
                 <Shield size={14} /> Admin

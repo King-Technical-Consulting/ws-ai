@@ -10,7 +10,7 @@ type Usage = {
   by_endpoint: { endpoint_id: string | null; calls: number; input_tokens: number; output_tokens: number; cost_usd: number; avg_latency_ms: number | null }[]
   by_user: { user_id: string | null; calls: number; cost_usd: number }[]
 }
-type MediaCaps = { engine: string; image?: boolean; image_edit?: boolean; video?: boolean; image_to_video?: boolean; sizes?: string[]; max_images?: number; max_seconds?: number }
+type MediaCaps = { engine: string; image?: boolean; image_edit?: boolean; video?: boolean; image_to_video?: boolean; upscale?: boolean; sizes?: string[]; max_images?: number; max_seconds?: number; seconds?: number[] }
 type Caps = { context_window: number; max_output: number; tools: boolean; vision: boolean; reasoning: boolean; prompt_cache: boolean; json_mode?: boolean; embeddings?: boolean; media?: MediaCaps }
 type Pricing = { input_per_m: number; output_per_m: number; cache_read_per_m?: number; cache_write_per_m?: number; per_image?: number; per_second?: number }
 type EndpointRow = {
@@ -26,7 +26,7 @@ type ProviderRow = {
   id: string; kind: string; name: string; base_url: string; base_url_env: string; api_key_env: string
   headers: Record<string, string>; configured: boolean; reason?: string
 }
-type EngineInfo = { id: string; name: string; image: boolean; image_edit: boolean; video: boolean; image_to_video: boolean; sizes: string[]; provider_kind: string; note: string }
+type EngineInfo = { id: string; name: string; image: boolean; image_edit: boolean; video: boolean; image_to_video: boolean; upscale: boolean; sizes: string[]; provider_kind: string; note: string }
 type Endpoints = {
   providers: { id: string; kind: string; name: string; base_url: string }[]
   all_providers?: ProviderRow[]
@@ -364,9 +364,11 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
   const [imageEdit, setImageEdit] = useState(media0?.image_edit ?? false)
   const [video, setVideo] = useState(media0?.video ?? false)
   const [imageToVideo, setImageToVideo] = useState(media0?.image_to_video ?? false)
+  const [upscale, setUpscale] = useState(media0?.upscale ?? false)
   const [sizes, setSizes] = useState((media0?.sizes ?? eng?.sizes ?? []).join(', '))
   const [maxImages, setMaxImages] = useState(media0?.max_images ?? 4)
   const [maxSeconds, setMaxSeconds] = useState(media0?.max_seconds ?? 0)
+  const [seconds, setSeconds] = useState((media0?.seconds ?? []).join(', '))
   const [perImage, setPerImage] = useState(initial?.pricing?.per_image ?? 0)
   const [perSecond, setPerSecond] = useState(initial?.pricing?.per_second ?? 0)
   const [err, setErr] = useState('')
@@ -386,9 +388,10 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
           ? {
               context_window: 0, max_output: 0, tools: false, vision: false, reasoning: false, prompt_cache: false,
               media: {
-                engine, image, image_edit: imageEdit, video, image_to_video: imageToVideo,
+                engine, image, image_edit: imageEdit, video, image_to_video: imageToVideo, upscale,
                 sizes: sizes.split(',').map((s) => s.trim()).filter(Boolean),
                 max_images: maxImages, max_seconds: maxSeconds,
+                seconds: seconds.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0),
               },
             }
           : { context_window: ctx, max_output: maxOut, tools, vision, json_mode: jsonMode, reasoning, prompt_cache: cache, embeddings }
@@ -463,11 +466,12 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
           </div>
           {eng?.note && <p className="meta">{eng.note}</p>}
           <div className="flex flex-wrap gap-3">
-            {check('image', image, setImage)}{check('image edit', imageEdit, setImageEdit)}{check('video', video, setVideo)}{check('image to video', imageToVideo, setImageToVideo)}
+            {check('image', image, setImage)}{check('image edit', imageEdit, setImageEdit)}{check('video', video, setVideo)}{check('image to video', imageToVideo, setImageToVideo)}{check('upscale', upscale, setUpscale)}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <label className="text-xs text-fg-2 flex items-center gap-1">max images <input type="number" min={1} max={4} value={maxImages} onChange={num(setMaxImages)} className={`${inputSm} w-20 tnum`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">max seconds <input type="number" min={0} value={maxSeconds} onChange={num(setMaxSeconds)} className={`${inputSm} w-20 tnum`} /></label>
+            <label className="text-xs text-fg-2 flex items-center gap-1">lengths <input value={seconds} onChange={(e) => setSeconds(e.target.value)} placeholder="4, 8, 12" title="Video lengths the model accepts, in seconds; the first is the default. Empty: any length up to max seconds." className={`${inputSm} w-24 font-mono`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">$/image <input type="number" step="0.001" value={perImage} onChange={num(setPerImage)} className={`${inputSm} w-24 tnum`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">$/second <input type="number" step="0.001" value={perSecond} onChange={num(setPerSecond)} className={`${inputSm} w-24 tnum`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">$/M tokens in <input type="number" step="0.01" value={inPerM} onChange={num(setInPerM)} className={`${inputSm} w-20 tnum`} /></label>
@@ -494,7 +498,7 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
 }
 
 type RentalTemplate = {
-  name: string; provider: string; description: string; gpu: string; gpu_count: number; model: string
+  name: string; kind: 'inference' | 'trainer'; provider: string; description: string; gpu: string; gpu_count: number; model: string
   idle_timeout: number; max_hours: number; hourly_usd: number
   endpoint: { id: string; display_name: string }
 }
@@ -567,6 +571,8 @@ function Rentals() {
               </div>
               {running ? (
                 <span className="meta shrink-0">{running.status}</span>
+              ) : t.kind === 'trainer' ? (
+                <span className="meta shrink-0" title="Set WS_FINETUNE_TEMPLATE to this template; a fine-tune job targeting a rented GPU starts and stops it">started by fine-tune jobs</span>
               ) : (
                 <button onClick={() => start.mutate(t.name)} disabled={start.isPending || !d.providers[t.provider] || !d.caps.key_set || d.caps.disabled} className={btn.primarySm}>
                   Start · ${t.hourly_usd.toFixed(2)}/h

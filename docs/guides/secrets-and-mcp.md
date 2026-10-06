@@ -20,7 +20,7 @@ The full variable list is in [Configuration](../CONFIGURATION.md).
 
 ## MCP servers
 
-The Model Context Protocol lets the assistant use tools that live outside ws. List servers in `config/mcp.yaml`; each one needs a `name` and either a `url` (Streamable HTTP, or `transport: sse`) or a `command` (see below). Their tools appear to the assistant as `mcp__<server>__<tool>` and work in chat as well as in code projects.
+The Model Context Protocol lets the assistant use tools that live outside ws. List servers in `config/mcp.yaml`; each one needs a `name` and either a `url` (Streamable HTTP, or `transport: sse`) or a `command` (see below). Their tools appear to the assistant as `mcp__<server>__<tool>` and work in chat as well as in code projects for URL servers; `command:` servers (below) work only in code projects.
 
 ```yaml
 servers:
@@ -46,6 +46,6 @@ MCP servers that need a filesystem or a shell can be listed with a `command:` in
 
 ## ws as an MCP server
 
-If you use Claude Code or another MCP client, point it at ws: `claude mcp add --transport http ws https://<your-host>/mcp --header "Authorization: Bearer ws_..."` (the Settings page prints the line for a key you mint with **MCP access** ticked; a key without it, including every key made before this setting existed, gets a `403`). The tools let the client list your projects, conversations and models, read a conversation, ask a model a one-off question, start a run in a project and follow it. It needs an API key with the `mcp` scope, not a browser session, and every call acts as the key's user. `WS_MCP_SERVER=false` turns it off.
+If you use Claude Code or another MCP client, point it at ws: `claude mcp add --transport http ws https://<your-host>/mcp --header "Authorization: Bearer ws_..."` (the Settings page prints the line for a key you mint with **MCP access** ticked; a key without it, including every key made before this setting existed, gets a `403`). The tools let the client list your projects, conversations and models, read a conversation, ask a model a one-off question, start a run in a project and follow it, and hand a task to the task router. It needs an API key with the `mcp` scope, not a browser session, and every call acts as the key's user. `WS_MCP_SERVER=false` turns it off.
 
-*Checked against the code and configuration at master `f54aa75`.*
+*Checked against the code and configuration at master `13a673a`.*

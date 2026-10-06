@@ -52,11 +52,24 @@ var (
 	ErrNotAvailable = errors.New("rental: the provider has no such machine available right now")
 )
 
+// Template kinds.
+const (
+	// KindInference serves a model: ws registers an endpoint for it while
+	// it runs and routes to it.
+	KindInference = "inference"
+	// KindTrainer runs the trainer image in serve mode (infra/training):
+	// no endpoint; the training service drives it over HTTP for one
+	// fine-tune job and stops it after.
+	KindTrainer = "trainer"
+)
+
 // Template is one infra/rental/templates/*.yaml.
 type Template struct {
 	Name        string `yaml:"name" json:"name"`
 	Provider    string `yaml:"provider" json:"provider"` // runpod
 	Description string `yaml:"description" json:"description"`
+	// Kind is inference (default) or trainer.
+	Kind string `yaml:"kind" json:"kind"`
 	// GPU is the provider's GPU type id (RunPod: "NVIDIA H100 80GB HBM3").
 	GPU      string `yaml:"gpu" json:"gpu"`
 	GPUCount int    `yaml:"gpu_count" json:"gpu_count"`
@@ -99,6 +112,9 @@ type TemplateEndpoint struct {
 // ProviderID is the providers row an instance of a template serves through.
 func (t Template) ProviderID() string { return "rental-" + t.Name }
 
+// IsTrainer reports a trainer template.
+func (t Template) IsTrainer() bool { return t.Kind == KindTrainer }
+
 var templateNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
 // LoadTemplates reads every *.yaml in dir.
@@ -133,8 +149,27 @@ func (t *Template) validate() error {
 	if !templateNameRe.MatchString(t.Name) {
 		return fmt.Errorf("name %q: lowercase letters, digits and dashes", t.Name)
 	}
-	if t.Provider == "" || t.GPU == "" || t.Image == "" || t.Model == "" || t.Endpoint.ID == "" {
-		return errors.New("provider, gpu, image, model and endpoint.id are required")
+	switch t.Kind {
+	case "":
+		t.Kind = KindInference
+	case KindInference, KindTrainer:
+	default:
+		return fmt.Errorf("kind %q: inference or trainer", t.Kind)
+	}
+	if t.Provider == "" || t.GPU == "" || t.Image == "" {
+		return errors.New("provider, gpu and image are required")
+	}
+	if t.IsTrainer() {
+		// A trainer has no model and no endpoint; the instance row still
+		// names one (its ledger rows and the idle check key on it).
+		if t.Endpoint.ID == "" {
+			t.Endpoint.ID = "trainer/" + t.Name
+		}
+		if t.Endpoint.DisplayName == "" {
+			t.Endpoint.DisplayName = "trainer (rented " + t.GPU + ")"
+		}
+	} else if t.Model == "" || t.Endpoint.ID == "" {
+		return errors.New("model and endpoint.id are required")
 	}
 	if t.GPUCount <= 0 {
 		t.GPUCount = 1
@@ -215,6 +250,7 @@ type Store interface {
 	SetRentalReady(ctx context.Context, arg store.SetRentalReadyParams) error
 	SetRentalProviderID(ctx context.Context, arg store.SetRentalProviderIDParams) error
 	SetRentalUsage(ctx context.Context, arg store.SetRentalUsageParams) error
+	TouchRentalInstance(ctx context.Context, id uuid.UUID) error
 	SumRentalHoursSince(ctx context.Context, since time.Time) (float64, error)
 	LastUsageForEndpoint(ctx context.Context, endpointID *string) (time.Time, error)
 	UpsertProvider(ctx context.Context, arg store.UpsertProviderParams) error
@@ -296,8 +332,11 @@ func (c *Controller) Start(ctx context.Context, templateName string, userID uuid
 	spec := StartSpec{Name: "ws-" + tpl.Name + "-" + c.now().UTC().Format("0102-1504"), Template: tpl, Args: Expand(tpl.Args, c.getenv), Env: env}
 	// Register the provider and endpoint first so an instance row never
 	// points at nothing; the endpoint stays disabled until the probe passes.
-	if err := c.register(ctx, tpl, "http://pending.invalid", false); err != nil {
-		return nil, err
+	// A trainer has no endpoint.
+	if !tpl.IsTrainer() {
+		if err := c.register(ctx, tpl, "http://pending.invalid", false); err != nil {
+			return nil, err
+		}
 	}
 	row, err := c.DB.CreateRentalInstance(ctx, store.CreateRentalInstanceParams{
 		Provider: tpl.Provider, Template: tpl.Name, Gpu: tpl.GPU, EndpointID: tpl.Endpoint.ID, HourlyUsd: tpl.HourlyUSD, StartedBy: store.NullUUID(userID),
@@ -328,6 +367,17 @@ func (c *Controller) Stop(ctx context.Context, id uuid.UUID, reason string) erro
 	return c.stop(ctx, row, reason)
 }
 
+// Instance returns an instance row.
+func (c *Controller) Instance(ctx context.Context, id uuid.UUID) (store.RentalInstance, error) {
+	return c.DB.GetRentalInstance(ctx, id)
+}
+
+// Touch records activity on an instance that has no ledger traffic (a
+// trainer being driven), so the idle check leaves it alone.
+func (c *Controller) Touch(ctx context.Context, id uuid.UUID) error {
+	return c.DB.TouchRentalInstance(ctx, id)
+}
+
 func (c *Controller) stop(ctx context.Context, row store.RentalInstance, reason string) error {
 	switch row.Status {
 	case StatusStopped, StatusFailed:
@@ -344,7 +394,9 @@ func (c *Controller) stop(ctx context.Context, row store.RentalInstance, reason 
 	c.bill(ctx, row, true)
 	_ = c.DB.SetRentalStatus(ctx, store.SetRentalStatusParams{ID: row.ID, Status: StatusStopped, StopReason: &reason})
 	if tpl, ok := c.Template(row.Template); ok {
-		c.unregister(ctx, tpl)
+		if !tpl.IsTrainer() {
+			c.unregister(ctx, tpl)
+		}
 	} else {
 		_ = c.DB.DeleteProvider(ctx, "rental-"+row.Template)
 		c.reload(ctx)
@@ -414,7 +466,9 @@ func (c *Controller) reconcileOne(ctx context.Context, row store.RentalInstance)
 		}
 		c.bill(ctx, row, true)
 		_ = c.DB.SetRentalStatus(ctx, store.SetRentalStatusParams{ID: row.ID, Status: StatusFailed, Error: &msg})
-		c.unregister(ctx, tpl)
+		if !tpl.IsTrainer() {
+			c.unregister(ctx, tpl)
+		}
 		return nil
 	}
 	switch row.Status {
@@ -430,15 +484,23 @@ func (c *Controller) reconcileOne(ctx context.Context, row store.RentalInstance)
 		if row.Status == StatusProvisioning {
 			_ = c.DB.SetRentalStatus(ctx, store.SetRentalStatusParams{ID: row.ID, Status: StatusWarming})
 		}
-		if err := c.probe(ctx, st.BaseURL, tpl.Model); err != nil {
-			c.log().Debug("rental: not ready yet", "instance", row.ID, "err", err)
+		var perr error
+		if tpl.IsTrainer() {
+			perr = c.probeTrainer(ctx, st.BaseURL)
+		} else {
+			perr = c.probe(ctx, st.BaseURL, tpl.Model)
+		}
+		if perr != nil {
+			c.log().Debug("rental: not ready yet", "instance", row.ID, "err", perr)
 			return nil
 		}
 		if err := c.DB.SetRentalReady(ctx, store.SetRentalReadyParams{ID: row.ID, BaseUrl: &st.BaseURL, HourlyUsd: st.HourlyUSD}); err != nil {
 			return err
 		}
-		if err := c.register(ctx, tpl, st.BaseURL, true); err != nil {
-			return err
+		if !tpl.IsTrainer() {
+			if err := c.register(ctx, tpl, st.BaseURL, true); err != nil {
+				return err
+			}
 		}
 		c.log().Info("rental: ready", "instance", row.ID, "template", tpl.Name, "base_url", st.BaseURL, "hourly_usd", st.HourlyUSD, "after", now.Sub(row.StartedAt).Round(time.Second))
 		return nil
@@ -459,6 +521,10 @@ func (c *Controller) reconcileOne(ctx context.Context, row store.RentalInstance)
 		}
 		if t, err := c.DB.LastUsageForEndpoint(ctx, &row.EndpointID); err == nil && t.After(last) {
 			last = t
+		}
+		// Touch (a trainer being driven) lands on the row, not the ledger.
+		if row.LastRequestAt != nil && row.LastRequestAt.After(last) {
+			last = *row.LastRequestAt
 		}
 		if now.Sub(last) > tpl.IdleTimeout {
 			return c.stop(ctx, row, fmt.Sprintf("idle for %s", tpl.IdleTimeout))
@@ -535,6 +601,26 @@ func (c *Controller) probe(ctx context.Context, baseURL, model string) error {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("/chat/completions: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// probeTrainer checks that a trainer pod answers its status route with
+// the rental key (infra/training serve mode).
+func (c *Controller) probeTrainer(ctx context.Context, baseURL string) error {
+	client := c.Probe
+	if client == nil {
+		client = &http.Client{Timeout: 20 * time.Second}
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+c.getenv(c.apiKeyEnv()))
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("/status: HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

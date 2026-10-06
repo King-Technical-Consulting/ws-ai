@@ -97,6 +97,91 @@ type Deps struct {
 	Rental interface {
 		Reconcile(ctx context.Context) error
 	}
+	// Training runs dataset builds, fine-tunes and evals (internal/training);
+	// nil leaves the queue without a worker.
+	Training interface {
+		Build(ctx context.Context, datasetID uuid.UUID) error
+		RunFinetune(ctx context.Context, jobID uuid.UUID) error
+		Evaluate(ctx context.Context, adapterID uuid.UUID) error
+	}
+}
+
+// TrainingBuildArgs exports a dataset.
+type TrainingBuildArgs struct {
+	DatasetID uuid.UUID `json:"dataset_id"`
+}
+
+// Kind implements river.JobArgs.
+func (TrainingBuildArgs) Kind() string { return "training.build" }
+
+// InsertOpts: one build per dataset; a failure is on the row.
+func (TrainingBuildArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "training", MaxAttempts: 1, UniqueOpts: river.UniqueOpts{ByArgs: true}}
+}
+
+// TrainingFinetuneArgs runs one fine-tune job.
+type TrainingFinetuneArgs struct {
+	JobID uuid.UUID `json:"job_id"`
+}
+
+// Kind implements river.JobArgs.
+func (TrainingFinetuneArgs) Kind() string { return "training.finetune" }
+
+// InsertOpts: one River job per fine-tune; never retried (hours of GPU).
+func (TrainingFinetuneArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "training", MaxAttempts: 1, UniqueOpts: river.UniqueOpts{ByArgs: true}}
+}
+
+// TrainingEvalArgs runs the eval gate on an adapter.
+type TrainingEvalArgs struct {
+	AdapterID uuid.UUID `json:"adapter_id"`
+}
+
+// Kind implements river.JobArgs.
+func (TrainingEvalArgs) Kind() string { return "training.eval" }
+
+// InsertOpts: one eval at a time per adapter.
+func (TrainingEvalArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "training", MaxAttempts: 1, UniqueOpts: river.UniqueOpts{ByArgs: true, ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}}}
+}
+
+type trainingBuildWorker struct {
+	river.WorkerDefaults[TrainingBuildArgs]
+	deps *Deps
+}
+
+func (w *trainingBuildWorker) Timeout(*river.Job[TrainingBuildArgs]) time.Duration {
+	return 30 * time.Minute
+}
+
+func (w *trainingBuildWorker) Work(ctx context.Context, job *river.Job[TrainingBuildArgs]) error {
+	return w.deps.Training.Build(ctx, job.Args.DatasetID)
+}
+
+type trainingFinetuneWorker struct {
+	river.WorkerDefaults[TrainingFinetuneArgs]
+	deps *Deps
+}
+
+func (w *trainingFinetuneWorker) Timeout(*river.Job[TrainingFinetuneArgs]) time.Duration {
+	return 8 * time.Hour
+}
+
+func (w *trainingFinetuneWorker) Work(ctx context.Context, job *river.Job[TrainingFinetuneArgs]) error {
+	return w.deps.Training.RunFinetune(ctx, job.Args.JobID)
+}
+
+type trainingEvalWorker struct {
+	river.WorkerDefaults[TrainingEvalArgs]
+	deps *Deps
+}
+
+func (w *trainingEvalWorker) Timeout(*river.Job[TrainingEvalArgs]) time.Duration {
+	return 2 * time.Hour
+}
+
+func (w *trainingEvalWorker) Work(ctx context.Context, job *river.Job[TrainingEvalArgs]) error {
+	return w.deps.Training.Evaluate(ctx, job.Args.AdapterID)
 }
 
 // RentalTickArgs is the periodic rented-GPU reconcile.
@@ -237,6 +322,12 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 				return RentalTickArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Minute}}
 			}, &river.PeriodicJobOpts{RunOnStart: true}))
 		}
+		if deps.Training != nil {
+			river.AddWorker(workers, &trainingBuildWorker{deps: deps})
+			river.AddWorker(workers, &trainingFinetuneWorker{deps: deps})
+			river.AddWorker(workers, &trainingEvalWorker{deps: deps})
+			cfg.Queues["training"] = river.QueueConfig{MaxWorkers: 1}
+		}
 		if deps.Sandbox != nil {
 			river.AddWorker(workers, &sandboxReapWorker{deps: deps})
 			cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
@@ -263,6 +354,23 @@ func (cl *Client) Stop(ctx context.Context) error { return cl.c.Stop(ctx) }
 // EnqueueRun schedules a run to be driven by the worker.
 func (cl *Client) EnqueueRun(ctx context.Context, runID uuid.UUID) error {
 	_, err := cl.c.Insert(ctx, RunArgs{RunID: runID}, nil)
+	return err
+}
+
+// EnqueueTrainingBuild, EnqueueFinetune and EnqueueEval schedule the
+// training flywheel's jobs.
+func (cl *Client) EnqueueTrainingBuild(ctx context.Context, datasetID uuid.UUID) error {
+	_, err := cl.c.Insert(ctx, TrainingBuildArgs{DatasetID: datasetID}, nil)
+	return err
+}
+
+func (cl *Client) EnqueueFinetune(ctx context.Context, jobID uuid.UUID) error {
+	_, err := cl.c.Insert(ctx, TrainingFinetuneArgs{JobID: jobID}, nil)
+	return err
+}
+
+func (cl *Client) EnqueueEval(ctx context.Context, adapterID uuid.UUID) error {
+	_, err := cl.c.Insert(ctx, TrainingEvalArgs{AdapterID: adapterID}, nil)
 	return err
 }
 
@@ -334,8 +442,9 @@ type mediaWorker struct {
 	deps *Deps
 }
 
-// Timeout bounds one generation; video engines poll inside it.
-func (w *mediaWorker) Timeout(*river.Job[MediaArgs]) time.Duration { return 15 * time.Minute }
+// Timeout bounds one generation; video engines poll inside it, and a
+// hosted video render can take ten minutes or more.
+func (w *mediaWorker) Timeout(*river.Job[MediaArgs]) time.Duration { return 25 * time.Minute }
 
 func (w *mediaWorker) Work(ctx context.Context, job *river.Job[MediaArgs]) error {
 	return w.deps.Media.Run(ctx, job.Args.JobID)

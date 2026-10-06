@@ -28,6 +28,7 @@ type fakeStore struct {
 	enabled   map[string]bool
 	lastUse   map[string]time.Time
 	reloads   int
+	clock     func() time.Time // Touch's now() (default time.Now)
 }
 
 func newFake() *fakeStore {
@@ -121,6 +122,18 @@ func (f *fakeStore) SetRentalUsage(_ context.Context, p store.SetRentalUsagePara
 		r.LastRequestAt = p.LastRequestAt
 	}
 	f.rows[p.ID] = r
+	return nil
+}
+func (f *fakeStore) TouchRentalInstance(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.rows[id]
+	now := time.Now()
+	if f.clock != nil {
+		now = f.clock()
+	}
+	r.LastRequestAt = &now
+	f.rows[id] = r
 	return nil
 }
 func (f *fakeStore) SumRentalHoursSince(_ context.Context, since time.Time) (float64, error) {
@@ -505,10 +518,103 @@ func TestLoadTemplates(t *testing.T) {
 	if err != nil || len(shipped) < 2 {
 		t.Errorf("shipped templates: %d, %v", len(shipped), err)
 	}
+	var trainers int
 	for _, s := range shipped {
+		if s.IsTrainer() {
+			trainers++
+			if s.Env["TRAINER_API_KEY"] != "$WS_RENTAL_API_KEY" || s.Env["TRAINER_MODE"] != "serve" || s.Endpoint.ID != "trainer/"+s.Name {
+				t.Errorf("%s: a trainer template must serve with the rental key: %+v", s.Name, s)
+			}
+			continue
+		}
 		if !strings.Contains(s.Args, "$WS_RENTAL_API_KEY") {
 			t.Errorf("%s: args do not require the rental key", s.Name)
 		}
+	}
+	if trainers == 0 {
+		t.Error("no trainer template ships")
+	}
+	dir2 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir2, "a.yaml"), []byte("kind: nope\nprovider: runpod\ngpu: H100\nimage: x\nmodel: m\nendpoint: {id: x}\n"), 0o600)
+	if _, err := LoadTemplates(dir2); err == nil || !strings.Contains(err.Error(), "kind") {
+		t.Errorf("bad kind: %v", err)
+	}
+}
+
+// trainerServer answers like the trainer image in serve mode when up.
+func trainerServer(t *testing.T, up *bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer rk-test" {
+			w.WriteHeader(401)
+			return
+		}
+		if !*up || r.URL.Path != "/v1/status" {
+			w.WriteHeader(503)
+			return
+		}
+		_, _ = w.Write([]byte(`{"state":"idle"}`))
+	}))
+}
+
+func TestTrainerTemplateHasNoEndpointAndIdlesOnTouch(t *testing.T) {
+	e := newEnv(t)
+	c, db, prov, now := e.c, e.db, e.prov, e.now
+	up := false
+	srv := trainerServer(t, &up)
+	t.Cleanup(srv.Close)
+	c.Probe = srv.Client()
+	db.clock = func() time.Time { return *now }
+	tpl := Template{Name: "trainer-test", Kind: KindTrainer, Provider: "fake", GPU: "A100", Image: "trainer", Env: map[string]string{"TRAINER_API_KEY": "$WS_RENTAL_API_KEY"}, HourlyUSD: 1.5}
+	if err := tpl.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if tpl.Endpoint.ID != "trainer/trainer-test" || tpl.Model != "" {
+		t.Fatalf("validated trainer = %+v", tpl)
+	}
+	c.Templates = append(c.Templates, tpl)
+	ctx := context.Background()
+	row, err := c.Start(ctx, "trainer-test", uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.providers["rental-trainer-test"]; ok || len(db.endpoints) != 0 {
+		t.Errorf("a trainer registered a provider or endpoint: %+v %+v", db.providers, db.endpoints)
+	}
+	if prov.started[0].Env["TRAINER_API_KEY"] != "rk-test" {
+		t.Errorf("trainer env = %+v", prov.started[0].Env)
+	}
+	prov.set(*row.ProviderInstanceID, Status{State: "running", BaseURL: srv.URL + "/v1", HourlyUSD: 1.49})
+	_ = c.Reconcile(ctx)
+	got, _ := db.GetRentalInstance(ctx, row.ID)
+	if got.Status != StatusWarming {
+		t.Fatalf("before the trainer answers: %+v", got)
+	}
+	up = true
+	_ = c.Reconcile(ctx)
+	got, _ = db.GetRentalInstance(ctx, row.ID)
+	if got.Status != StatusReady || got.BaseUrl == nil || got.HourlyUsd != 1.49 || len(db.endpoints) != 0 {
+		t.Fatalf("after the trainer answers: %+v endpoints=%d", got, len(db.endpoints))
+	}
+	if inst, err := c.Instance(ctx, row.ID); err != nil || inst.ID != row.ID {
+		t.Errorf("Instance: %+v, %v", inst, err)
+	}
+	// Touched recently: stays up past the idle timeout measured from ready.
+	*now = now.Add(25 * time.Minute)
+	if err := c.Touch(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Reconcile(ctx)
+	got, _ = db.GetRentalInstance(ctx, row.ID)
+	if got.Status != StatusReady {
+		t.Fatalf("touched trainer stopped: %+v", got)
+	}
+	// Not touched for longer than the idle timeout: stopped, nothing to
+	// unregister.
+	*now = now.Add(30 * time.Minute)
+	_ = c.Reconcile(ctx)
+	got, _ = db.GetRentalInstance(ctx, row.ID)
+	if got.Status != StatusStopped || got.StopReason == nil || !strings.Contains(*got.StopReason, "idle") || len(prov.stopped) != 1 {
+		t.Fatalf("idle trainer: %+v stopped=%v", got, prov.stopped)
 	}
 }
 

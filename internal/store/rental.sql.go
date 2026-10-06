@@ -312,3 +312,12 @@ func (q *Queries) SumRentalHoursSince(ctx context.Context, startedAt time.Time) 
 	err := row.Scan(&column_1)
 	return column_1, err
 }
+
+const touchRentalInstance = `-- name: TouchRentalInstance :exec
+UPDATE rental_instances SET last_request_at = now() WHERE id = $1
+`
+
+func (q *Queries) TouchRentalInstance(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, touchRentalInstance, id)
+	return err
+}

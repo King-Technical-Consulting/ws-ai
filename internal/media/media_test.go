@@ -126,6 +126,30 @@ func (f *fakeStore) ListAttachmentsByIDs(_ context.Context, ids []uuid.UUID) ([]
 	return out, nil
 }
 
+func (f *fakeStore) GetAttachment(_ context.Context, id uuid.UUID) (store.Attachment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.atts[id]
+	if !ok {
+		return store.Attachment{}, pgx.ErrNoRows
+	}
+	return a, nil
+}
+
+func (f *fakeStore) AttachmentMediaProjects(_ context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []uuid.UUID
+	for _, j := range f.jobs {
+		for _, oid := range j.OutputAttachmentIds {
+			if oid == id {
+				out = append(out, j.ProjectID)
+			}
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) GetConversation(_ context.Context, id uuid.UUID) (store.Conversation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -140,15 +164,22 @@ func (f *fakeStore) GetConversation(_ context.Context, id uuid.UUID) (store.Conv
 type fakeEngine struct {
 	err   error
 	calls int
+	last  *Request
 }
 
 func (e *fakeEngine) Generate(_ context.Context, _ *gateway.Provider, ep *gateway.Endpoint, req *Request, progress Progress) (*Result, error) {
 	e.calls++
+	cp := *req
+	e.last = &cp
 	if e.err != nil {
 		return nil, e.err
 	}
 	progress(0.5, "prov-1")
 	res := &Result{}
+	if req.Kind == KindVideo {
+		res.Outputs = append(res.Outputs, Output{Data: []byte("not really mp4"), MIME: "video/mp4", Seconds: float64(req.Seconds)})
+		return res, nil
+	}
 	for i := 0; i < req.N; i++ {
 		res.Outputs = append(res.Outputs, Decode(pngBytes(8+i, 4)))
 	}

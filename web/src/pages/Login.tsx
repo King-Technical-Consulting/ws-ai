@@ -4,7 +4,7 @@ import { startAuthentication } from '@simplewebauthn/browser'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { KeyRound, Mail } from 'lucide-react'
-import { Divider, Callout, btn, input } from '../components/ui'
+import { Divider, Callout, WsMark, btn, input } from '../components/ui'
 
 export default function Login() {
   const nav = useNavigate()
@@ -52,7 +52,10 @@ export default function Login() {
     <div className="h-full grid place-items-center p-6">
       <div className="w-full max-w-sm space-y-6">
         <div>
-          <h1 className="wordmark">ws</h1>
+          <h1 className="wordmark inline-flex items-center gap-3">
+            <WsMark size={40} draw className="text-fg" />
+            ws
+          </h1>
           <p className="tagline text-fg-2 mt-1">Self-hosted AI workspace. Invite only.</p>
         </div>
 

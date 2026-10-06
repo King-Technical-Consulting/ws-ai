@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
@@ -26,7 +27,19 @@ func TestHasScope(t *testing.T) {
 		t.Error("mcp scope not honoured")
 	}
 	key.Scopes = nil
-	if key.HasScope(ScopeChat) {
+	if key.HasScope(ScopeChat) || key.HasScope(ScopeJobs) {
 		t.Error("a key with no scopes should have none")
+	}
+	key.Scopes = []string{ScopeJobs}
+	if !key.HasScope(ScopeJobs) || key.HasScope(ScopeChat) {
+		t.Error("jobs-only key")
+	}
+	if !session.HasScope(ScopeJobs) {
+		t.Error("session principal should carry jobs too")
+	}
+	for _, sc := range []string{ScopeChat, ScopeMCP, ScopeJobs} {
+		if !slices.Contains(KnownScopes, sc) {
+			t.Errorf("%s missing from KnownScopes", sc)
+		}
 	}
 }

@@ -81,11 +81,18 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return t, ok
 }
 
-// Defs returns tool definitions, filtered by an allowlist (empty = all),
-// sorted by name so the prompt prefix stays cache-stable.
+// NoTools in an allowlist means the run gets no tools at all. An empty
+// allowlist means every registered tool, so "none" needs a word.
+const NoTools = "none"
+
+// Defs returns tool definitions, filtered by an allowlist (empty = all,
+// NoTools = none), sorted by name so the prompt prefix stays cache-stable.
 func (r *Registry) Defs(allow []string) []gateway.ToolDef {
 	allowed := map[string]bool{}
 	for _, a := range allow {
+		if a == NoTools {
+			return nil
+		}
 		allowed[a] = true
 	}
 	var out []gateway.ToolDef

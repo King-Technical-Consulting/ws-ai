@@ -84,7 +84,7 @@ func (c *Config) Reporter() (*Reporter, error) {
 	key := strings.TrimSpace(os.Getenv("WSJ_WS_KEY"))
 	if key == "" {
 		if c.WS.KeyFile == "" {
-			return nil, errors.New("ws: set key_file in [ws] (a ws API key) or WSJ_WS_KEY")
+			return nil, errors.New("ws: set key_file in [ws] (an owner's ws API key minted with job reporting) or WSJ_WS_KEY")
 		}
 		b, err := os.ReadFile(ExpandHome(c.WS.KeyFile))
 		if err != nil {

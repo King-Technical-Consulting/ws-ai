@@ -12,6 +12,7 @@ package agents
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"strings"
 	"time"
 
@@ -33,11 +35,18 @@ import (
 
 // Trigger kinds (agent_triggers.kind).
 const (
-	KindCron     = "cron"
-	KindWebhook  = "webhook"
-	KindRepoPush = "repo_push" // planned: GitHub App push events
+	KindCron    = "cron"
+	KindWebhook = "webhook"
+	// KindRepoPush is a GitHub webhook: same URL and secret as a webhook,
+	// but the payload is read as a GitHub event, filtered by the spec's
+	// events and branches, and rendered for the model.
+	KindRepoPush = "repo_push"
 	KindManual   = "manual"
 )
+
+// ErrIgnored says a hook delivery matched no filter (a ping, another
+// branch, an event the trigger does not want); the caller answers 200.
+var ErrIgnored = errors.New("agents: delivery ignored")
 
 // Errors callers map to HTTP statuses.
 var (
@@ -53,15 +62,28 @@ const MaxInputBytes = 64 << 10
 
 // ModelPolicy is agents.model_policy.
 type ModelPolicy struct {
-	Selector  string            `json:"selector,omitempty"`
-	TaskClass gateway.TaskClass `json:"task_class,omitempty"`
-	Reasoning bool              `json:"reasoning,omitempty"`
+	Selector  string            `json:"selector,omitempty" yaml:"selector"`
+	TaskClass gateway.TaskClass `json:"task_class,omitempty" yaml:"task_class"`
+	Reasoning bool              `json:"reasoning,omitempty" yaml:"reasoning"`
 }
 
 // CronSpec is agent_triggers.spec for kind cron.
 type CronSpec struct {
 	Expr string `json:"expr"`
 	// Input is the first user message of each run; empty means the goal.
+	Input string `json:"input,omitempty"`
+}
+
+// RepoPushSpec is agent_triggers.spec for kind repo_push.
+type RepoPushSpec struct {
+	// Repo, when set, is the only owner/name accepted.
+	Repo string `json:"repo,omitempty"`
+	// Branches are the branch names (or path patterns such as release/*)
+	// a push must land on; empty means any branch.
+	Branches []string `json:"branches,omitempty"`
+	// Events are the GitHub event names to run on (default push).
+	Events []string `json:"events,omitempty"`
+	// Input is text put before the rendered event (instructions for the run).
 	Input string `json:"input,omitempty"`
 }
 
@@ -72,6 +94,7 @@ type Store interface {
 	CountOpenRunsForAgent(ctx context.Context, agentID uuid.NullUUID) (int64, error)
 	GetRun(ctx context.Context, id uuid.UUID) (store.AgentRun, error)
 	CancelRun(ctx context.Context, id uuid.UUID) error
+	SetRunStatus(ctx context.Context, arg store.SetRunStatusParams) error
 	CreateConversation(ctx context.Context, arg store.CreateConversationParams) (store.Conversation, error)
 	SetConversationAgent(ctx context.Context, arg store.SetConversationAgentParams) error
 	NextMessageSeq(ctx context.Context, conversationID uuid.UUID) (int32, error)
@@ -96,8 +119,11 @@ type Service struct {
 	// Memory, when set, recalls earlier runs' memories into the system
 	// prompt of each new run.
 	Memory *Memory
-	Log    *slog.Logger
-	Now    func() time.Time
+	// Presets are the starting points the new-agent form offers
+	// (config/presets, LoadPresets).
+	Presets []Preset
+	Log     *slog.Logger
+	Now     func() time.Time
 }
 
 // StartParams describe one firing.
@@ -225,7 +251,7 @@ func SystemPrompt(ag store.Agent) string {
 	if g := strings.TrimSpace(ag.Goal); g != "" {
 		b.WriteString("\n\nYour standing goal: " + g)
 	}
-	b.WriteString("\n\nYou run as a background job: nobody is watching live. Work the goal with the tools you have, then end with a short report of what you did, what you found and what you could not do. Use ask_user only for a decision you truly cannot make; it ends this run and the question waits in the agent's monitor until someone answers, which starts the next run with their reply.")
+	b.WriteString("\n\nYou run as a background job: nobody is watching live. Work the goal with the tools you have, then end with a short report of what you did, what you found and what you could not do. Use ask_user only for a decision you truly cannot make; it ends this run and the question waits in the agent's monitor until someone answers, which starts the next run with their reply. When you have remember and recall tools, use remember for a fact or preference future runs will need and recall to search what earlier runs kept; a summary of this run is kept automatically.")
 	return b.String()
 }
 
@@ -243,7 +269,7 @@ func (s *Service) Steer(ctx context.Context, runID uuid.UUID, text string, userI
 		return nil, fmt.Errorf("%w: message is required", ErrInvalid)
 	}
 	switch run.Status {
-	case "queued", "running", "paused_approval", "paused_steer":
+	case "queued", "running", "paused_approval", "paused_steer", "paused_manual":
 		return nil, ErrBusy
 	}
 	return s.Start(ctx, StartParams{AgentID: run.AgentID.UUID, Input: text, UserID: userID, Conversation: store.NullUUID(run.ConversationID), Label: "steer"})
@@ -252,6 +278,42 @@ func (s *Service) Steer(ctx context.Context, runID uuid.UUID, text string, userI
 // Cancel marks a run cancelled; the runtime stops at its next step.
 func (s *Service) Cancel(ctx context.Context, runID uuid.UUID) error {
 	return s.DB.CancelRun(ctx, runID)
+}
+
+// Pause holds a queued or running run: the runtime stops at its next
+// step and the run keeps its place (status paused_manual) until Resume.
+func (s *Service) Pause(ctx context.Context, runID uuid.UUID) error {
+	run, err := s.DB.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	switch run.Status {
+	case "queued", "running":
+	default:
+		return fmt.Errorf("%w: a %s run cannot be paused", ErrInvalid, strings.ReplaceAll(run.Status, "_", " "))
+	}
+	return s.DB.SetRunStatus(ctx, store.SetRunStatusParams{ID: run.ID, Status: "paused_manual"})
+}
+
+// Resume re-queues a run paused by Pause; the worker picks it up where
+// it stopped.
+func (s *Service) Resume(ctx context.Context, runID uuid.UUID) error {
+	run, err := s.DB.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != "paused_manual" {
+		return fmt.Errorf("%w: only a paused run can be resumed", ErrInvalid)
+	}
+	if err := s.DB.SetRunStatus(ctx, store.SetRunStatusParams{ID: run.ID, Status: "queued"}); err != nil {
+		return err
+	}
+	if s.Enqueue != nil {
+		if err := s.Enqueue(ctx, run.ID); err != nil {
+			return fmt.Errorf("agents: enqueue: %w", err)
+		}
+	}
+	return nil
 }
 
 // ---- triggers ----
@@ -287,7 +349,30 @@ func (s *Service) NewTrigger(ctx context.Context, agentID uuid.UUID, kind, name 
 		n := sch.Next(s.now())
 		next = &n
 		spec, _ = json.Marshal(cs)
-	case KindWebhook:
+	case KindWebhook, KindRepoPush:
+		if kind == KindRepoPush {
+			var rs RepoPushSpec
+			if err := json.Unmarshal(spec, &rs); err != nil {
+				return nil, "", fmt.Errorf("%w: repo_push spec: %v", ErrInvalid, err)
+			}
+			rs.Repo = strings.TrimSpace(rs.Repo)
+			if rs.Repo != "" && strings.Count(rs.Repo, "/") != 1 {
+				return nil, "", fmt.Errorf("%w: repo_push repo must be owner/name", ErrInvalid)
+			}
+			if len(rs.Events) == 0 {
+				rs.Events = []string{"push"}
+			}
+			for i, e := range rs.Events {
+				rs.Events[i] = strings.ToLower(strings.TrimSpace(e))
+			}
+			for i, b := range rs.Branches {
+				rs.Branches[i] = strings.TrimSpace(b)
+				if _, err := path.Match(rs.Branches[i], ""); err != nil {
+					return nil, "", fmt.Errorf("%w: branch pattern %q", ErrInvalid, b)
+				}
+			}
+			spec, _ = json.Marshal(rs)
+		}
 		b := make([]byte, 24)
 		if _, err := rand.Read(b); err != nil {
 			return nil, "", err
@@ -309,22 +394,76 @@ func (s *Service) NewTrigger(ctx context.Context, agentID uuid.UUID, kind, name 
 // Fire starts a run from a webhook trigger after checking its secret.
 // The body becomes the run's input.
 func (s *Service) Fire(ctx context.Context, triggerID uuid.UUID, secret string, body string) (*store.AgentRun, error) {
-	t, err := s.DB.GetTrigger(ctx, triggerID)
+	return s.FireHook(ctx, FireParams{TriggerID: triggerID, Secret: secret, Body: body})
+}
+
+// FireParams describe one hook delivery.
+type FireParams struct {
+	TriggerID uuid.UUID
+	Secret    string
+	Body      string
+	// GitHubEvent is the X-GitHub-Event header, set for repo_push triggers.
+	GitHubEvent string
+	// Signature is GitHub's X-Hub-Signature-256 header ("sha256=<hex>"),
+	// sent when the repository's webhook has a secret. When present it
+	// must be the HMAC of the body under the trigger's secret (the one in
+	// the URL), so a delivery is checked twice: the URL and the signature.
+	Signature string
+}
+
+// VerifySignature checks GitHub's sha256 signature of body under secret.
+func VerifySignature(signature, secret, body string) bool {
+	sig := strings.TrimPrefix(strings.TrimSpace(signature), "sha256=")
+	want, err := hex.DecodeString(sig)
+	if err != nil || len(want) != sha256.Size {
+		return false
+	}
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte(body))
+	return hmac.Equal(m.Sum(nil), want)
+}
+
+// FireHook starts a run from a webhook or repo_push trigger after checking
+// its secret. A webhook's body becomes the run's input verbatim; a
+// repo_push delivery is filtered by the spec and rendered, and one that
+// matches nothing (a ping, another branch) returns ErrIgnored without a
+// run.
+func (s *Service) FireHook(ctx context.Context, p FireParams) (*store.AgentRun, error) {
+	t, err := s.DB.GetTrigger(ctx, p.TriggerID)
 	if err != nil {
 		return nil, ErrSecret // do not reveal whether the id exists
 	}
-	sum := sha256.Sum256([]byte(secret))
-	if t.Kind != KindWebhook || !t.Enabled || len(t.SecretHash) != len(sum) || subtle.ConstantTimeCompare(t.SecretHash, sum[:]) != 1 {
+	sum := sha256.Sum256([]byte(p.Secret))
+	if (t.Kind != KindWebhook && t.Kind != KindRepoPush) || !t.Enabled || len(t.SecretHash) != len(sum) || subtle.ConstantTimeCompare(t.SecretHash, sum[:]) != 1 {
 		return nil, ErrSecret
 	}
-	input := strings.TrimSpace(body)
-	if len(input) > MaxInputBytes {
-		input = input[:MaxInputBytes]
+	if p.Signature != "" && !VerifySignature(p.Signature, p.Secret, p.Body) {
+		return nil, ErrSecret
 	}
-	if input != "" {
-		input = "Webhook payload:\n\n" + input
+	var input string
+	label := "webhook"
+	if t.Kind == KindRepoPush {
+		label = "github"
+		var rs RepoPushSpec
+		_ = json.Unmarshal(t.Spec, &rs)
+		rendered, ok := RenderGitHubEvent(rs, p.GitHubEvent, p.Body)
+		if !ok {
+			return nil, ErrIgnored
+		}
+		input = rendered
+		if rs.Input != "" {
+			input = strings.TrimSpace(rs.Input) + "\n\n" + input
+		}
+	} else {
+		input = strings.TrimSpace(p.Body)
+		if len(input) > MaxInputBytes {
+			input = input[:MaxInputBytes]
+		}
+		if input != "" {
+			input = "Webhook payload:\n\n" + input
+		}
 	}
-	run, err := s.Start(ctx, StartParams{AgentID: t.AgentID, TriggerID: store.NullUUID(t.ID), Input: input, Label: "webhook"})
+	run, err := s.Start(ctx, StartParams{AgentID: t.AgentID, TriggerID: store.NullUUID(t.ID), Input: input, Label: label})
 	msg := ""
 	if err != nil {
 		msg = err.Error()

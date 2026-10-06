@@ -28,6 +28,9 @@
   --color-accent-fg: #ffffff;
   --color-link-underline: #c9a882;
   --color-danger: #cc272e;
+  /* status hues: outlined chips, badges and diagrams only; never buttons or links */
+  --color-ok: #5f6a3a;     /* olive: healthy, local endpoints */
+  --color-info: #4f6272;   /* slate: info, hosted endpoints, queued */
 
   --radius-code: 2px;
 }
@@ -50,6 +53,8 @@
     --color-accent-fg: #1b1611;
     --color-link-underline: #7d5d40;
     --color-danger: #ef6b5f;
+    --color-ok: #a9b36f;
+    --color-info: #8ea6b8;
   }
 }
 
@@ -69,6 +74,14 @@ html, body { background: var(--color-bg); color: var(--color-fg); -webkit-font-s
 /* Wordmark: ws in small caps. */
 .wordmark { font-family: var(--font-serif); font-size: 18.7px; line-height: 1.5; font-variant: small-caps; letter-spacing: .2em; color: var(--color-fg-3); }
 .wordmark:hover { color: var(--color-accent-hover); }
+/* Logo draw-on: trunk, then branches, then destinations. Once, on load (Login only). */
+@keyframes ws-draw { from { stroke-dashoffset: 90 } to { stroke-dashoffset: 0 } }
+@keyframes ws-fade { from { opacity: 0 } to { opacity: 1 } }
+.ws-draw { stroke-dasharray: 90; animation: ws-draw 1.6s ease-out both }
+.ws-draw-2 { stroke-dasharray: 90; animation: ws-draw 1.6s ease-out .2s both }
+.ws-dest-1 { animation: ws-fade .6s ease-out 1.5s both }
+.ws-dest-2 { animation: ws-fade .6s ease-out 1.7s both }
+@media (prefers-reduced-motion: reduce) { .ws-draw, .ws-draw-2, .ws-dest-1, .ws-dest-2 { animation: none } }
 /* Pulsing italic "Thinking…". */
 .thinking { font-family: var(--font-serif); font-style: italic; font-size: 15.6px; color: var(--color-fg-3); animation: ws-pulse 2s cubic-bezier(.4,0,.6,1) infinite; }
 @keyframes ws-pulse { 50% { opacity: .5; } }

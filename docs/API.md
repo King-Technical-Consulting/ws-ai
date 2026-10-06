@@ -1,6 +1,6 @@
 # HTTP API
 
-The routes `ws serve` exposes, grouped by who calls them. Verified against `internal/httpx/server.go`, `internal/externalapi/`, `internal/artifacts/origin.go`, `internal/httpx/preview.go`, `internal/sandbox/internalapi.go` and the handlers they mount. Last verified at commit `5e9f902`.
+The routes `ws serve` exposes, grouped by who calls them. Verified against `internal/httpx/server.go`, `internal/externalapi/`, `internal/artifacts/origin.go`, `internal/httpx/preview.go`, `internal/sandbox/internalapi.go` and the handlers they mount. Last verified at commit `2d4e9f0`.
 
 This is a route and behavior map, not a full schema. Request fields are listed where a handler decodes a body; response bodies are the JSON rows from `internal/store` unless noted. The `/v1` surface is under active change for milestone M5 (passthrough, billing router), so treat that section as the contract today and check the PLAN for where it is heading.
 
@@ -19,7 +19,7 @@ Three credentials are accepted on authenticated routes, checked in this order. T
 
 | Credential | Form | Used for |
 |---|---|---|
-| API key | `Authorization: Bearer ws_...` | `/v1` (needs the `chat` scope) and `/mcp` (needs the `mcp` scope). A key reaches no other route |
+| API key | `Authorization: Bearer ws_...` | `/v1` (needs the `chat` scope), `/mcp` (needs the `mcp` scope) and the `wsj` job reports under `/api/jobs/cc` (needs the `jobs` scope). Every other `/api` route refuses a key with `403`, whatever its scopes and whoever owns it |
 | API key | `x-api-key: ws_...` | Anthropic-style clients |
 | Session | `ws_session` cookie (HttpOnly, SameSite=Lax, Secure outside `WS_ENV=dev`) | The browser app |
 
@@ -109,8 +109,11 @@ All routes below need authentication.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/me` | `{id, email, display_name, role, via_api_key}` |
-| `GET /api/models` | `{models, aliases}` for the model picker. `models` is `[{id, display_name, provider, local, capabilities, pricing, health}]` for enabled non-embedding, non-media endpoints; `media` lists the enabled image and video endpoints (`id`, `display_name`, `provider`, `local`, `engine`, `image`, `image_edit`, `video`, `sizes`, `max_images`, `max_seconds`, `health`, and `per_image` and `per_second` for hosted ones); `aliases` maps alias name to endpoint ids |
+| `GET /api/me` | `{id, email, display_name, role, via_api_key, training_consent}` |
+| `PUT /api/me/training-consent` | Body `{enabled}`. Whether the caller's conversations may be exported into training datasets (PLAN M10); off by default |
+| `PUT /api/messages/{id}/rating`, `DELETE /api/messages/{id}/rating` | Body `{score, note?}` with `score` `1` or `-1`: the caller's rating of an assistant message (one per user; a put replaces). `400` for a user message or another score; `404` for a message in a conversation the caller cannot see |
+| `GET /api/conversations/{id}/ratings` | `{ratings: {message_id: score}}`, the caller's ratings in the conversation |
+| `GET /api/models` | `{models, aliases}` for the model picker. `models` is `[{id, display_name, provider, local, capabilities, pricing, health}]` for enabled non-embedding, non-media endpoints; `media` lists the enabled image and video endpoints (`id`, `display_name`, `provider`, `local`, `engine`, `image`, `image_edit`, `video`, `image_to_video`, `sizes`, `max_images`, `max_seconds`, `seconds` (the allowed video lengths, `[]` when unrestricted), `health`, and `per_image` and `per_second` for hosted ones); `aliases` maps alias name to endpoint ids |
 | `GET /api/keys` | List the caller's API keys as `{id, name, prefix, scopes, default_policy, created_at, last_used_at}` (never the hash) |
 | `POST /api/keys` | Body `{name, scopes?, default_policy?}`; `scopes` is any of `chat` and `mcp` (`400 unknown scope "x" (chat, mcp)` otherwise) and defaults to `["chat"]`, `default_policy` to `auto`. `chat` is what `/v1` needs and `mcp` what `/mcp` needs; a browser session has every scope. Returns `201 {key, record}` with `record` in the same shape as the list; `key` is shown only once |
 | `DELETE /api/keys/{id}` | Revoke. `200 {"status":"ok"}` even for an unknown id; `400` for a malformed one |
@@ -128,7 +131,9 @@ All routes below need authentication.
 | `PATCH /api/conversations/{id}` | Body `{title?, model?, settings?}`. `settings.tool_policies` overrides tool policies, for example `{"tool_policies":{"web_fetch":"ask"}}` |
 | `DELETE /api/conversations/{id}` | Archive (not a hard delete). `PATCH` and `DELETE` answer `200 {"status":"ok"}` |
 | `GET /api/conversations/{id}/artifacts` | Artifacts created in the conversation |
-| `GET /api/artifacts/{id}`, `GET /api/artifacts/{id}/versions/{v}` | An artifact, current or by version (`?version=N` also works). Returns `{artifact, versions, version, version_id, url, content, kind, title}`; `url` is the signed viewer URL on the artifact origin |
+| `GET /api/artifacts/{id}`, `GET /api/artifacts/{id}/versions/{v}` | An artifact, current or by version (`?version=N` also works). Returns `{artifact, versions, version, version_id, url, content, kind, title, design_context}`; `url` is the signed viewer URL on the artifact origin; `design_context` is the design system a `design` version was made under (null otherwise) |
+| `GET /api/artifacts/{id}/export?version=N` | The version's content as a download (`Content-Disposition: attachment`): `.html` for `html` and `design`, `.svg`, `.md`, `.mmd`, or the code language's extension. The model's document as stored, never rendered on the app origin |
+| `POST /api/artifacts/{id}/variants` | Body `{n?, instruction?, version?, model?}`. Generates `n` (default 3, at most 4) alternatives of a `design` or `html` artifact's version in parallel, each a model call billed to the caller, and stores each as a new `design` artifact in the conversation titled "`title` · variant k" with the same `design_context`. `201 {variants: [ref], errors: [string]}`; `502` when none succeeded |
 
 ### Chat and runs
 
@@ -164,19 +169,20 @@ These proxy to the worker's internal API; the browser never reaches the worker o
 | `GET /api/projects/{id}/pty` | WebSocket carrying a `bash` session; query `cols`, `rows`, `cwd` |
 | `GET /api/projects/{id}/preview/{port}` | `302` to the preview host's `/__ws/auth`. `400` bad port, `503` if previews aren't configured |
 
-### Media (images)
+### Media (images and video)
 
 Generation is a durable job (`media_jobs`, River queue `media`), routed through the gateway so policies and budgets apply and one ledger row is written per job. All routes need a session and access to the project.
 
 | Route | Notes |
 |---|---|
 | `GET /api/projects/{id}/media` | `{jobs}`, newest first. `?limit=` (default 60, at most 200), `?offset=`, `?kind=` |
-| `POST /api/projects/{id}/media` | Body `{kind?, prompt, size?, n?, quality?, model?, conversation_id?}`. `kind` defaults to image; video, edit and upscale answer `400` not supported yet. Returns `201` and the job, with `inputs.estimate_usd` (the price shown before generating). `400` for an invalid request (no prompt, size or count the endpoint does not accept, no media endpoint for the selector, conversation not in the project), `402` when a blocking budget is spent, `503` when media is not configured |
+| `POST /api/projects/{id}/attachments` | Uploads a source photo for an edit or an image-to-video job. Multipart field `file`, images only (the type is read from the bytes), at most 32 MB. `201 {id, url, mime, bytes, filename, width, height}`; `404` for an inaccessible project, `400` for a missing or non-image file, `413 file over 32 MB`, `503 attachments are not configured`. The attachment belongs to the uploader |
+| `POST /api/projects/{id}/media` | Body `{kind?, prompt, size?, n?, quality?, seconds?, source_attachment_id?, mask_attachment_id?, scale?, model?, conversation_id?}`. `kind` is `image`, `edit` (needs `source_attachment_id`; `mask_attachment_id` marks the area to change, and only an edit takes one (`400` otherwise); OpenAI reads it as its `mask` field (transparent pixels are edited), fal sends it as `mask_url`, ComfyUI fills `{{mask}}`, and the Google engine ignores it), `upscale` (needs a source; `scale` 2, the default, or 4; the prompt is optional; one output) or `video` (text to video, or image to video when a source is given); it defaults to `image`, or to `edit` when a source is given. A source or mask must be an image of at most 32 MB that the caller owns or that a media job in the same project produced. `n` is at most 4 (and at most the endpoint's `max_images`; one per video job); `seconds` must be one of the endpoint's listed lengths, defaulting to the first, else 5 capped by `max_seconds`; a prompt is at most 32,000 characters. Returns `201` and the job, with `inputs.estimate_usd` (the price shown before generating). `400` for an invalid request (no prompt, size or count the endpoint does not accept, no media endpoint for the selector, conversation not in the project), `402` when a blocking budget is spent, `503` when media is not configured |
 | `GET /api/media/{id}` | One job: `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `progress`, `cost_usd`, `error`, and `outputs` (`[{id, url, mime, bytes, filename, width, height}]`) |
 | `DELETE /api/media/{id}` | Cancels a queued job (`{status:"cancelled"}`), removes a finished one (`{status:"deleted"}`; its attachments are kept), `409` while it runs (a started generation cannot be stopped) |
 | `GET /api/attachments/{id}` | Streams an attachment to its owner, or to anyone who can see a media job that produced it. Never served as HTML (`text/html` becomes `application/octet-stream`), with `Content-Security-Policy: sandbox; default-src 'none'`, `Content-Disposition: inline` and an immutable one-year private cache. `503` when attachments are not configured |
 
-Jobs found running for more than 15 minutes (a worker died) are marked abandoned. The agent tool `generate_image` (registered, and allowed in chat, only when an image endpoint exists on the box) creates a job in the conversation's project, waits up to 4 minutes for the worker, and returns the attachment URLs so the chat renders them.
+The Google engine (Imagen and Veo) takes `image`, `video` and image to video, but not `edit`, a mask or `upscale`. The Media page asks for a 2x upscale only; this route takes 2 or 4. Jobs found running for more than 15 minutes (a worker died) are marked abandoned. The agent tools `generate_image` (registered, and allowed in chat, only when an image endpoint exists on the box; an optional `source_attachment_id` makes it an edit, and `mask_attachment_id` adds a mask; there is no upscale tool, upscaling is on the Media page and this route) and `generate_video` (only when a video endpoint exists; `prompt`, `seconds` 1 to 60, `size`, `source_attachment_id`, `model`) create a job in the conversation's project, wait for the worker (4 minutes for an image, 15 for a video), and return the attachment URLs so the chat renders them, with an inline player for video.
 
 ### Agents and runs (PLAN M7)
 
@@ -185,19 +191,23 @@ An agent is a standing goal with its own tools, triggers and run history; each r
 | Route | Notes |
 |---|---|
 | `GET /api/agents` | The caller's agents, each with `project_id` |
-| `POST /api/agents` | Body `{name, goal, system_prompt, project_id, model: {selector, task_class, reasoning}, tool_allowlist[], tool_policies{tool: auto, ask or deny}, max_steps, enabled}`. `name` and `project_id` are required and the project must be accessible; `max_steps` defaults to 50 and is at most 500 (`400`). `enabled` is ignored on create. `201` |
+| `GET /api/agents/presets` | `{presets}`: the starting points the new-agent form offers, from `config/presets/*.yaml` (`WS_PRESETS_DIR`), in name order; each has `name`, `title`, `description`, `goal`, `prompt`, `model`, `tools` (an allowlist; `["none"]` means no tools, `[]` every tool), `max_steps`, `note`. Picking one copies its fields into the form; nothing links the agent to the preset afterwards |
+| `POST /api/agents/presets/import` | Body `{text}`: one `SKILL.md` (AgentSkills shape: YAML frontmatter with `name` and `description`, a markdown body). Returns a preset preview `{preset, requested_tools, warnings}` and saves nothing: the form copies the preview and the person presses Create. The text is untrusted: the body goes into `prompt` under a label that says it is imported content (ws's rules and the goal come after it), `tools` is `["none"]`, `allowed-tools` and `tools` from the frontmatter are reported in `requested_tools` and never granted, other frontmatter keys are ignored and listed, zero-width and direction-override characters and HTML comments are removed and counted, links (by host), fenced blocks and instruction-override phrases are listed in `warnings`. Limits: 64 KB file, 64-character name, 1 KB description, 32 KB body (longer is cut and said). `400` for an empty, oversize, non-UTF-8 file, no frontmatter, no name or no body |
+| `POST /api/agents` | Body `{name, goal, system_prompt, project_id, model: {selector, task_class, reasoning}, tool_allowlist[], tool_policies{tool: auto, ask or deny}, max_steps, enabled}`. An empty `tool_allowlist` means every tool the worker has; `["none"]` means no tools. `name` and `project_id` are required and the project must be accessible; `max_steps` defaults to 50 and is at most 500 (`400`). `enabled` is ignored on create. `201` |
 | `GET /api/agents/{id}` | `{agent, triggers, runs (30), pending_approvals, spend}`; `spend` is `{since, usd, budgets}` for the UTC month, with the agent-scoped budgets |
 | `PUT /api/agents/{id}` | Same body as create; `enabled` keeps its value when omitted |
 | `DELETE /api/agents/{id}` | `200 {"status":"ok"}` |
 | `POST /api/agents/{id}/enabled` | Body `{enabled}` |
 | `POST /api/agents/{id}/run` | Body `{input?}`. Starts a run now (the goal is the input when empty). `201` with the run; `409` if the agent is disabled or already has an open run; `503` when agents are not configured |
-| `POST /api/agents/{id}/triggers` | Body `{kind, name, spec}`. `kind` is `cron` (`spec.expr`, a five-field expression or `@hourly` style, and optional `spec.input`), `webhook` or `manual`; `repo_push` is rejected. A webhook answers with its `secret` and `url` once; only the hash is stored |
+| `POST /api/agents/{id}/triggers` | Body `{kind, name, spec}`. `kind` is `cron` (`spec.expr`, a five-field expression or `@hourly` style, and optional `spec.input`), `webhook`, `manual`, or `repo_push` (a GitHub webhook: `spec` is `{repo?, branches?, events?, input?}`; `repo` is `owner/name`, `branches` are names or patterns such as `release/*` (`*` does not cross `/`), `events` default to `["push"]`, `input` is prepended to what the agent is told; `400` for a malformed repo or branch pattern). A webhook or `repo_push` trigger answers with its `secret` and `url` once; only the hash is stored |
 | `DELETE /api/agents/{id}/triggers/{tid}`, `POST .../{tid}/enabled` | Remove a trigger; set `{enabled}` |
 | `POST /api/runs/{id}/cancel` | Cancels an agent's run (the run stops between steps). `404` for a run with no agent |
+| `POST /api/runs/{id}/pause` | Holds a `queued` or `running` run: it stops between steps and keeps its place as `paused_manual`. `200 {"status":"paused_manual"}`; `400` for a run in any other state |
+| `POST /api/runs/{id}/resume` | Queues a `paused_manual` run again; the worker continues it where it stopped. `200 {"status":"queued"}`; `400` unless the run is paused |
 | `POST /api/runs/{id}/steer` | Body `{text}`. Posts the text into the run's conversation and starts a new run there; `409` while the run is still open |
-| `POST /hooks/agents/{id}/{secret}` | The webhook. No session: the secret in the path is the credential. Any content type up to 64 KB (`413` over), `202 {run_id, status}`; the payload becomes the run's input. `404` for a wrong secret, a non-webhook or a disabled trigger; `409` when the agent is busy or disabled |
+| `POST /hooks/agents/{id}/{secret}` | The webhook. No session: the secret in the path is the credential. Any content type up to 64 KB, or up to 1 MB when an `X-GitHub-Event` header is present (`413 body too large` over). `202 {run_id, status}`; the payload becomes the run's input (for a `repo_push` trigger the event is rendered as text: pushes with commits, authors, files and a compare link; pull requests, issues, comments and releases; anything else generically; capped at 64 KB). A GitHub ping, an event the trigger does not list, a repository or a branch that does not match answers `200 {"status":"ignored"}` and starts no run (branches are checked for pushes and pull requests only). `404` for a wrong secret, a trigger of another kind or a disabled one; `409` when the agent is busy or disabled. When the delivery carries `X-Hub-Signature-256` (GitHub sends it once the repository's webhook has a secret; set it to the secret in the URL) the signature is checked against the body under that secret and a mismatch is `404` too; without the header the secret in the URL is the only credential |
 
-Cron triggers fire from the `agent.tick` job every minute. A firing is skipped, with `last_error` set on the trigger, when the agent already has an open run. The agent page also calls `GET /api/agents/{id}/memories` and `DELETE` on it and on `.../memories/{mid}`; those routes are not registered on the server yet, so the memory section gets `404`.
+Cron triggers fire from the `agent.tick` job every minute. A firing is skipped, with `last_error` set on the trigger, when the agent already has an open run. What an agent remembers is under `GET /api/agents/{id}/memories` (`?limit=` default 50, at most 500, `?offset=`; `{memories, total}` newest first, each `{id, kind, content, importance, embedded, source_run_id, last_used_at, created_at}`, never the vector), `DELETE /api/agents/{id}/memories/{mid}` (forget one) and `DELETE /api/agents/{id}/memories` (forget all), all `200 {"status":"ok"}` and `404` unless the agent is yours. During an agent's run (not a chat) the tools `remember` and `recall` read and write the same memory.
 
 ### Admin (owner only)
 
@@ -219,16 +229,38 @@ Cron triggers fire from the `agent.tick` job every minute. A firing is skipped, 
 | `PUT /api/admin/policies/{name}` | Body `{yaml, priority, enabled?}`. `priority` defaults to 100, `enabled` to `true`. The YAML is validated (`400 invalid policy`) |
 | `DELETE /api/admin/policies/{name}` | Remove a policy |
 | `GET /api/admin/rentals` | `?limit=` (default 50, at most 200). `{templates, instances, providers, caps}`: the templates from `infra/rental/templates`, rented machines newest first with `estimated_usd`, which providers are configured, and `caps` (`daily_cap_hours`, `used_today_hours`, `disabled`, `key_set`; `key_set` is always true in the current build, so do not rely on it) |
-| `POST /api/admin/rentals` | Body `{template}`. Starts a machine: `201` with the instance; `400 template required`, `404 unknown template`, `409` if the template already has an open machine, the kill switch is on, the daily cap is reached, or no provider or rental key is set; `502` for a provider error; `503 rentals are not configured` |
+| `POST /api/admin/rentals` | Body `{template}`. Starts a machine: `201` with the instance; `400 template required`, `400` for a `kind: trainer` template (a fine-tune job starts those), `404 unknown template`, `409` if the template already has an open machine, the kill switch is on, the daily cap is reached, or no provider or rental key is set; `502` for a provider error; `503 rentals are not configured` |
 | `POST /api/admin/rentals/{id}/stop` | Stops one machine; `200` with the instance |
 | `POST /api/admin/rentals/stop-all` | Stops every open machine; `200 {"status":"ok"}` |
 | `GET /api/admin/rentals/offers/{provider}` | The provider's GPU offers `{offers:[{gpu, memory_gb, hourly_usd, available}]}` (the Admin page does not call it yet) |
 | `GET`, `PUT /api/admin/budgets` | List; set with `{scope, scope_id, period, limit_usd, on_exceed}`. `scope` is `global`, `user`, `agent` or `api_key`; `period` is `day`, `week`, `month` or `total`; `on_exceed` is `block` or `downgrade` (default); `limit_usd` must be above 0; `scope_id` must be a UUID unless `scope` is `global`. `400` otherwise |
 | `DELETE /api/admin/budgets/{id}` | Remove a budget. `200 {"status":"ok"}` even for an unknown id; `400` for a malformed one |
 
+### Training (owner only, PLAN M10)
+
+Datasets exported from opted-in users' conversations, fine-tune jobs and the adapters they make. `503 training is not configured` when the service is absent; starting a job needs a trainer runner (`WS_FINETUNE_IMAGE`, or `WS_FINETUNE_TEMPLATE` for a rented machine), else `503`. Every route here needs the `owner` role, not ownership of the row: any owner sees, downloads and deletes every dataset and adapter.
+
+| Route | Notes |
+|---|---|
+| `GET /api/training/datasets` | `{datasets}`, newest first (100) |
+| `POST /api/training/datasets` | Body `{name, task_class?, filters: {modes?, models?, min_rating, since?, holdout_pct, max_examples?}}`. Records the dataset and queues `training.build`, which reads the conversations of users with `training_consent` (in the listed modes, active since the date, archived ones left out, at most `max_conversations` of them (default 2000), `max_prefix` earlier turns per example (default 40) and `max_examples` examples (default 5000)), keeps each assistant turn that passes the rating floor (`1` upvoted only, `0` upvoted or unrated, `-1` all; a rating by any user counts, and the highest one wins) and the model filter, writes one chat-format JSONL line per turn with the turns before it, splits conversations by a stable hash into train and held-out (`holdout_pct`), and stores both. Nothing is scrubbed: tool calls and their results go in verbatim, and only reasoning is dropped (images and files become placeholders). `201` with the row; `400` for a missing name or an unknown mode. A build that matches nothing fails with the reason on the row |
+| `GET /api/training/datasets/{id}` | The row with `status`, `examples`, `eval_examples`, `bytes`, `error` |
+| `GET /api/training/datasets/{id}/download?split=train|eval` | The JSONL as a download; `409` until the dataset is ready |
+| `DELETE /api/training/datasets/{id}` | Removes the row only; the exported files stay in the blob store. A queued job whose dataset was deleted fails with "the dataset was deleted" |
+| `GET /api/training/jobs` | `{jobs, runner, targets}`; `runner` says whether this deployment can fine-tune; `targets` lists where (`[{id: local|rental, label}]`, the default first): the worker's Docker (`WS_FINETUNE_IMAGE`) and a rented trainer (`WS_FINETUNE_TEMPLATE`) |
+| `POST /api/training/jobs` | Body `{dataset_id, base_model?, base_endpoint_id?, adapter_name, config?: {epochs, learning_rate, rank, alpha, max_seq_len, image, target}}`. `target` is `local` or `rental` (one of `targets`; empty takes the default, which is stored on the job; `400` for one this deployment lacks). The dataset must be ready; `base_model` defaults to the base endpoint's model name; the adapter name is lowercase letters, digits, dots, dashes and underscores. Queues `training.finetune`: the worker runs the trainer container on the dataset (or rents a trainer machine, drives it and stops it), stores the adapter and registers an endpoint `lora/<name>` next to the base endpoint, disabled. `201` with the job; `400` for an invalid request; `503` without a runner |
+| `GET /api/training/jobs/{id}` | The job with `status`, `progress`, `log` (tail), `adapter_id`, `error` |
+| `POST /api/training/jobs/{id}/cancel` | Marks a queued or running job cancelled; the worker sees it within 15 s and stops the trainer container, or the rented machine |
+| `GET /api/training/adapters` | `{adapters}` with `eval_score`, `baseline_score`, `eval`, `promoted`, `endpoint_id` |
+| `GET /api/training/adapters/{id}/download` | The adapter as `<name>.tar.gz`, to place where the serving engine loads LoRA modules from |
+| `POST /api/training/adapters/{id}/evaluate` | Queues `training.eval`: the held-out examples through the adapter's endpoint and through its base, each answer scored 0 to 10 by the judge model (`WS_TRAINING_JUDGE`) against the reference; the means land on the adapter (40 examples at most). The adapter's endpoint must answer (load the adapter on the server first). `202`; a failed eval (no held-out set, endpoint missing) leaves nothing on the adapter and shows only in the worker's log |
+| `POST /api/training/adapters/{id}/promote` | Body `{force?}`. Enables the adapter's endpoint, only when it was evaluated and scored at least its base unless `force`. `409` otherwise; `400` for an adapter without an endpoint |
+| `DELETE /api/training/adapters/{id}/promote` | Disables the endpoint again |
+| `DELETE /api/training/adapters/{id}` | Removes the adapter, its endpoint row and its file |
+
 ### Claude Code jobs (owner only, network-gated)
 
-The read-only job tab and the reports `wsj` sends it. All four routes need the `owner` role **and** a client address inside `WS_CC_WEB_ALLOW` (by default the tailnet and loopback), otherwise `403 this route is only served on the tailnet`. The address checked is the one the server sees after its real-IP middleware, which takes it from the `X-Forwarded-For`, `X-Real-IP` or `True-Client-IP` headers; so the gate is only as strong as the proxy in front of ws, which must overwrite those headers (see [Trust and security](TRUST.md)). If the job tab is not configured on the host the routes answer `503`.
+The read-only job tab and the reports `wsj` sends it. These are the only `/api` routes an API key may call, and only one carrying the `jobs` scope. All four routes need the `owner` role **and** a client address inside `WS_CC_WEB_ALLOW` (by default the tailnet and loopback), otherwise `403 this route is only served on the tailnet`. The address checked is the one the server sees after its real-IP middleware, which takes it from the `X-Forwarded-For`, `X-Real-IP` or `True-Client-IP` headers; so the gate is only as strong as the proxy in front of ws, which must overwrite those headers (see [Trust and security](TRUST.md)). If the job tab is not configured on the host the routes answer `503`.
 
 | Route | Notes |
 |---|---|

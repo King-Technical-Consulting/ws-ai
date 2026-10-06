@@ -71,6 +71,10 @@ func (s *Server) handleStartRental(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "template required")
 		return
 	}
+	if tpl, ok := s.Rental.Template(in.Template); ok && tpl.IsTrainer() {
+		writeErr(w, 400, "a trainer template is started by a fine-tune job, not from here")
+		return
+	}
 	row, err := s.Rental.Start(r.Context(), in.Template, Principal(r.Context()).UserID)
 	if err != nil {
 		writeRentalErr(w, err)

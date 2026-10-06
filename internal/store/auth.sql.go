@@ -232,7 +232,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 }
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (email, display_name, role) VALUES ($1, $2, $3) RETURNING id, email, display_name, role, created_at, disabled_at
+INSERT INTO users (email, display_name, role) VALUES ($1, $2, $3) RETURNING id, email, display_name, role, created_at, disabled_at, training_consent
 `
 
 type CreateUserParams struct {
@@ -251,6 +251,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Role,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.TrainingConsent,
 	)
 	return i, err
 }
@@ -437,7 +438,7 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, display_name, role, created_at, disabled_at FROM users WHERE email = $1
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -450,12 +451,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.Role,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.TrainingConsent,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, display_name, role, created_at, disabled_at FROM users WHERE id = $1
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -468,6 +470,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.Role,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.TrainingConsent,
 	)
 	return i, err
 }
@@ -599,7 +602,7 @@ func (q *Queries) ListPasskeysByUser(ctx context.Context, userID uuid.UUID) ([]P
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, display_name, role, created_at, disabled_at FROM users ORDER BY created_at
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users ORDER BY created_at
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -618,6 +621,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.Role,
 			&i.CreatedAt,
 			&i.DisabledAt,
+			&i.TrainingConsent,
 		); err != nil {
 			return nil, err
 		}

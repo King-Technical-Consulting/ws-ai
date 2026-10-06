@@ -293,6 +293,7 @@ func (c *Capabilities) merge(o Capabilities) {
 			c.Media.ImageEdit = c.Media.ImageEdit || o.Media.ImageEdit
 			c.Media.Video = c.Media.Video || o.Media.Video
 			c.Media.ImageToVideo = c.Media.ImageToVideo || o.Media.ImageToVideo
+			c.Media.Upscale = c.Media.Upscale || o.Media.Upscale
 		}
 	}
 }
@@ -315,6 +316,8 @@ func (have Capabilities) satisfies(need Capabilities) string {
 			return "no video generation"
 		case need.Media.ImageToVideo && !have.Media.ImageToVideo:
 			return "no image to video"
+		case need.Media.Upscale && !have.Media.Upscale:
+			return "no upscaling"
 		}
 		return ""
 	}
@@ -353,6 +356,12 @@ func RequiredCapabilities(req *Request) Capabilities {
 		c.Media = &MediaCaps{Image: true}
 	case TaskVideo:
 		c.Media = &MediaCaps{Video: true}
+	}
+	// A media job can be more precise: an edit, or image to video, needs
+	// that capability rather than the class's default.
+	if req.Media != nil && c.Media != nil {
+		m := MediaCaps{Image: req.Media.Image, ImageEdit: req.Media.ImageEdit, Video: req.Media.Video, ImageToVideo: req.Media.ImageToVideo, Upscale: req.Media.Upscale}
+		c.Media = &m
 	}
 	return c
 }

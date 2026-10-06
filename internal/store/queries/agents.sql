@@ -104,7 +104,7 @@ UPDATE agents SET enabled = $2 WHERE id = $1;
 UPDATE agents SET last_run_at = now() WHERE id = $1;
 
 -- name: CountOpenRunsForAgent :one
-SELECT count(*) FROM agent_runs WHERE agent_id = $1 AND status IN ('queued','running','paused_approval','paused_steer');
+SELECT count(*) FROM agent_runs WHERE agent_id = $1 AND status IN ('queued','running','paused_approval','paused_steer','paused_manual');
 
 -- name: ListPendingApprovalsForAgent :many
 SELECT a.* FROM approvals a JOIN agent_runs r ON r.id = a.run_id

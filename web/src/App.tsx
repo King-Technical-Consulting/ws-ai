@@ -8,7 +8,8 @@ import Chat from './pages/Chat'
 import Settings from './pages/Settings'
 import Admin from './pages/Admin'
 import Jobs from './pages/Jobs'
-import Images from './pages/Images'
+import Training from './pages/Training'
+import Media from './pages/Media'
 import Agents from './pages/Agents'
 import AgentMonitor from './pages/Agent'
 
@@ -64,7 +65,9 @@ export default function App() {
         <Route path="settings" element={<Settings />} />
         <Route path="admin" element={<RequireOwner><Admin /></RequireOwner>} />
         <Route path="jobs" element={<RequireOwner><Jobs /></RequireOwner>} />
-        <Route path="images" element={<Images />} />
+        <Route path="training" element={<RequireOwner><Training /></RequireOwner>} />
+        <Route path="media" element={<Media />} />
+        <Route path="images" element={<Navigate to="/media" replace />} />
         <Route path="agents" element={<Agents />} />
         <Route path="agents/:id" element={<AgentMonitor />} />
         <Route path="*" element={<Navigate to="/" replace />} />

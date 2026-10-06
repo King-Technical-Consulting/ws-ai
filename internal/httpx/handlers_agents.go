@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,7 +53,7 @@ func viewTrigger(t store.AgentTrigger) triggerView {
 	if len(v.Spec) == 0 {
 		v.Spec = json.RawMessage("{}")
 	}
-	if t.Kind == agents.KindWebhook {
+	if t.Kind == agents.KindWebhook || t.Kind == agents.KindRepoPush {
 		v.URL = "/hooks/agents/" + t.ID.String() + "/<secret>"
 	}
 	return v
@@ -130,6 +131,38 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	out := make([]agentView, 0, len(rows))
 	for _, a := range rows {
 		out = append(out, viewAgent(a))
+	}
+	writeJSON(w, 200, out)
+}
+
+// handleListPresets is GET /api/agents/presets: the starting points the
+// new-agent form offers (config/presets), in name order.
+func (s *Server) handleListPresets(w http.ResponseWriter, r *http.Request) {
+	presets := []agents.Preset{}
+	if s.Agents != nil {
+		presets = append(presets, s.Agents.Presets...)
+	}
+	writeJSON(w, 200, map[string]any{"presets": presets})
+}
+
+// handleImportSkill is POST /api/agents/presets/import {text}: reads one
+// SKILL.md (AgentSkills shape) into a preset preview with warnings. It
+// saves nothing; the form copies the preview and the person presses
+// Create. The text is untrusted: no tools are granted, hidden text is
+// removed, and what deserves a look is reported.
+func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Text string `json:"text"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, int64(agents.MaxSkillBytes)*2+4096)
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json, or the file is larger than 64 KB")
+		return
+	}
+	out, err := agents.ImportSkill([]byte(in.Text))
+	if err != nil {
+		writeErr(w, 400, strings.TrimPrefix(err.Error(), agents.ErrSkill.Error()+": "))
+		return
 	}
 	writeJSON(w, 200, out)
 }
@@ -359,6 +392,80 @@ func (s *Server) handleSetTriggerEnabled(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]any{"status": "ok", "enabled": in.Enabled})
 }
 
+// memoryView is one agent_memory row without its hash and vector; embedded
+// says whether a vector is stored (recall by similarity) or not
+// (importance only).
+type memoryView struct {
+	ID          uuid.UUID     `json:"id"`
+	Kind        string        `json:"kind"`
+	Content     string        `json:"content"`
+	Importance  float32       `json:"importance"`
+	Embedded    bool          `json:"embedded"`
+	SourceRunID uuid.NullUUID `json:"source_run_id"`
+	LastUsedAt  *time.Time    `json:"last_used_at"`
+	CreatedAt   time.Time     `json:"created_at"`
+}
+
+func viewMemory(m store.AgentMemory) memoryView {
+	return memoryView{ID: m.ID, Kind: m.Kind, Content: m.Content, Importance: m.Importance, Embedded: m.Embedding != nil, SourceRunID: m.SourceRunID, LastUsedAt: m.LastUsedAt, CreatedAt: m.CreatedAt}
+}
+
+// handleListMemories lists what reflection kept, newest first:
+// `?limit=` (default 50, at most 500) and `?offset=`, with the total.
+func (s *Server) handleListMemories(w http.ResponseWriter, r *http.Request) {
+	ag, ok := s.loadAgent(w, r)
+	if !ok {
+		return
+	}
+	limit, offset := 50, 0
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		limit = min(v, 500)
+	}
+	if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && v > 0 {
+		offset = v
+	}
+	rows, err := s.DB.ListMemoriesForAgent(r.Context(), store.ListMemoriesForAgentParams{AgentID: ag.ID, Limit: int32(limit), Offset: int32(offset)})
+	if err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	total, _ := s.DB.CountMemoriesForAgent(r.Context(), ag.ID)
+	out := make([]memoryView, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, viewMemory(m))
+	}
+	writeJSON(w, 200, map[string]any{"memories": out, "total": total})
+}
+
+func (s *Server) handleDeleteMemory(w http.ResponseWriter, r *http.Request) {
+	ag, ok := s.loadAgent(w, r)
+	if !ok {
+		return
+	}
+	mid, err := uuid.Parse(chi.URLParam(r, "mid"))
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	if err := s.DB.DeleteMemory(r.Context(), store.DeleteMemoryParams{ID: mid, AgentID: ag.ID}); err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleClearMemories(w http.ResponseWriter, r *http.Request) {
+	ag, ok := s.loadAgent(w, r)
+	if !ok {
+		return
+	}
+	if err := s.DB.DeleteMemoriesForAgent(r.Context(), ag.ID); err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
 // loadAgentRun checks the caller owns the run's agent.
 func (s *Server) loadAgentRun(w http.ResponseWriter, r *http.Request) (*store.AgentRun, bool) {
 	id, err := uuidParam(r, "id")
@@ -395,6 +502,41 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
 }
 
+// handlePauseRun and handleResumeRun hold and release a run from the
+// monitor: pause stops it between steps keeping its place, resume queues
+// it again.
+func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
+	run, ok := s.loadAgentRun(w, r)
+	if !ok {
+		return
+	}
+	if s.Agents == nil {
+		writeErr(w, 503, "agents are not configured")
+		return
+	}
+	if err := s.Agents.Pause(r.Context(), run.ID); err != nil {
+		writeAgentsErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "paused_manual"})
+}
+
+func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
+	run, ok := s.loadAgentRun(w, r)
+	if !ok {
+		return
+	}
+	if s.Agents == nil {
+		writeErr(w, 503, "agents are not configured")
+		return
+	}
+	if err := s.Agents.Resume(r.Context(), run.ID); err != nil {
+		writeAgentsErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "queued"})
+}
+
 func (s *Server) handleSteerRun(w http.ResponseWriter, r *http.Request) {
 	run, ok := s.loadAgentRun(w, r)
 	if !ok {
@@ -420,8 +562,11 @@ func (s *Server) handleSteerRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentHook is the unauthenticated webhook: the secret in the path
-// is the credential. The body (any content type, up to 64 KB) becomes the
-// run's input.
+// is the credential. For a webhook trigger the body (any content type, up
+// to 64 KB) becomes the run's input; for a repo_push trigger it is a
+// GitHub delivery (X-GitHub-Event names the event; GitHub's payloads can
+// be larger, so 1 MB is read and the renderer clips) and one the trigger
+// does not want answers 200 without a run.
 func (s *Server) handleAgentHook(w http.ResponseWriter, r *http.Request) {
 	if s.Agents == nil {
 		writeErr(w, 503, "agents are not configured")
@@ -433,18 +578,26 @@ func (s *Server) handleAgentHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := chi.URLParam(r, "secret")
-	body, _ := io.ReadAll(io.LimitReader(r.Body, agents.MaxInputBytes+1))
-	if len(body) > agents.MaxInputBytes {
-		writeErr(w, 413, "body over 64 KB")
+	ghEvent := r.Header.Get("X-GitHub-Event")
+	limit := int64(agents.MaxInputBytes)
+	if ghEvent != "" {
+		limit = 1 << 20
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(body)) > limit {
+		writeErr(w, 413, "body too large")
 		return
 	}
-	run, err := s.Agents.Fire(r.Context(), id, secret, string(body))
+	run, err := s.Agents.FireHook(r.Context(), agents.FireParams{TriggerID: id, Secret: secret, Body: string(body), GitHubEvent: ghEvent, Signature: r.Header.Get("X-Hub-Signature-256")})
 	if err != nil {
-		if errors.Is(err, agents.ErrSecret) {
+		switch {
+		case errors.Is(err, agents.ErrSecret):
 			writeErr(w, 404, "not found")
-			return
+		case errors.Is(err, agents.ErrIgnored):
+			writeJSON(w, 200, map[string]any{"status": "ignored"})
+		default:
+			writeAgentsErr(w, err)
 		}
-		writeAgentsErr(w, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"run_id": run.ID, "status": run.Status})

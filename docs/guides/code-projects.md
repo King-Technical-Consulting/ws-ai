@@ -34,9 +34,9 @@ With a GitHub App configured (permissions Contents and Pull requests, read and w
 ## Limits
 
 - By default, idle sandboxes stop after 15 minutes, and a stopped container is removed after a week (`WS_SANDBOX_IDLE_STOP`, `WS_SANDBOX_REMOVE_AFTER`). The volume stays, so your working copy survives.
-- A sandbox has memory, CPU and process limits, a read-only root filesystem, and no network except through the worker's egress proxy, which allows package registries, GitHub and Go modules (the operator can add hosts with `WS_EGRESS_ALLOW`).
+- A sandbox has memory, CPU and process limits, a read-only root filesystem, and no network except through the worker's egress proxy, which allows package registries (npm, PyPI, Go modules, crates, Debian), GitHub, ghcr.io and the ws host itself (the operator can add hosts with `WS_EGRESS_ALLOW`).
 - A sandbox shares the host kernel unless the host has gVisor.
 
 How the isolation works, and where it stops, is in [Trust and security](../TRUST.md).
 
-*Checked against the code at master `3364287`.*
+*Checked against the code at master `13a673a`.*

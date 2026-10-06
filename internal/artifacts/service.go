@@ -65,13 +65,18 @@ type Ref struct {
 	URL        string `json:"url"`
 }
 
-// Create stores a new artifact with version 1.
-func (s *Service) Create(ctx context.Context, convID uuid.UUID, kind Kind, title, language, content string, byMessage uuid.NullUUID) (*Ref, error) {
+// Create stores a new artifact with version 1. design is the
+// design_context stored on the version (design artifacts; nil otherwise).
+func (s *Service) Create(ctx context.Context, convID uuid.UUID, kind Kind, title, language, content string, design json.RawMessage, byMessage uuid.NullUUID) (*Ref, error) {
 	if !ValidKind(kind) {
 		return nil, fmt.Errorf("artifacts: unsupported kind %q", kind)
 	}
 	if len(content) > MaxContent {
 		return nil, errors.New("artifacts: content too large")
+	}
+	design, err := normalizeDesign(kind, design)
+	if err != nil {
+		return nil, err
 	}
 	if title == "" {
 		title = "Untitled"
@@ -84,11 +89,12 @@ func (s *Service) Create(ctx context.Context, convID uuid.UUID, kind Kind, title
 	if err != nil {
 		return nil, err
 	}
-	return s.addVersion(ctx, a.ID, kind, title, content, byMessage)
+	return s.addVersion(ctx, a.ID, kind, title, content, design, byMessage)
 }
 
-// Update appends a version. An empty title keeps the old one.
-func (s *Service) Update(ctx context.Context, artifactID uuid.UUID, title, content string, byMessage uuid.NullUUID) (*Ref, error) {
+// Update appends a version. An empty title keeps the old one; a nil
+// design keeps the previous version's design_context.
+func (s *Service) Update(ctx context.Context, artifactID uuid.UUID, title, content string, design json.RawMessage, byMessage uuid.NullUUID) (*Ref, error) {
 	if len(content) > MaxContent {
 		return nil, errors.New("artifacts: content too large")
 	}
@@ -96,19 +102,45 @@ func (s *Service) Update(ctx context.Context, artifactID uuid.UUID, title, conte
 	if err != nil {
 		return nil, fmt.Errorf("artifacts: not found")
 	}
+	design, err = normalizeDesign(Kind(a.Kind), design)
+	if err != nil {
+		return nil, err
+	}
+	if design == nil && Kind(a.Kind) == KindDesign {
+		if prev, err := s.DB.GetArtifactVersion(ctx, store.GetArtifactVersionParams{ArtifactID: a.ID, Version: a.CurrentVersion}); err == nil {
+			design = prev.DesignContext
+		}
+	}
 	if title == "" {
 		title = a.Title
 	}
-	return s.addVersion(ctx, a.ID, Kind(a.Kind), title, content, byMessage)
+	return s.addVersion(ctx, a.ID, Kind(a.Kind), title, content, design, byMessage)
 }
 
-func (s *Service) addVersion(ctx context.Context, id uuid.UUID, kind Kind, title, content string, byMessage uuid.NullUUID) (*Ref, error) {
+// normalizeDesign validates a design_context and drops it for kinds that
+// do not carry one.
+func normalizeDesign(kind Kind, raw json.RawMessage) (json.RawMessage, error) {
+	if kind != KindDesign {
+		return nil, nil
+	}
+	d, err := ParseDesignContext(raw)
+	if err != nil {
+		return nil, fmt.Errorf("artifacts: %w", err)
+	}
+	if d == nil {
+		return nil, nil
+	}
+	b, _ := json.Marshal(d)
+	return b, nil
+}
+
+func (s *Service) addVersion(ctx context.Context, id uuid.UUID, kind Kind, title, content string, design json.RawMessage, byMessage uuid.NullUUID) (*Ref, error) {
 	v, err := s.DB.BumpArtifactVersion(ctx, store.BumpArtifactVersionParams{ID: id, Column2: title})
 	if err != nil {
 		return nil, err
 	}
 	row, err := s.DB.InsertArtifactVersion(ctx, store.InsertArtifactVersionParams{
-		ArtifactID: id, Version: v, Content: &content, CreatedByMessageID: byMessage,
+		ArtifactID: id, Version: v, Content: &content, DesignContext: design, CreatedByMessageID: byMessage,
 	})
 	if err != nil {
 		return nil, err
@@ -177,29 +209,44 @@ func (s *Service) Verify(id uuid.UUID, token string) bool {
 func ToolDefs() []gateway.ToolDef {
 	return []gateway.ToolDef{
 		{
-			Name: "create_artifact",
-			Description: "Create a substantial, self-contained document the user can view in a side panel and keep: a complete HTML page (with inline CSS/JS), an SVG, a Mermaid diagram, a Markdown document, or a code file. Use it for content over ~15 lines that the user will reuse, edit, or run. Do not use it for short answers or explanations; put those in the reply. After calling it, briefly tell the user what you made; do not repeat the content.",
+			Name:        "create_artifact",
+			Description: "Create a substantial, self-contained document the user can view in a side panel and keep: a complete HTML page (with inline CSS/JS), a UI design (kind design: a complete HTML mockup that follows a design system), an SVG, a Mermaid diagram, a Markdown document, or a code file. Use it for content over ~15 lines that the user will reuse, edit, or run. Do not use it for short answers or explanations; put those in the reply. After calling it, briefly tell the user what you made; do not repeat the content.",
 			InputSchema: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "kind": {"type": "string", "enum": ["html", "svg", "markdown", "mermaid", "code"], "description": "What the content is."},
+    "kind": {"type": "string", "enum": ["html", "design", "svg", "markdown", "mermaid", "code"], "description": "What the content is. design is an HTML mockup of a user interface."},
     "title": {"type": "string", "description": "Short title, 2-6 words."},
     "language": {"type": "string", "description": "For kind=code: the language, e.g. python, go, tsx."},
-    "content": {"type": "string", "description": "The full content. For html, a complete document."}
+    "content": {"type": "string", "description": "The full content. For html and design, a complete document."},
+    "design_context": {
+      "type": "object",
+      "description": "For kind=design: the design system the mockup follows, so later versions and variants keep it. Copy the conversation's design system when there is one.",
+      "properties": {
+        "library": {"type": "string", "enum": ["tailwind", "shadcn", "plain"]},
+        "colors": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Token name to CSS color, e.g. primary, background, foreground, accent."},
+        "type": {"type": "object", "additionalProperties": {"type": "string"}, "description": "heading, body, mono font stacks; scale."},
+        "spacing": {"type": "string"},
+        "radius": {"type": "string"},
+        "components": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
   },
   "required": ["kind", "title", "content"],
   "additionalProperties": false
 }`),
 		},
 		{
-			Name: "update_artifact",
-			Description: "Replace the content of an existing artifact with a new version. Always send the complete new content, not a diff.",
+			Name:        "update_artifact",
+			Description: "Replace the content of an existing artifact with a new version. Always send the complete new content, not a diff. A design artifact keeps its design_context unless you send a new one.",
 			InputSchema: json.RawMessage(`{
   "type": "object",
   "properties": {
     "artifact_id": {"type": "string", "description": "The artifact_id returned by create_artifact."},
     "title": {"type": "string", "description": "New title, or omit to keep it."},
-    "content": {"type": "string", "description": "The complete new content."}
+    "content": {"type": "string", "description": "The complete new content."},
+    "design_context": {"type": "object", "description": "For a design artifact: a changed design system; omit to keep the current one.", "additionalProperties": true}
   },
   "required": ["artifact_id", "content"],
   "additionalProperties": false
@@ -216,20 +263,22 @@ func (s *Service) Call(ctx context.Context, convID uuid.UUID, byMessage uuid.Nul
 	switch name {
 	case "create_artifact":
 		var in struct {
-			Kind     Kind   `json:"kind"`
-			Title    string `json:"title"`
-			Language string `json:"language"`
-			Content  string `json:"content"`
+			Kind     Kind            `json:"kind"`
+			Title    string          `json:"title"`
+			Language string          `json:"language"`
+			Content  string          `json:"content"`
+			Design   json.RawMessage `json:"design_context"`
 		}
 		if err := json.Unmarshal(args, &in); err != nil {
 			return nil, fmt.Errorf("bad arguments: %w", err)
 		}
-		return s.Create(ctx, convID, in.Kind, in.Title, in.Language, in.Content, byMessage)
+		return s.Create(ctx, convID, in.Kind, in.Title, in.Language, in.Content, in.Design, byMessage)
 	case "update_artifact":
 		var in struct {
-			ArtifactID string `json:"artifact_id"`
-			Title      string `json:"title"`
-			Content    string `json:"content"`
+			ArtifactID string          `json:"artifact_id"`
+			Title      string          `json:"title"`
+			Content    string          `json:"content"`
+			Design     json.RawMessage `json:"design_context"`
 		}
 		if err := json.Unmarshal(args, &in); err != nil {
 			return nil, fmt.Errorf("bad arguments: %w", err)
@@ -243,7 +292,7 @@ func (s *Service) Call(ctx context.Context, convID uuid.UUID, byMessage uuid.Nul
 		if err != nil || a.ConversationID != convID {
 			return nil, errors.New("artifact not found in this conversation")
 		}
-		return s.Update(ctx, id, in.Title, in.Content, byMessage)
+		return s.Update(ctx, id, in.Title, in.Content, in.Design, byMessage)
 	}
 	return nil, fmt.Errorf("unknown tool %s", name)
 }

@@ -4,7 +4,7 @@ How a conversation works in ws, how a model gets chosen, and what happens to lon
 
 ## Projects and conversations
 
-A **project** holds conversations. The sidebar's "New conversation" starts a chat in your most recently active project, or creates one called "General" if you have none; a project can also be a [code project](code-projects.md), which adds a sandbox. Every turn is an agent run: one or more model calls, plus any tool calls the model asks for. Runs are saved as they go, so they survive a restart of the server; a run whose process stopped is picked up and finished by the worker. Hover a conversation in the sidebar to rename it or archive it.
+A **project** holds conversations. The sidebar's "New conversation" starts a chat in your most recently active project, or creates one called "General" if you have none; a project can also be a [code project](code-projects.md), which adds a sandbox. Every turn is an agent run: one or more model calls, plus any tool calls the model asks for. Runs are saved as they go, so they survive a restart of the server; a run whose process stopped is picked up and finished by the worker. Hover a conversation in the sidebar to rename it or archive it (renaming asks for a new title and archiving asks you to confirm). The sidebar also links to Images, Agents and Settings, and, for the owner, Jobs and Admin.
 
 ## Choosing a model
 
@@ -14,7 +14,7 @@ The model picker has three groups:
 - **Local:** endpoints on your own hardware.
 - **Hosted:** endpoints from providers such as Anthropic, OpenAI and OpenRouter.
 
-An endpoint that is down is shown disabled with "(down)"; an endpoint an admin has disabled is not listed.
+An endpoint that is down is disabled in the picker, and a local one also shows "(down)"; image and video models are not listed (they are used through Images and `generate_image`); an endpoint an admin has disabled is not listed.
 
 The brain icon next to the picker asks for extended thinking. It has an effect only on Anthropic-protocol endpoints that support it; local and OpenRouter endpoints ignore it today. It is not remembered and is off again when you reload the page. Which endpoints exist, and what each can do, comes from `config/endpoints.yaml` and from the Admin page; see [Admin](admin.md) and [Configuration](../CONFIGURATION.md).
 
@@ -24,14 +24,18 @@ The brain icon next to the picker asks for extended thinking. It has an effect o
 
 ## Tools in chat
 
-A chat turn can call these built-in tools: `create_artifact` and `update_artifact` (see [Artifacts](artifacts.md)), `web_fetch` (public URLs only; private, loopback and tailnet addresses are refused), `read_blob` (to page through a long tool result that was stored outside the conversation) and `ask_user`. Tools from MCP servers listed in `config/mcp.yaml` appear as `mcp__<server>__<tool>`. Code projects are offered every tool the worker has, including these and the sandbox tools. Each tool has a policy that decides whether it runs on its own or asks you first; see [Approvals](approvals.md).
+A chat turn can call these built-in tools: `create_artifact` and `update_artifact` (see [Artifacts](artifacts.md)), `web_fetch` (public URLs only; private, loopback and tailnet addresses are refused), `read_blob` (to page through a long tool result that was stored outside the conversation) and `ask_user`. When an image model is configured it can also call `generate_image` (the results appear in the chat; the Media page uses the same models), and when the operator turns task dispatch on it can call `spawn_job`. Tools from MCP servers listed in `config/mcp.yaml` appear as `mcp__<server>__<tool>`. Code projects are offered every tool the worker has, including these and the sandbox tools. Each tool has a policy that decides whether it runs on its own or asks you first; see [Approvals](approvals.md).
 
 ## Long conversations
 
 ws never edits what is stored. When a request would be larger than the compaction budget (`WS_COMPACTION_BUDGET_TOKENS`, 60,000 tokens by default), it sends a stored summary of the older turns plus the recent turns instead, and drops the oldest turns for that one request if it is still too long. A background job writes a fresh summary with a cheap model. Your full history stays as it was.
 
+## Rating answers
+
+Each answer has a thumbs up and thumbs down; clicking the same one again clears it. Ratings are stored per user. They matter only if the owner builds a fine-tuning dataset, which also needs your consent: **Settings** has an "Allow my conversations in training datasets" box, off by default (see [Trust and security](../TRUST.md)).
+
 ## Cost and limits
 
 Every model call is written to a usage ledger with its tokens, cost and the routing decision. The owner can set budgets that block a call or switch it to local endpoints once a limit is reached; see [Admin](admin.md).
 
-*Checked against the code at master `3364287`.*
+*Checked against the code at master `13a673a`.*

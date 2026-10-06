@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: PolyForm Strict 1.0.0" src="https://img.shields.io/badge/license-PolyForm%20Strict%201.0.0-b85a1a?style=flat-square&labelColor=2c2416"></a>
+  <a href="LICENSE"><img alt="License: PolyForm Noncommercial 1.0.0" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-b85a1a?style=flat-square&labelColor=2c2416"></a>
   <a href="https://github.com/King-Technical-Consulting/ws-ai/releases"><img alt="Release" src="https://img.shields.io/github/v/release/King-Technical-Consulting/ws-ai?style=flat-square&labelColor=2c2416&color=b85a1a"></a>
   <a href="https://ws-docs.pages.dev"><img alt="Docs" src="https://img.shields.io/badge/docs-ws--docs.pages.dev-b85a1a?style=flat-square&labelColor=2c2416"></a>
 </p>
@@ -18,7 +18,10 @@
 - 🧑‍💻 **A coding mode you can watch.** Each code project gets its own Docker sandbox with an editor, a terminal and live previews. Running commands, pushing and opening pull requests ask for your approval by default.
 - 🔀 **One gateway for every model.** llama.cpp, vLLM, Ollama and anything OpenAI-compatible sit next to Anthropic, OpenAI and OpenRouter. Budgets can block a call or send it to a local model, and every call is written to a usage ledger.
 - 🤖 **Claude Code, routed through ws.** Point Claude Code at ws as its gateway, or let ws launch real Claude Code sessions on your own machines through a small CLI.
-- 🗓️ **Agents, images and more.** Long-lived agents with cron and webhook triggers, image generation, ws as an MCP server for your other tools, and rented GPUs on demand (early).
+- 🗓️ **Agents that keep working.** Long-lived agents with a goal, their own tools and a monthly budget. Cron, webhook and GitHub push triggers start them, they remember between runs, and you can pause, resume or steer a run from a monitor page.
+- 🎨 **Images and video.** Generate and edit images, upscale them, and make short videos through OpenAI, fal.ai, Google or a ComfyUI you run, with the price shown first. The engines beyond OpenAI images were only tested against fakes so far.
+- 🔌 **Open to your other tools.** ws is also an MCP server, and API keys carry scopes, so a key reaches only what you gave it.
+- 🧪 **Early: rented GPUs and fine-tuning.** Start a RunPod GPU from Admin with a daily cap and idle shutdown. Rate answers, opt conversations in, export a dataset, fine-tune an adapter and let an eval gate decide whether the adapter goes live. Both are first cuts: treat them as early.
 
 ## How it fits together
 
@@ -65,10 +68,10 @@ make dev               # starts Postgres, then prints the next commands: make se
 
 ## Feedback
 
-Questions and ideas are welcome in Discussions, and bug reports in Issues. Please do not report security problems there: use private vulnerability reporting, described in [SECURITY.md](SECURITY.md). ws is released under PolyForm Strict, which does not allow changes or redistribution, so pull requests are not accepted.
+Questions and ideas are welcome in Discussions, and bug reports in Issues. Please do not report security problems there: use private vulnerability reporting, described in [SECURITY.md](SECURITY.md). ws is released under PolyForm Noncommercial, which allows changes. Pull requests are not accepted yet: they open once a contributor agreement is in place.
 
 ## License
 
-[PolyForm Strict License 1.0.0](LICENSE): noncommercial use only, and no changes or redistribution. Read the license for the exact terms; this summary is not legal advice.
+[PolyForm Noncommercial License 1.0.0](LICENSE): noncommercial use only. You may change and share it for noncommercial purposes, keeping the notices. Read the license for the exact terms; this summary is not legal advice. ws is source-available, not open source.
 
 Required Notice: Copyright Jeremy King (https://jeremyking.co)

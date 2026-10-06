@@ -29,6 +29,9 @@ UPDATE rental_instances SET provider_instance_id = $2 WHERE id = $1;
 -- name: SetRentalUsage :exec
 UPDATE rental_instances SET hours_used = $2, billed_hours = $3, last_request_at = COALESCE(sqlc.narg('last_request_at'), last_request_at) WHERE id = $1;
 
+-- name: TouchRentalInstance :exec
+UPDATE rental_instances SET last_request_at = now() WHERE id = $1;
+
 -- name: SumRentalHoursSince :one
 SELECT COALESCE(SUM(hours_used), 0)::float8 FROM rental_instances WHERE started_at >= $1 OR status IN ('provisioning','warming','ready','stopping');
 

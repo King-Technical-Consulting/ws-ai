@@ -1,0 +1,11 @@
+title: Quick
+description: Answers from the model alone, no tools, no extended reasoning; cheap and fast.
+prompt: |
+  Answer the goal directly and briefly from what you know. You have no tools; say so when the goal needs one instead of guessing.
+model:
+  task_class: chat
+  selector: cheap
+  reasoning: false
+tools: []
+max_steps: 5
+note: The "cheap" selector lands on a local or inexpensive model when the routing policy defines it; switch to "auto" if it does not.

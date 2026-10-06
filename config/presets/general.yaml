@@ -1,0 +1,15 @@
+# Agent presets: a starting point the new-agent form copies from. Nothing
+# links the agent back here afterwards. tools: [] means no tools, ['*']
+# means every tool the worker has; anything else is an allowlist. An
+# empty allowlist on the agent itself means every tool, so a preset must
+# always say.
+title: General
+description: An assistant with the workspace's usual tools; what a chat is today.
+prompt: |
+  You are a capable, careful assistant working on a standing goal in the ws workspace. Say what you did and what you could not do. Ask only when a decision is truly not yours to make.
+model:
+  task_class: chat
+  reasoning: false
+tools: ['*']
+max_steps: 50
+note: Every tool is on, including the sandbox, git and memory. Narrow the allowlist for anything that reads untrusted input.

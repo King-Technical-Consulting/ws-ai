@@ -52,6 +52,29 @@ providers:
     name: Mac Studio (MLX)
     base_url_env: MAC_STUDIO_URL
 
+  # Media providers (PLAN.md M6). fal.ai fronts hundreds of image and video
+  # models behind one queue API; the endpoint's model is the fal model id.
+  - id: fal
+    kind: openai_compat
+    name: fal.ai
+    base_url: https://queue.fal.run
+    api_key_env: FAL_KEY
+
+  # A local ComfyUI server; its endpoints name a workflow template under
+  # infra/comfyui/workflows in extra_body.
+  - id: comfyui
+    kind: openai_compat
+    name: ComfyUI (local)
+    base_url_env: COMFYUI_URL
+
+  # Google's Gemini API for Imagen (images) and Veo (video); the key is
+  # sent as x-goog-api-key.
+  - id: google
+    kind: openai_compat
+    name: Google (Gemini API)
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key_env: GEMINI_API_KEY
+
 endpoints:
   # ---- Anthropic ----
   - id: anthropic/claude-opus-5-5
@@ -106,10 +129,116 @@ endpoints:
     provider: openai
     model: gpt-image-1
     display_name: GPT Image 1 (OpenAI)
-    capabilities: { media: { engine: openai_images, image: true, sizes: [1024x1024, 1536x1024, 1024x1536, auto], max_images: 4 } }
+    capabilities: { media: { engine: openai_images, image: true, image_edit: true, sizes: [1024x1024, 1536x1024, 1024x1536, auto], max_images: 4 } }
     pricing: { input_per_m: 5.00, output_per_m: 40.00, per_image: 0.04 }
     throughput_class: medium
     latency_class: slow
+
+  # ---- OpenAI Videos (Sora 2) ----
+  # Billed per second of output; the lengths Sora accepts are listed so
+  # the picker offers only those. Image to video sends the source as
+  # input_reference. Disabled until tried: enable it in Admin.
+  - id: openai/sora-2
+    provider: openai
+    model: sora-2
+    display_name: Sora 2 (OpenAI)
+    capabilities: { media: { engine: openai_videos, video: true, image_to_video: true, sizes: [1280x720, 720x1280], max_seconds: 12, seconds: [4, 8, 12] } }
+    pricing: { per_second: 0.10 }
+    throughput_class: low
+    latency_class: slow
+    enabled: false
+
+  # ---- fal.ai ----
+  # One engine, many models: the model is fal's id. Prices are per image or
+  # per second and change often; check fal.ai/models before relying on
+  # them. Model-specific inputs go in extra_body (ws sends prompt,
+  # num_images, image_size, image_url and duration).
+  - id: fal/flux-dev
+    provider: fal
+    model: fal-ai/flux/dev
+    display_name: FLUX.1 dev (fal)
+    capabilities: { media: { engine: fal, image: true, sizes: [1024x1024, 1344x768, 768x1344, landscape_16_9, portrait_16_9, square_hd], max_images: 4 } }
+    pricing: { per_image: 0.025 }
+    throughput_class: medium
+    latency_class: normal
+
+  - id: fal/flux-kontext
+    provider: fal
+    model: fal-ai/flux-pro/kontext
+    display_name: FLUX.1 Kontext (fal, edits)
+    capabilities: { media: { engine: fal, image_edit: true, max_images: 1 } }
+    pricing: { per_image: 0.04 }
+    throughput_class: medium
+    latency_class: normal
+
+  - id: fal/wan-2.2-t2v
+    provider: fal
+    model: fal-ai/wan/v2.2-a14b/text-to-video
+    display_name: Wan 2.2 text to video (fal)
+    capabilities: { media: { engine: fal, video: true, sizes: [16:9, 9:16], max_seconds: 5, seconds: [5] } }
+    pricing: { per_second: 0.08 }
+    throughput_class: low
+    latency_class: slow
+    enabled: false
+
+  - id: fal/wan-2.2-i2v
+    provider: fal
+    model: fal-ai/wan/v2.2-a14b/image-to-video
+    display_name: Wan 2.2 image to video (fal)
+    capabilities: { media: { engine: fal, image_to_video: true, max_seconds: 5, seconds: [5] } }
+    pricing: { per_second: 0.08 }
+    throughput_class: low
+    latency_class: slow
+    enabled: false
+
+  # ---- ComfyUI (local) ----
+  # Free, on your own GPU. The model is the checkpoint file name the
+  # workflow's loader gets as {{model}}; the workflow is a template under
+  # infra/comfyui/workflows. Enable it once COMFYUI_URL points at a server.
+  - id: comfyui/sdxl
+    provider: comfyui
+    model: sd_xl_base_1.0.safetensors
+    display_name: SDXL (ComfyUI)
+    capabilities: { media: { engine: comfyui, image: true, image_edit: true, sizes: [1024x1024, 1344x768, 768x1344], max_images: 4 } }
+    extra_body: { workflow: sdxl-text-to-image.json, negative: "blurry, low quality, watermark, text" }
+    local: true
+    throughput_class: low
+    latency_class: slow
+    enabled: false
+
+  # An upscaler on fal: a source image to 2x or 4x (ws sends image_url
+  # and upscale_factor; the prompt is optional guidance).
+  - id: fal/clarity-upscaler
+    provider: fal
+    model: fal-ai/clarity-upscaler
+    display_name: Clarity upscaler (fal)
+    capabilities: { media: { engine: fal, upscale: true, max_images: 1 } }
+    pricing: { per_image: 0.03 }
+    throughput_class: medium
+    latency_class: normal
+
+  # ---- Google (Gemini API) ----
+  # Imagen prices per image, Veo per second; both change, check
+  # ai.google.dev/pricing. Sizes are aspect ratios. Veo ships disabled
+  # until tried: enable it in Admin.
+  - id: google/imagen-4
+    provider: google
+    model: imagen-4.0-generate-001
+    display_name: Imagen 4 (Google)
+    capabilities: { media: { engine: google, image: true, sizes: ["1:1", "3:4", "4:3", "9:16", "16:9"], max_images: 4 } }
+    pricing: { per_image: 0.04 }
+    throughput_class: medium
+    latency_class: normal
+
+  - id: google/veo-3
+    provider: google
+    model: veo-3.0-generate-001
+    display_name: Veo 3 (Google)
+    capabilities: { media: { engine: google, video: true, image_to_video: true, sizes: ["16:9", "9:16"], max_seconds: 8, seconds: [8] } }
+    pricing: { per_second: 0.40 }
+    throughput_class: low
+    latency_class: slow
+    enabled: false
 
   # ---- OpenRouter (examples; add what you use) ----
   - id: openrouter/google/gemini-2.5-pro

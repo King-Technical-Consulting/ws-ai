@@ -13,6 +13,23 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+type Adapter struct {
+	ID             uuid.UUID       `json:"id"`
+	Name           string          `json:"name"`
+	BaseModel      string          `json:"base_model"`
+	BaseEndpointID *string         `json:"base_endpoint_id"`
+	FinetuneJobID  uuid.NullUUID   `json:"finetune_job_id"`
+	BlobKey        string          `json:"blob_key"`
+	Bytes          int64           `json:"bytes"`
+	EvalScore      *float32        `json:"eval_score"`
+	BaselineScore  *float32        `json:"baseline_score"`
+	Eval           json.RawMessage `json:"eval"`
+	Promoted       bool            `json:"promoted"`
+	EndpointID     *string         `json:"endpoint_id"`
+	CreatedAt      time.Time       `json:"created_at"`
+	EvaluatedAt    *time.Time      `json:"evaluated_at"`
+}
+
 type Agent struct {
 	ID            uuid.UUID       `json:"id"`
 	OwnerID       uuid.UUID       `json:"owner_id"`
@@ -234,6 +251,23 @@ type Conversation struct {
 	ArchivedAt               *time.Time      `json:"archived_at"`
 }
 
+type Dataset struct {
+	ID           uuid.UUID       `json:"id"`
+	OwnerID      uuid.UUID       `json:"owner_id"`
+	Name         string          `json:"name"`
+	TaskClass    string          `json:"task_class"`
+	Filters      json.RawMessage `json:"filters"`
+	Status       string          `json:"status"`
+	BlobKey      *string         `json:"blob_key"`
+	EvalBlobKey  *string         `json:"eval_blob_key"`
+	Bytes        int64           `json:"bytes"`
+	Examples     int32           `json:"examples"`
+	EvalExamples int32           `json:"eval_examples"`
+	Error        *string         `json:"error"`
+	CreatedAt    time.Time       `json:"created_at"`
+	BuiltAt      *time.Time      `json:"built_at"`
+}
+
 type Endpoint struct {
 	ID              string          `json:"id"`
 	ProviderID      string          `json:"provider_id"`
@@ -253,6 +287,24 @@ type Endpoint struct {
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	ExtraBody       json.RawMessage `json:"extra_body"`
+}
+
+type FinetuneJob struct {
+	ID             uuid.UUID       `json:"id"`
+	OwnerID        uuid.UUID       `json:"owner_id"`
+	DatasetID      uuid.NullUUID   `json:"dataset_id"`
+	BaseModel      string          `json:"base_model"`
+	BaseEndpointID *string         `json:"base_endpoint_id"`
+	AdapterName    string          `json:"adapter_name"`
+	Config         json.RawMessage `json:"config"`
+	Status         string          `json:"status"`
+	Progress       float32         `json:"progress"`
+	Log            string          `json:"log"`
+	AdapterID      uuid.NullUUID   `json:"adapter_id"`
+	Error          *string         `json:"error"`
+	CreatedAt      time.Time       `json:"created_at"`
+	StartedAt      *time.Time      `json:"started_at"`
+	EndedAt        *time.Time      `json:"ended_at"`
 }
 
 type Invite struct {
@@ -314,6 +366,14 @@ type Message struct {
 type MessageAttachment struct {
 	MessageID    uuid.UUID `json:"message_id"`
 	AttachmentID uuid.UUID `json:"attachment_id"`
+}
+
+type MessageRating struct {
+	MessageID uuid.UUID `json:"message_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Score     int16     `json:"score"`
+	Note      *string   `json:"note"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Passkey struct {
@@ -457,12 +517,13 @@ type UsageLedger struct {
 }
 
 type User struct {
-	ID          uuid.UUID  `json:"id"`
-	Email       string     `json:"email"`
-	DisplayName string     `json:"display_name"`
-	Role        string     `json:"role"`
-	CreatedAt   time.Time  `json:"created_at"`
-	DisabledAt  *time.Time `json:"disabled_at"`
+	ID              uuid.UUID  `json:"id"`
+	Email           string     `json:"email"`
+	DisplayName     string     `json:"display_name"`
+	Role            string     `json:"role"`
+	CreatedAt       time.Time  `json:"created_at"`
+	DisabledAt      *time.Time `json:"disabled_at"`
+	TrainingConsent bool       `json:"training_consent"`
 }
 
 type WebauthnSession struct {

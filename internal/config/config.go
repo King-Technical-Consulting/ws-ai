@@ -67,6 +67,9 @@ type Config struct {
 	// EndpointsFile seeds providers/endpoints on boot (idempotent upsert).
 	EndpointsFile string `env:"WS_ENDPOINTS_FILE" envDefault:"config/endpoints.yaml"`
 	PoliciesDir   string `env:"WS_POLICIES_DIR" envDefault:"config/policies"`
+	// PresetsDir holds agent presets (config/presets/*.yaml): starting
+	// points the new-agent form copies from.
+	PresetsDir string `env:"WS_PRESETS_DIR" envDefault:"config/presets"`
 	// MCPFile declares MCP servers whose tools the runtime exposes.
 	MCPFile string `env:"WS_MCP_FILE" envDefault:"config/mcp.yaml"`
 	// MCPServer serves ws itself as an MCP server at /mcp (Streamable
@@ -88,7 +91,7 @@ type Config struct {
 	// In the container: /secrets/ssh_config next to the mounted key.
 	// Overrides the file's ssh_config key.
 	CCSSHConfig string `env:"WS_CC_SSH_CONFIG"`
-	CCAliases  string `env:"WS_CC_ALIASES" envDefault:"api=best,openrouter=cheap,local=local"`
+	CCAliases   string `env:"WS_CC_ALIASES" envDefault:"api=best,openrouter=cheap,local=local"`
 	// CCClassify lets the router ask a small model (task class classify)
 	// about prompts the rules find ambiguous; off means rules only.
 	CCClassify bool `env:"WS_CC_CLASSIFY" envDefault:"true"`
@@ -109,6 +112,10 @@ type Config struct {
 	CCWeeklyCap  int `env:"WS_CC_WEEKLY_CAP" envDefault:"0"`
 	CCWeeklySoft int `env:"WS_CC_WEEKLY_SOFT" envDefault:"75"`
 
+	// Media (PLAN M6, internal/media). ComfyWorkflows is the directory a
+	// ComfyUI endpoint's extra_body.workflow names a template in.
+	ComfyWorkflows string `env:"WS_COMFY_WORKFLOWS" envDefault:"infra/comfyui/workflows"`
+
 	// Rented GPUs (PLAN M9, internal/fleet/rental). Templates come from
 	// RentalTemplates; RUNPOD_API_KEY enables the RunPod provider;
 	// WS_RENTAL_API_KEY is the key every rented server is started with and
@@ -120,6 +127,20 @@ type Config struct {
 	RunPodAPIKey        string  `env:"RUNPOD_API_KEY"`
 	RentalDailyCapHours float64 `env:"WS_RENTAL_DAILY_CAP_HOURS" envDefault:"8"`
 	RentalDisabled      bool    `env:"WS_RENTAL_DISABLED" envDefault:"false"`
+
+	// Training flywheel (PLAN M10, internal/training). FinetuneImage is the
+	// trainer container the worker runs fine-tune jobs in (infra/training
+	// builds one); unset, fine-tune jobs are refused and datasets and
+	// ratings still work. FinetuneGPUs is "all", a count or "" for none;
+	// FinetuneTemplate names a trainer-kind rental template (M9) a job can
+	// run on instead, when its provider is configured; TrainingDir holds
+	// a job's files while it runs; TrainingJudge is the model selector
+	// that scores eval answers.
+	FinetuneImage    string `env:"WS_FINETUNE_IMAGE"`
+	FinetuneGPUs     string `env:"WS_FINETUNE_GPUS" envDefault:"all"`
+	FinetuneTemplate string `env:"WS_FINETUNE_TEMPLATE"`
+	TrainingDir      string `env:"WS_TRAINING_DIR" envDefault:"data/training"`
+	TrainingJudge    string `env:"WS_TRAINING_JUDGE" envDefault:"auto"`
 
 	// WebAuthn relying party. Derived from PublicURL when empty.
 	RPID          string   `env:"WS_RP_ID"`

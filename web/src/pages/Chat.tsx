@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useParams } from 'react-router'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useParams, useSearchParams } from 'react-router'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useChat } from '@ai-sdk/react'
 import { DefaultChatTransport, lastAssistantMessageIsCompleteWithApprovalResponses, type UIMessage } from 'ai'
 import { api, type Conversation, type ModelsResponse } from '../api'
 import { MessageList } from '../components/MessageList'
-import { Composer } from '../components/Composer'
+import { Composer, type FilePart } from '../components/Composer'
 import { ModelPicker } from '../components/ModelPicker'
 import { ArtifactContext, ArtifactPanel, type ArtifactRef } from '../components/ArtifactPanel'
 import { CodePanel } from '../components/CodePanel'
-import { PanelRight } from 'lucide-react'
+import { DesignPanel } from '../components/DesignPanel'
+import { Palette, PanelRight } from 'lucide-react'
 
 type ConvResponse = { conversation: Conversation; messages: UIMessage[] }
 
@@ -107,9 +108,49 @@ function ChatInner({
     }
   }, [chat.messages])
 
+  // Ratings (PLAN M10): thumbs on assistant answers, one per user.
+  const qc = useQueryClient()
+  const ratings = useQuery({ queryKey: ['ratings', id], queryFn: () => api.get<{ ratings: Record<string, number> }>(`/api/conversations/${id}/ratings`) })
+  const rate = useMutation({
+    mutationFn: ({ messageId, score }: { messageId: string; score: 1 | -1 | null }) =>
+      score === null ? api.del(`/api/messages/${messageId}/rating`) : api.put(`/api/messages/${messageId}/rating`, { score }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['ratings', id] }),
+  })
+
+  // ?attach=<attachment id> (the gallery's "use in chat"): load the image
+  // into the composer as if the user had attached it, then drop the param.
+  const [params, setParams] = useSearchParams()
+  const attach = params.get('attach')
+  const [initialFiles, setInitialFiles] = useState<FilePart[] | undefined>(undefined)
+  useEffect(() => {
+    if (!attach) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`/api/attachments/${attach}`, { credentials: 'same-origin' })
+        if (!res.ok) return
+        const blob = await res.blob()
+        const url = await new Promise<string>((ok) => {
+          const r = new FileReader()
+          r.onload = () => ok(r.result as string)
+          r.readAsDataURL(blob)
+        })
+        if (!cancelled) setInitialFiles([{ type: 'file', mediaType: blob.type || 'image/png', url, filename: 'image' }])
+      } finally {
+        if (!cancelled) setParams({}, { replace: true })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attach])
+
   const busy = chat.status === 'submitted' || chat.status === 'streaming'
   const isCode = initial.conversation.mode === 'code'
+  const isDesign = initial.conversation.mode === 'design'
   const [codeOpen, setCodeOpen] = useState(isCode)
+  const [designOpen, setDesignOpen] = useState(false)
 
   return (
     <ArtifactContext.Provider value={{ open: (aid, version) => setPanel({ id: aid, version }) }}>
@@ -124,6 +165,17 @@ function ChatInner({
                   <PanelRight size={16} />
                 </button>
               )}
+              {isDesign && (
+                <button
+                  onClick={() => setDesignOpen(!designOpen)}
+                  className={designOpen ? 'p-1.5 rounded-md text-fg bg-bg-3' : 'p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg'}
+                  title="Design system"
+                  aria-label="Design system"
+                  aria-pressed={designOpen}
+                >
+                  <Palette size={16} />
+                </button>
+              )}
             </div>
           </header>
           <MessageList
@@ -131,9 +183,12 @@ function ChatInner({
             status={chat.status}
             error={chat.error}
             onApproval={(approvalId, approved) => chat.addToolApprovalResponse({ id: approvalId, approved })}
+            ratings={ratings.data?.ratings}
+            onRate={(messageId, score) => rate.mutate({ messageId, score })}
           />
           <Composer
             disabled={busy}
+            initialFiles={initialFiles}
             onStop={busy ? () => chat.stop() : undefined}
             onSend={(text, files) => {
               chat.sendMessage({ text, files })
@@ -141,7 +196,8 @@ function ChatInner({
           />
         </div>
         {isCode && codeOpen && <CodePanel projectId={initial.conversation.project_id} onClose={() => setCodeOpen(false)} />}
-        {panel && !(isCode && codeOpen) && (
+        {isDesign && designOpen && <DesignPanel conversationId={id} settings={initial.conversation.settings} onClose={() => setDesignOpen(false)} />}
+        {panel && !(isCode && codeOpen) && !designOpen && (
           <ArtifactPanel
             id={panel.id}
             version={panel.version}

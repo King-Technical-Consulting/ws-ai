@@ -79,6 +79,18 @@ func (f *fakeStore) CancelRun(_ context.Context, id uuid.UUID) error {
 	f.runs[id] = r
 	return nil
 }
+func (f *fakeStore) SetRunStatus(_ context.Context, p store.SetRunStatusParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runs[p.ID]
+	if !ok {
+		return pgx.ErrNoRows
+	}
+	r.Status = p.Status
+	r.Error = p.Error
+	f.runs[p.ID] = r
+	return nil
+}
 func (f *fakeStore) CreateConversation(_ context.Context, p store.CreateConversationParams) (store.Conversation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

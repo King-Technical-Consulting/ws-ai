@@ -37,12 +37,26 @@ rules:
       - openai/text-embedding-3-small
 
   # Images (M6): only media endpoints qualify, so a text model is never
-  # tried. Put a local ComfyUI endpoint first here once one exists. Video
-  # has no endpoint in the seed yet; without a rule the router falls back
-  # to any enabled video endpoint.
+  # tried. The local ComfyUI endpoint goes first once it is enabled; an
+  # edit (image plus prompt) uses the same class and skips endpoints that
+  # cannot edit.
   - match: { task_class: [image] }
     prefer:
+      - comfyui/sdxl
       - openai/gpt-image-1
+      - google/imagen-4
+      - fal/flux-dev
+      - fal/flux-kontext
+      - fal/clarity-upscaler
+
+  # Video (M6): Sora first, Veo and Wan behind it; image to video skips
+  # endpoints that cannot take a source.
+  - match: { task_class: [video] }
+    prefer:
+      - openai/sora-2
+      - google/veo-3
+      - fal/wan-2.2-t2v
+      - fal/wan-2.2-i2v
 
   # Coding and agent work wants the strongest tool-caller available.
   - match: { task_class: [code] }

@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jking323/ws/internal/agent"
+	"github.com/jking323/ws/internal/artifacts"
 	"github.com/jking323/ws/internal/gateway"
 	"github.com/jking323/ws/internal/httpx/aistream"
 	"github.com/jking323/ws/internal/store"
@@ -62,17 +63,20 @@ func (s *Service) Run(ctx context.Context, w *aistream.Writer, t Turn) (uuid.UUI
 		return uuid.Nil, err
 	}
 
-	system := t.System
-	if system == "" {
-		system = defaultSystemPrompt(conv.Mode)
-	}
 	var policies map[string]agent.Policy
+	var design *artifacts.DesignContext
 	if len(conv.Settings) > 0 {
 		var st struct {
-			ToolPolicies map[string]agent.Policy `json:"tool_policies"`
+			ToolPolicies  map[string]agent.Policy `json:"tool_policies"`
+			DesignContext json.RawMessage         `json:"design_context"`
 		}
 		_ = json.Unmarshal(conv.Settings, &st)
 		policies = st.ToolPolicies
+		design, _ = artifacts.ParseDesignContext(st.DesignContext)
+	}
+	system := t.System
+	if system == "" {
+		system = systemPrompt(conv.Mode, design)
 	}
 	run, err := s.Runtime.Create(ctx, agent.StartParams{
 		ConversationID: conv.ID, UserID: t.UserID,
@@ -327,13 +331,15 @@ func (s *Service) title(ctx context.Context, convID uuid.UUID) {
 	_ = s.DB.UpdateConversationTitle(ctx, store.UpdateConversationTitleParams{ID: convID, Title: title})
 }
 
-func defaultSystemPrompt(mode string) string {
+// systemPrompt is the default prompt for a mode. A design conversation
+// gets the design instructions and its design system (PLAN M6).
+func systemPrompt(mode string, design *artifacts.DesignContext) string {
 	base := "You are a helpful, direct assistant. Use Markdown. Keep answers as short as the question allows."
 	switch mode {
 	case "code":
 		base += " You are helping with software engineering. Prefer concrete code over prose."
 	case "design":
-		base += " You help design user interfaces. When asked for a mockup, produce a single self-contained HTML file."
+		base += artifacts.DesignSystemPrompt(design)
 	}
 	base += " When the user asks for a document, web page, diagram, or a file-sized piece of code they will keep, use create_artifact and then describe it in one or two sentences; use update_artifact to revise an existing artifact. Use web_fetch to read a public page when the user gives a URL or asks about something you'd need to look up. If a tool result says a large output was stored as a blob, use read_blob to read more of it only when needed."
 	return base

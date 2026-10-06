@@ -38,7 +38,73 @@ export const api = {
 
 // ---- types mirrored from the Go side ----
 
-export type User = { id: string; email: string; display_name: string; role: 'owner' | 'member'; via_api_key?: boolean }
+export type User = { id: string; email: string; display_name: string; role: 'owner' | 'member'; via_api_key?: boolean; training_consent?: boolean }
+
+// ---- training flywheel (PLAN M10) ----
+
+export type DatasetFilters = {
+  modes?: string[]
+  models?: string[]
+  min_rating: number
+  since?: string
+  holdout_pct: number
+  max_examples?: number
+}
+
+export type Dataset = {
+  id: string
+  owner_id: string
+  name: string
+  task_class: string
+  filters: DatasetFilters
+  status: 'queued' | 'building' | 'ready' | 'failed'
+  blob_key: string | null
+  eval_blob_key: string | null
+  bytes: number
+  examples: number
+  eval_examples: number
+  error: string | null
+  created_at: string
+  built_at: string | null
+}
+
+export type FinetuneConfig = { epochs?: number; learning_rate?: number; rank?: number; alpha?: number; max_seq_len?: number; image?: string; target?: 'local' | 'rental' }
+export type FinetuneTarget = { id: 'local' | 'rental'; label: string }
+
+export type FinetuneJob = {
+  id: string
+  owner_id: string
+  dataset_id: { UUID: string; Valid: boolean }
+  base_model: string
+  base_endpoint_id: string | null
+  adapter_name: string
+  config: FinetuneConfig
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  progress: number
+  log: string
+  adapter_id: { UUID: string; Valid: boolean }
+  error: string | null
+  created_at: string
+  started_at: string | null
+  ended_at: string | null
+}
+
+export type Adapter = {
+  id: string
+  name: string
+  base_model: string
+  base_endpoint_id: string | null
+  finetune_job_id: { UUID: string; Valid: boolean }
+  blob_key: string
+  bytes: number
+  eval_score: number | null
+  baseline_score: number | null
+  eval: { examples: number; adapter_score: number; baseline_score: number; judge: string; adapter_wins: number; baseline_wins: number; ties: number; errors?: string[]; at: string } | null
+  promoted: boolean
+  endpoint_id: string | null
+  created_at: string
+  evaluated_at: string | null
+}
 
 export type Project = {
   id: string
@@ -49,6 +115,24 @@ export type Project = {
   updated_at: string
 }
 
+// The design system a design conversation's mockups follow (PLAN M6);
+// stored in the conversation's settings and on each design artifact
+// version as design_context.
+export type DesignContext = {
+  library?: 'tailwind' | 'shadcn' | 'plain'
+  colors?: Record<string, string>
+  type?: Record<string, string>
+  spacing?: string
+  radius?: string
+  components?: string[]
+  notes?: string
+}
+
+export type ConversationSettings = {
+  tool_policies?: Record<string, 'auto' | 'ask' | 'deny'>
+  design_context?: DesignContext
+}
+
 export type Conversation = {
   id: string
   project_id: string
@@ -56,6 +140,7 @@ export type Conversation = {
   title: string
   mode: string
   model_selector: string
+  settings?: ConversationSettings | null
   created_at: string
   updated_at: string
 }
@@ -108,9 +193,12 @@ export type MediaModel = {
   image: boolean
   image_edit: boolean
   video: boolean
+  image_to_video: boolean
+  upscale: boolean
   sizes: string[]
   max_images: number
   max_seconds: number
+  seconds: number[]
   per_image: number
   per_second: number
   health: string
@@ -135,7 +223,7 @@ export type MediaJob = {
   kind: 'image' | 'video' | 'edit' | 'upscale'
   selector: string
   endpoint_id: string | null
-  inputs: { prompt: string; size?: string; n?: number; quality?: string; seconds?: number; estimate_usd?: number }
+  inputs: { prompt: string; size?: string; n?: number; quality?: string; seconds?: number; source_attachment_id?: string; mask_attachment_id?: string; scale?: number; estimate_usd?: number }
   provider_job_id: string | null
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
   progress: number
@@ -181,12 +269,26 @@ export type AgentInput = {
   enabled?: boolean
 }
 
+export type AgentPreset = {
+  name: string
+  title: string
+  description: string
+  goal: string
+  prompt: string
+  model: { selector?: string; task_class?: string; reasoning?: boolean }
+  tools: string[]
+  max_steps: number
+  note: string
+}
+
+export type SkillImport = { preset: AgentPreset; requested_tools: string[]; warnings: string[] }
+
 export type AgentTrigger = {
   id: string
   agent_id: string
   kind: 'cron' | 'webhook' | 'repo_push' | 'manual'
   name: string
-  spec: { expr?: string; input?: string }
+  spec: { expr?: string; input?: string; repo?: string; branches?: string[]; events?: string[] }
   enabled: boolean
   created_at: string
   next_run_at: string | null
@@ -200,7 +302,7 @@ export type AgentRun = {
   agent_id: NullUUID
   conversation_id: string
   trigger_id: NullUUID
-  status: 'queued' | 'running' | 'paused_approval' | 'paused_steer' | 'done' | 'failed' | 'cancelled'
+  status: 'queued' | 'running' | 'paused_approval' | 'paused_steer' | 'paused_manual' | 'done' | 'failed' | 'cancelled'
   max_steps: number
   step_count: number
   cost_usd: number
@@ -238,7 +340,7 @@ export type AgentDetail = {
   triggers: AgentTrigger[]
   runs: AgentRun[]
   pending_approvals: Approval[]
-  spend: { since: string; usd: number; budgets: { period: string; limit_usd: number; on_exceed: string }[] }
+  spend: { since: string; usd: number; budgets: { id: string; period: string; limit_usd: number; on_exceed: string }[] }
 }
 
 export type AgentMemory = {

@@ -1,21 +1,28 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react'
 
-type FilePart = { type: 'file'; mediaType: string; url: string; filename?: string }
+export type FilePart = { type: 'file'; mediaType: string; url: string; filename?: string }
 
 export function Composer({
   disabled,
   onSend,
   onStop,
+  initialFiles,
 }: {
   disabled: boolean
   onSend: (text: string, files?: FilePart[]) => void
   onStop?: () => void
+  // Files to start with (a gallery image sent to chat); applied when the
+  // array changes.
+  initialFiles?: FilePart[]
 }) {
   const [text, setText] = useState('')
   const [files, setFiles] = useState<FilePart[]>([])
   const ta = useRef<HTMLTextAreaElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (initialFiles && initialFiles.length) setFiles((cur) => [...cur, ...initialFiles])
+  }, [initialFiles])
 
   function submit() {
     const t = text.trim()

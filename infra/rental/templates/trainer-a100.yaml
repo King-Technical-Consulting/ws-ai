@@ -1,0 +1,28 @@
+# A fine-tune box: the ws trainer image (infra/training) in serve mode on
+# one A100 80 GB. No model is served and no endpoint is registered; the
+# worker's training.finetune job starts it when a job's target is
+# "rental", drives it over HTTPS (dataset in, progress out, adapter out)
+# and stops it as soon as the job ends. Point WS_FINETUNE_TEMPLATE at it.
+name: trainer-a100
+kind: trainer
+provider: runpod
+description: LoRA fine-tunes on one A100 80 GB (Unsloth trainer, serve mode)
+gpu: NVIDIA A100 80GB PCIe
+gpu_count: 1
+cloud_type: secure
+# Push the image somewhere the pod can pull it:
+#   docker build -t ghcr.io/king-technical-consulting/ws-trainer:latest infra/training && docker push ...
+image: ghcr.io/king-technical-consulting/ws-trainer:latest
+env:
+  TRAINER_MODE: serve
+  TRAINER_API_KEY: $WS_RENTAL_API_KEY
+  HF_TOKEN: $HF_TOKEN
+  HF_HOME: /workspace/hf
+port: 8000
+disk_gb: 40
+volume_gb: 100
+volume_path: /workspace
+idle_timeout: 15m
+max_hours: 6
+warmup_timeout: 20m
+hourly_usd: 1.64

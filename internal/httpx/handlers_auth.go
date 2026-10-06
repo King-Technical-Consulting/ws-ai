@@ -195,7 +195,11 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	p := Principal(r.Context())
-	writeJSON(w, 200, map[string]any{"id": p.UserID, "email": p.Email, "display_name": p.DisplayName, "role": p.Role, "via_api_key": p.APIKeyID.Valid})
+	consent := false
+	if u, err := s.DB.GetUserByID(r.Context(), p.UserID); err == nil {
+		consent = u.TrainingConsent
+	}
+	writeJSON(w, 200, map[string]any{"id": p.UserID, "email": p.Email, "display_name": p.DisplayName, "role": p.Role, "via_api_key": p.APIKeyID.Valid, "training_consent": consent})
 }
 
 func isUnauthorized(err error) bool { return errors.Is(err, auth.ErrUnauthorized) }

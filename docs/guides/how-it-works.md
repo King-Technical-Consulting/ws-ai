@@ -4,7 +4,7 @@ A plain-language tour of what happens between your message and the reply. The [a
 
 ## Two processes, one database
 
-ws is one program started in two roles. **`serve`** answers the browser and the API: sign-in, the web app, the `/v1` model API, and the artifact and preview hostnames. **`worker`** does the slow and privileged work: running agent steps, summarizing long conversations, managing sandboxes, and the network proxy that sandboxes go through. Both roles run the model gateway, but only the worker can talk to Docker. They never call each other directly except to manage sandboxes, move files and carry terminal bytes; everything else goes through Postgres, which holds jobs, live events, settings and history.
+ws is one program started in two roles. **`serve`** answers the browser and the API: sign-in, the web app, the `/v1` model API, the `/mcp` endpoint for API keys with the `mcp` scope, and the artifact and preview hostnames. **`worker`** does the slow and privileged work: running agent steps, summarizing long conversations, managing sandboxes, the network proxy that sandboxes go through, image generation, agent triggers and memory, and the reconcile pass for rented GPUs. Both roles run the model gateway, but only the worker can talk to Docker. They never call each other directly except to manage sandboxes, move files and carry terminal bytes; everything else goes through Postgres, which holds jobs, live events, settings and history.
 
 ## A message is a run
 
@@ -28,6 +28,6 @@ For the isolation details and the limits, see [Trust and security](../TRUST.md).
 
 ## What is stored
 
-Postgres holds accounts, projects, conversations, messages, runs and steps, approvals, artifacts and their versions, sandbox records, the endpoint and policy configuration, budgets and the usage ledger. Large tool output is kept as files in a blob directory, and each sandbox's working copy lives in its own Docker volume. [Data model](../DATA-MODEL.md) lists every table.
+Postgres holds accounts, projects, conversations, messages, runs and steps, approvals, artifacts and their versions, sandbox records, the endpoint and policy configuration, budgets and the usage ledger, plus agents with their triggers and memory, image jobs, API keys with their scopes, and rented-machine records. Large tool output is kept as files in a blob directory, and each sandbox's working copy lives in its own Docker volume. [Data model](../DATA-MODEL.md) lists every table.
 
-*Checked against the architecture and the code at master `f54aa75`.*
+*Checked against the architecture and the code at master `13a673a`.*

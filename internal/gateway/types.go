@@ -185,6 +185,11 @@ type Request struct {
 	// prompt. Message-level breakpoints use Part.CacheHint.
 	SystemCache bool `json:"system_cache,omitempty"`
 
+	// Media, on a media task class, says what the job needs of a media
+	// endpoint (an edit needs image_edit, image to video needs
+	// image_to_video); nil means the task class's default (image, video).
+	Media *MediaCaps `json:"media,omitempty"`
+
 	Metadata Metadata `json:"metadata"`
 }
 
@@ -432,13 +437,14 @@ type Capabilities struct {
 // MediaCaps describes a media endpoint: which engine drives it and what it
 // can make. Declared in config like the rest; engines rarely report it.
 type MediaCaps struct {
-	// Engine names the adapter in internal/media: openai_images today;
-	// comfyui, fal and google are planned.
+	// Engine names the adapter in internal/media: openai_images,
+	// openai_videos, fal, comfyui or google.
 	Engine       string `json:"engine" yaml:"engine"`
 	Image        bool   `json:"image,omitempty" yaml:"image"`                   // text to image
 	ImageEdit    bool   `json:"image_edit,omitempty" yaml:"image_edit"`         // image plus prompt (and mask) to image
 	Video        bool   `json:"video,omitempty" yaml:"video"`                   // text to video
 	ImageToVideo bool   `json:"image_to_video,omitempty" yaml:"image_to_video"` // image plus prompt to video
+	Upscale      bool   `json:"upscale,omitempty" yaml:"upscale"`               // image to a larger image
 	// Sizes lists the accepted "WxH" (or engine keywords such as "auto");
 	// empty means the engine's default only.
 	Sizes []string `json:"sizes,omitempty" yaml:"sizes"`
@@ -446,6 +452,10 @@ type MediaCaps struct {
 	MaxImages int `json:"max_images,omitempty" yaml:"max_images"`
 	// MaxSeconds caps a video job's length; 0 means the engine's default.
 	MaxSeconds int `json:"max_seconds,omitempty" yaml:"max_seconds"`
+	// Seconds lists the video lengths the engine accepts (Sora takes 4, 8
+	// or 12); empty means any length up to MaxSeconds. The first is the
+	// default.
+	Seconds []int `json:"seconds,omitempty" yaml:"seconds"`
 }
 
 // IsMedia reports whether the endpoint is an image or video endpoint.

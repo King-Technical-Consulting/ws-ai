@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { registerPasskey } from '../lib/passkey'
-import { PageTitle, Callout, btn, input } from '../components/ui'
+import { PageTitle, Callout, WsMark, btn, input } from '../components/ui'
 
 export default function Invite() {
   const { token = '' } = useParams()
@@ -50,6 +50,7 @@ export default function Invite() {
   return (
     <div className="h-full grid place-items-center p-6">
       <div className="w-full max-w-sm space-y-5">
+        <WsMark size={40} className="text-fg" />
         <PageTitle>Welcome to ws</PageTitle>
         {err && <Callout kind="error">{err}</Callout>}
 

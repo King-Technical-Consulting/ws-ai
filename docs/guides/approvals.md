@@ -10,7 +10,7 @@ Models act through tools, and each tool has a policy that decides whether it run
 | `ask` | The run pauses and an approval card appears in the chat. Nothing happens until you answer. |
 | `deny` | The tool is blocked. |
 
-Each tool ships with a default. In a chat, the built-in tools (`create_artifact`, `update_artifact`, `web_fetch`, `read_blob`, `ask_user`) are `auto`. In a [code project](code-projects.md), the file tools (`read_file`, `write_file`, `edit_file`, `list_files`, `grep`) are `auto`, while `bash` is `ask`, and so are `git_push` and `open_pr`. Tools from MCP servers default to `ask`, unless the server's entry in `config/mcp.yaml` sets a different default or a per-tool override; see [Configuration](../CONFIGURATION.md). The task router's `spawn_job` is `auto` while dispatch is off (it only decides) and `ask` when the operator turns dispatch on; see [Use Claude Code with ws](claude-code.md).
+Each tool ships with a default. In a chat, the built-in tools (`create_artifact`, `update_artifact`, `web_fetch`, `read_blob`, `ask_user`, and `generate_image` when an image model is configured) are `auto`. In a [code project](code-projects.md), the file tools (`read_file`, `write_file`, `edit_file`, `list_files`, `grep`) and the read-only and local git tools (`git_status`, `git_diff`, `git_commit`) are `auto`, while `bash` is `ask`, and so are `git_push` and `open_pr`. Tools from MCP servers default to `ask`, unless the server's entry in `config/mcp.yaml` sets a different default or a per-tool override; see [Configuration](../CONFIGURATION.md). Servers declared with `command:` run inside the code sandbox and can only be called from code projects. Agents have their own settings: each has a tool allowlist and per-tool policies, and an agent run that needs approval shows an Allow or Decline card on the agent's page. The task router's `spawn_job` is `auto` while dispatch is off (it only decides) and `ask` when the operator turns dispatch on; see [Use Claude Code with ws](claude-code.md).
 
 ## Answering an approval
 
@@ -24,4 +24,4 @@ A conversation can override the defaults with `settings.tool_policies`: send `{"
 
 A model can be steered by text it reads, such as a web page it fetched or a file in a repository. Approvals keep a person between that text and anything with side effects: running a command, pushing code, opening a pull request. Isolation does the rest; see [Trust and security](../TRUST.md).
 
-*Checked against the code at master `3364287`.*
+*Checked against the code at master `13a673a`.*

@@ -1,6 +1,6 @@
 # Roadmap
 
-What is built, what is in progress and what is planned. Milestones M1 to M4 are built and used; M5 is in progress; M6 onward is planned and may change. This page is a summary: each built area has a reference page, and planned work has no code yet. Last checked against the code at master `436b0c8` (see [Architecture](ARCHITECTURE.md) for what exists today).
+What is built, what is in progress and what is planned. Milestones M1 to M4 are built and used; M5 is in progress; M6, M9 and M10 are in progress, M7 is built, and M8 is planned and may change. This page is a summary: each built area has a reference page, and planned work has no code yet. Last checked against the code at master `9d28c2f` (see [Architecture](ARCHITECTURE.md) for what exists today).
 
 | Milestone | State | What it covers |
 |---|---|---|
@@ -8,12 +8,12 @@ What is built, what is in progress and what is planned. Milestones M1 to M4 are 
 | M2 External API and routing | Built | `/v1/chat/completions` and `/v1/messages` with API keys, routing policies and budgets with an Admin editor, sandboxed artifacts on a separate origin |
 | M3 Agent runtime | Built | Durable runs with steps and checkpoints, resume after restart, tool approvals, conversation compaction, River jobs |
 | M4 Coding sandbox | Built | Per-user Docker sandboxes, egress proxy, GitHub App with git tools and `open_pr`, a files, terminal and preview panel |
-| M5 Claude Code and MCP | In progress | Built: secrets from Infisical, an MCP client, the `wsj` launcher for Claude Code sessions in tmux, and the task router (rules plus a small-model classifier, off by default), and the outbound gateway (a byte-for-byte `/v1/messages` passthrough for Anthropic endpoints so Claude Code can use ws as its API gateway), the read-only job tab (a page listing the Claude Code sessions `wsj` reports, with a read-only terminal view, tailnet-gated), and a weekly launch counter that lets the router keep low-value work off the subscription as the week fills. Next: acceptance runs with a real Claude Code client and a real target |
-| M6 Design, images and video | In progress | Built: a media gateway with hosted image generation (OpenAI), a `generate_image` chat tool and an Images page. Next: video, image edit, local engines such as ComfyUI, and design artifacts |
-| M7 Long-lived agents | In progress | Built: agents with goals, cron and webhook triggers, a monitor page, and memory with reflection and recall. Next: repo-push triggers and an agent-facing remember and recall |
+| M5 Claude Code and MCP | In progress | Built: secrets from Infisical, an MCP client, the `wsj` launcher for Claude Code sessions in tmux, and the task router (rules plus a small-model classifier, off by default), and the outbound gateway (a byte-for-byte `/v1/messages` passthrough for Anthropic endpoints so Claude Code can use ws as its API gateway), ws as an MCP server (`/mcp`, for API keys with the `mcp` scope), MCP servers that run inside a code project's sandbox, the read-only job tab (a page listing the Claude Code sessions `wsj` reports, with a read-only terminal view, tailnet-gated), and a weekly launch counter that lets the router keep low-value work off the subscription as the week fills. Next: acceptance runs with a real Claude Code client and a real target |
+| M6 Design, images and video | In progress | Built: a media gateway with OpenAI, Sora, fal.ai, ComfyUI and Google (Imagen, Veo) engines, image edits with masks, upscale and video, `generate_image` and `generate_video` chat tools and a Media page. Next: design artifacts and variants |
+| M7 Long-lived agents | Built | Agents with goals, cron, webhook and GitHub triggers, memory, a monitor with a budget control, and pause and resume of a run |
 | M8 Fleet | Planned | vLLM and Ollama/MLX profiles, throughput-aware routing |
-| M9 Rented GPUs | In progress | Built: starting a RunPod GPU machine from Admin with a daily cap and idle shutdown, appearing as a model while it runs. Next: Lambda and Vast.ai |
-| M10 Training flywheel | Planned, optional | Dataset export, fine-tuning, an adapter registry |
+| M9 Rented GPUs | In progress | Built: starting a RunPod GPU machine from Admin with a daily cap and idle shutdown, appearing as a model while it runs. Next: Lambda and Vast.ai. A rental template can also be a trainer machine for fine-tuning |
+| M10 Training flywheel | In progress, optional | Built: thumbs on answers, per-user consent, dataset export, fine-tune jobs on a trainer container or a rented trainer machine, an adapter registry and an eval gate. Next: serving an adapter, distillation. Only tested against fakes |
 
 ## Claude Code and subscriptions
 

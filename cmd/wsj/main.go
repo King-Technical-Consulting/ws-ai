@@ -70,7 +70,8 @@ Every command takes --no-mux to open a fresh ssh connection instead of the
 multiplexed one (for debugging a stale control socket).
 
 Targets: `+ccjobs.DefaultConfigPath()+` (override with WSJ_TARGETS).
-With a [ws] section there (url, key_file: a ws API key) or WSJ_WS_URL and
+With a [ws] section there (url, key_file: an owner's ws API key minted with
+job reporting) or WSJ_WS_URL and
 WSJ_WS_KEY, run, kill and clean report job handles to ws for its read-only
 job tab. Only the handle is sent: never the prompt, never any output.
 `)

@@ -20,7 +20,7 @@ DOCKER_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || stat -f %g 
 export DOCKER_GID
 COMPOSE := docker compose --env-file .env -f infra/compose/compose.yaml -f infra/compose/override.$(HW).yaml $(if $(filter traefik,$(INGRESS)),-f infra/compose/override.traefik.yaml,) $(if $(filter cloudflare tailscale,$(INGRESS)),--profile $(INGRESS),) $(foreach p,$(PROFILES),--profile $(p))
 
-.PHONY: all build wsj wsj-install dev serve worker test lint migrate sqlc web web-dev image db-up db-down tidy up down pull logs ps backup config install-cd uninstall-cd deploy cd-logs
+.PHONY: notices notices-check all build wsj wsj-install dev serve worker test lint migrate sqlc web web-dev image db-up db-down tidy up down pull logs ps backup config install-cd uninstall-cd deploy cd-logs
 
 all: build
 
@@ -53,6 +53,13 @@ migrate:
 
 migrate-down:
 	$(GO) run ./cmd/ws migrate down
+
+# THIRD_PARTY_NOTICES.txt is generated; needs web/node_modules (npm ci in web/).
+notices:
+	node scripts/notices/generate.mjs
+
+notices-check:
+	node scripts/notices/generate.mjs --check
 
 test:
 	$(GO) test ./...

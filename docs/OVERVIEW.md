@@ -10,7 +10,10 @@ ws is a self-hosted AI workspace. You get chat with documents the assistant can 
 - **Get documents, not just replies.** The assistant can produce web pages, diagrams, Markdown and code as versioned artifacts that render on a separate, locked-down origin. See [Artifacts](guides/artifacts.md).
 - **Let the assistant write code in a sandbox.** A code project gives the assistant its own container with your repository, a file editor, a terminal and live previews. By default it asks before it runs commands, pushes code or opens pull requests. See [Code projects](guides/code-projects.md) and [Tool approvals](guides/approvals.md).
 - **Use Claude Code through ws.** Point Claude Code at ws as its API gateway and get routing, budgets and a per-session usage record, or launch real Claude Code sessions on your own machines with a small CLI. See [Use Claude Code with ws](guides/claude-code.md).
-- **Run your own models next to hosted ones.** llama.cpp, vLLM, Ollama and anything OpenAI-compatible work as endpoints, with Anthropic, OpenAI and OpenRouter alongside. Budgets can block a call or switch it to local endpoints. See [Admin](guides/admin.md) and [Inference targets](../infra/inference/README.md).
+- **Generate images.** Ask in chat or use the Media page; ws routes the request to an image model, shows the price first and keeps the results in a gallery. It can also edit a photo and make short videos. Engines are OpenAI (images and Sora), fal.ai and a ComfyUI you run; only the OpenAI image engine has been used against a real service so far.
+- **Run agents on a schedule.** An agent has a goal, its own tools and a project; cron, webhook or GitHub push triggers start it, a monitor page shows its runs, and it can remember facts between runs. These are early features.
+- **Run your own models next to hosted ones.** llama.cpp, vLLM, Ollama and anything OpenAI-compatible work as endpoints, with Anthropic, OpenAI and OpenRouter alongside. Budgets can block a call or switch it to local endpoints, and the owner can rent a RunPod GPU from Admin with a daily cap and idle shutdown. See [Admin](guides/admin.md) and [Inference targets](../infra/inference/README.md).
+- **Use ws from your other tools.** ws also runs as an MCP server, so Claude Code and other MCP clients can list your projects, read conversations and start runs, with an API key made for that.
 - **Keep control.** Secrets can live in Infisical and never enter a sandbox. Running commands, pushing and opening pull requests ask for approval by default, and you can change the policy for each tool. See [Trust and security](TRUST.md).
 
 ## How it is built
@@ -23,4 +26,4 @@ Two roles from one binary: `serve` handles the browser, the API and auth; `worke
 2. [Deploy with Compose](../infra/compose/README.md) puts it on a server, with Cloudflare Tunnel, Tailscale or Traefik in front.
 3. The guides under **Use it** show how it works day to day, and **Reference** has every setting, route and table.
 
-ws is released under the PolyForm Strict License 1.0.0, which allows noncommercial use only; see [License](LICENSING.md).
+ws is released under the PolyForm Noncommercial License 1.0.0, which allows noncommercial use only; see [License](LICENSING.md).

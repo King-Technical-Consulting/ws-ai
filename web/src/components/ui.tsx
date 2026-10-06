@@ -73,3 +73,45 @@ export const btn = {
 
 export const input = 'w-full rounded-lg border border-line bg-bg-2 px-3 py-2.5 outline-none focus:border-accent'
 export const inputSm = 'w-full rounded-lg border border-line bg-bg-2 px-3 py-2 text-sm outline-none focus:border-accent'
+
+/** The routing mark: one line splits to a hosted model (filled dot) and a local one (ring).
+ *  Ink follows currentColor, the destinations use the accent. `draw` plays the draw-on once (Login only). */
+export function WsMark({ size = 24, draw = false, className }: { size?: number; draw?: boolean; className?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 64 64"
+      width={size}
+      height={size}
+      fill="none"
+      role="img"
+      aria-label="ws"
+      className={className}
+    >
+      {/* thicker strokes below 32px so the mark holds at small sizes */}
+      <g stroke="currentColor" strokeWidth={size < 32 ? 4 : 2.6} strokeLinecap="round">
+        <path className={draw ? 'ws-draw' : undefined} d="M6 32 H22 C34 32 36 14 50 14" />
+        <path className={draw ? 'ws-draw-2' : undefined} d="M22 32 C34 32 36 50 50 50" />
+      </g>
+      <circle cx="5" cy="32" r="2.6" fill="currentColor" />
+      <circle className={draw ? 'ws-dest-1' : undefined} cx="55" cy="14" r="4.5" fill="var(--color-accent)" />
+      <circle className={draw ? 'ws-dest-2' : undefined} cx="55" cy="50" r="3.6" stroke="var(--color-accent)" strokeWidth="2" />
+    </svg>
+  )
+}
+
+/** Outlined status chip. `ok` is healthy or local, `info` is hosted, queued or informational.
+ *  Never interactive: orange stays the only interactive hue. */
+export function StatusChip({ kind, children }: { kind: 'ok' | 'info'; children: React.ReactNode }) {
+  return (
+    <span
+      className={clsx(
+        'inline-flex items-center rounded-md border px-2.5 py-1 text-xs',
+        kind === 'ok' && 'border-ok text-ok',
+        kind === 'info' && 'border-info text-info',
+      )}
+    >
+      {children}
+    </span>
+  )
+}

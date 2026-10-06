@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -255,14 +256,18 @@ type Principal struct {
 	Scopes []string
 }
 
-// API key scopes. A key is minted with chat by default; mcp is explicit.
+// API key scopes. A key is minted with chat by default; the others are
+// explicit. A key reaches nothing but the routes its scopes name: the web
+// /api routes take a browser session, and the one /api group a key may
+// use (the job reports) needs jobs.
 const (
 	ScopeChat = "chat" // /v1 (chat completions, messages, models)
 	ScopeMCP  = "mcp"  // /mcp (ws as an MCP server)
+	ScopeJobs = "jobs" // /api/jobs/cc (wsj reports Claude Code sessions)
 )
 
 // KnownScopes lists the scopes a key may carry.
-var KnownScopes = []string{ScopeChat, ScopeMCP}
+var KnownScopes = []string{ScopeChat, ScopeMCP, ScopeJobs}
 
 // IsOwner reports admin rights.
 func (p *Principal) IsOwner() bool { return p != nil && p.Role == "owner" }
@@ -356,8 +361,8 @@ func (s *Service) CreateAPIKey(ctx context.Context, userID uuid.UUID, name strin
 		scopes = []string{ScopeChat}
 	}
 	for _, sc := range scopes {
-		if sc != ScopeChat && sc != ScopeMCP {
-			return "", nil, fmt.Errorf("unknown scope %q (chat, mcp)", sc)
+		if !slices.Contains(KnownScopes, sc) {
+			return "", nil, fmt.Errorf("unknown scope %q (%s)", sc, strings.Join(KnownScopes, ", "))
 		}
 	}
 	if defaultPolicy == "" {

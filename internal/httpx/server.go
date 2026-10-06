@@ -33,6 +33,7 @@ import (
 	"github.com/jking323/ws/internal/sandbox"
 	"github.com/jking323/ws/internal/store"
 	"github.com/jking323/ws/internal/store/blob"
+	"github.com/jking323/ws/internal/training"
 )
 
 // Server holds dependencies for handlers.
@@ -65,7 +66,10 @@ type Server struct {
 	Agents *agents.Service
 	// Rental rents GPUs on demand (Admin); nil answers 503.
 	Rental *rental.Controller
-	Log    *slog.Logger
+	// Training is the flywheel (datasets, fine-tunes, adapters); nil
+	// answers 503 on those routes (ratings and consent still work).
+	Training *training.Service
+	Log      *slog.Logger
 	// Web is the built frontend (web/dist). nil disables static serving.
 	Web fs.FS
 }
@@ -173,17 +177,22 @@ func (s *Server) appHandler() http.Handler {
 
 			pr.Get("/artifacts/{id}", s.handleGetArtifact)
 			pr.Get("/artifacts/{id}/versions/{v}", s.handleGetArtifact)
+			pr.Get("/artifacts/{id}/export", s.handleExportArtifact)
+			pr.Post("/artifacts/{id}/variants", s.handleArtifactVariants)
 
 			// Media (PLAN M6): image and video jobs per project, their
 			// outputs as attachments.
 			pr.Get("/projects/{id}/media", s.handleListMedia)
 			pr.Post("/projects/{id}/media", s.handleCreateMedia)
+			pr.Post("/projects/{id}/attachments", s.handleUploadAttachment)
 			pr.Get("/media/{id}", s.handleGetMedia)
 			pr.Delete("/media/{id}", s.handleDeleteMedia)
 			pr.Get("/attachments/{id}", s.handleGetAttachment)
 
 			// Long-lived agents (PLAN M7): definitions, triggers, runs.
 			pr.Get("/agents", s.handleListAgents)
+			pr.Get("/agents/presets", s.handleListPresets)
+			pr.Post("/agents/presets/import", s.handleImportSkill)
 			pr.Post("/agents", s.handleCreateAgent)
 			pr.Get("/agents/{id}", s.handleGetAgent)
 			pr.Put("/agents/{id}", s.handleUpdateAgent)
@@ -193,27 +202,27 @@ func (s *Server) appHandler() http.Handler {
 			pr.Post("/agents/{id}/triggers", s.handleCreateTrigger)
 			pr.Delete("/agents/{id}/triggers/{tid}", s.handleDeleteTrigger)
 			pr.Post("/agents/{id}/triggers/{tid}/enabled", s.handleSetTriggerEnabled)
+			pr.Get("/agents/{id}/memories", s.handleListMemories)
+			pr.Delete("/agents/{id}/memories", s.handleClearMemories)
+			pr.Delete("/agents/{id}/memories/{mid}", s.handleDeleteMemory)
 			pr.Post("/runs/{id}/cancel", s.handleCancelRun)
+			pr.Post("/runs/{id}/pause", s.handlePauseRun)
+			pr.Post("/runs/{id}/resume", s.handleResumeRun)
 			pr.Post("/runs/{id}/steer", s.handleSteerRun)
 
 			pr.Get("/keys", s.handleListKeys)
 			pr.Post("/keys", s.handleCreateKey)
 			pr.Delete("/keys/{id}", s.handleRevokeKey)
 
-			// Claude Code job tab: owner-only and tailnet-only (spec §6.5).
-			ccAllow := "" // no config (tests): the default list below
-			if s.Cfg != nil {
-				ccAllow = s.Cfg.CCWebAllow
-			}
-			if strings.TrimSpace(ccAllow) == "" {
-				ccAllow = "100.64.0.0/10,127.0.0.0/8,::1/128"
-			}
-			pr.Group(func(cc chi.Router) {
-				cc.Use(requireOwner, netGate(ccAllow))
-				cc.Get("/jobs/cc", s.handleListCCJobs)
-				cc.Post("/jobs/cc", s.handleReportCCJob)
-				cc.Delete("/jobs/cc/{id}", s.handleKillCCJob)
-				cc.Get("/jobs/cc/{id}/term", s.handleCCJobTerm)
+			// Training flywheel (PLAN M10): everyone rates and consents;
+			// the datasets, jobs and adapters are the owner's.
+			pr.Put("/me/training-consent", s.handleSetTrainingConsent)
+			pr.Put("/messages/{id}/rating", s.handleRateMessage)
+			pr.Delete("/messages/{id}/rating", s.handleUnrateMessage)
+			pr.Get("/conversations/{id}/ratings", s.handleConversationRatings)
+			pr.Group(func(tr chi.Router) {
+				tr.Use(requireOwner)
+				tr.Route("/training", s.trainingRoutes)
 			})
 
 			pr.Group(func(ad chi.Router) {
@@ -243,6 +252,24 @@ func (s *Server) appHandler() http.Handler {
 				ad.Put("/admin/budgets", s.handlePutBudget)
 				ad.Delete("/admin/budgets/{id}", s.handleDeleteBudget)
 			})
+		})
+
+		// Claude Code job tab: owner-only and tailnet-only (spec §6.5). The
+		// only /api routes an API key may use, with the jobs scope, since
+		// wsj reports from a terminal with no browser session.
+		ccAllow := "" // no config (tests): the default list below
+		if s.Cfg != nil {
+			ccAllow = s.Cfg.CCWebAllow
+		}
+		if strings.TrimSpace(ccAllow) == "" {
+			ccAllow = "100.64.0.0/10,127.0.0.0/8,::1/128"
+		}
+		api.Group(func(cc chi.Router) {
+			cc.Use(requireAuthScope(auth.ScopeJobs), requireOwner, netGate(ccAllow))
+			cc.Get("/jobs/cc", s.handleListCCJobs)
+			cc.Post("/jobs/cc", s.handleReportCCJob)
+			cc.Delete("/jobs/cc/{id}", s.handleKillCCJob)
+			cc.Get("/jobs/cc/{id}/term", s.handleCCJobTerm)
 		})
 	})
 
@@ -317,7 +344,11 @@ func requireAuthV1(next http.Handler) http.Handler {
 			}
 			return
 		}
-		requireAuth(next).ServeHTTP(w, r)
+		if crossSite(r, p) {
+			writeErr(w, 403, "cross-site request blocked")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -339,23 +370,52 @@ func requireAPIKeyMCP(next http.Handler) http.Handler {
 	})
 }
 
-func requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if Principal(r.Context()) == nil {
-			writeErr(w, 401, "unauthorized")
-			return
-		}
-		// CSRF: state-changing browser requests must come from our origin.
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if p := Principal(r.Context()); p != nil && !p.APIKeyID.Valid {
-				if sf := r.Header.Get("Sec-Fetch-Site"); sf != "" && sf != "same-origin" && sf != "none" {
-					writeErr(w, 403, "cross-site request blocked")
+// requireAuth admits a signed-in browser session to the web /api routes.
+// An API key is refused (403): a key reaches only what its scopes name,
+// /v1 with chat and /mcp with mcp, so a key that leaks from a Claude Code
+// environment cannot read projects, call the owner-only routes or mint
+// more keys. The one /api group a key may use is mounted with
+// requireAuthScope.
+func requireAuth(next http.Handler) http.Handler { return requireAuthScope("")(next) }
+
+// requireAuthScope is requireAuth for a route group that also takes an
+// API key carrying the scope. A session passes as it does everywhere;
+// an empty scope admits no key at all.
+func requireAuthScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p := Principal(r.Context())
+			if p == nil {
+				writeErr(w, 401, "unauthorized")
+				return
+			}
+			if p.APIKeyID.Valid {
+				switch {
+				case scope == "":
+					writeErr(w, 403, "API keys are not accepted here: they reach /v1 (chat scope) and /mcp (mcp scope); sign in for the rest")
+					return
+				case !p.HasScope(scope):
+					writeErr(w, 403, "this API key has no "+scope+" scope; mint one with it in Settings")
 					return
 				}
 			}
-		}
-		next.ServeHTTP(w, r)
-	})
+			if crossSite(r, p) {
+				writeErr(w, 403, "cross-site request blocked")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// crossSite is the CSRF check: a state-changing request on a browser
+// session must come from our origin. A key is never a browser.
+func crossSite(r *http.Request, p *auth.Principal) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead || p == nil || p.APIKeyID.Valid {
+		return false
+	}
+	sf := r.Header.Get("Sec-Fetch-Site")
+	return sf != "" && sf != "same-origin" && sf != "none"
 }
 
 func requireOwner(next http.Handler) http.Handler {

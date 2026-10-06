@@ -20,6 +20,12 @@ func TestRegistryDefsAndPolicies(t *testing.T) {
 	if d := r.Defs([]string{"web_fetch"}); len(d) != 1 || d[0].Name != "web_fetch" {
 		t.Errorf("allowlist not applied: %v", names(d))
 	}
+	if d := r.Defs([]string{NoTools}); len(d) != 0 {
+		t.Errorf("none should give no tools: %v", names(d))
+	}
+	if d := r.Defs([]string{"web_fetch", NoTools}); len(d) != 0 {
+		t.Errorf("none wins over listed tools: %v", names(d))
+	}
 	pol := r.Policies(map[string]Policy{"web_fetch": PolicyAsk})
 	if pol["web_fetch"] != PolicyAsk || pol["read_blob"] != PolicyAuto {
 		t.Errorf("policies = %v", pol)

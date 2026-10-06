@@ -41,6 +41,7 @@ import (
 	"github.com/jking323/ws/internal/secrets"
 	"github.com/jking323/ws/internal/store"
 	"github.com/jking323/ws/internal/store/blob"
+	"github.com/jking323/ws/internal/training"
 	"github.com/jking323/ws/web"
 )
 
@@ -192,6 +193,7 @@ type stack struct {
 	media     *media.Service
 	agents    *agents.Service
 	rental    *rental.Controller
+	training  *training.Service
 }
 
 // buildStack wires blobs, artifacts, tools, the agent runtime, compaction
@@ -302,14 +304,19 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	}
 
 	// Media gateway (PLAN M6): image and video jobs on media endpoints.
-	// generate_image exists only when an image endpoint is configured on
-	// this box (a restart picks up a newly added one); the gallery routes
-	// work either way.
-	med := &media.Service{DB: db, Blobs: blobs, GW: gw, Engines: media.DefaultEngines(), Log: log}
+	// generate_image and generate_video exist only when an endpoint of
+	// that kind is configured on this box (a restart picks up a newly
+	// added one); the gallery routes work either way.
+	med := &media.Service{DB: db, Blobs: blobs, GW: gw, Engines: media.DefaultEngines(cfg.ComfyWorkflows), Log: log}
 	if n := len(med.Endpoints(media.KindImage)); n > 0 {
 		tools.Add(media.NewTool(med, db))
 		chat.AllowTools(media.ToolName)
 		log.Info("media: image endpoints", "count", n)
+	}
+	if n := len(med.Endpoints(media.KindVideo)); n > 0 {
+		tools.Add(media.NewVideoTool(med, db))
+		chat.AllowTools(media.ToolNameVideo)
+		log.Info("media: video endpoints", "count", n)
 	}
 
 	rt := agent.New(db, gw, tools, blobs, log)
@@ -324,11 +331,29 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	// the worker's minute tick fires due cron triggers.
 	mem := &agents.Memory{DB: db, GW: gw, Log: log}
 	ags := &agents.Service{DB: db, Runtime: rt, Memory: mem, Log: log}
+	// remember and recall exist for agent runs only (a chat turn gets an
+	// error result); chat conversations are not offered them.
+	tools.Add(agents.NewRememberTool(mem))
+	tools.Add(agents.NewRecallTool(mem))
+	// Agent presets: starting points for the new-agent form, from disk.
+	if presets, warn, err := agents.LoadPresets(cfg.PresetsDir, func(name string) bool { _, ok := tools.Get(name); return ok }); err != nil {
+		log.Warn("agent presets", "dir", cfg.PresetsDir, "err", err)
+	} else {
+		ags.Presets = presets
+		for _, w := range warn {
+			log.Warn("agent presets: " + w)
+		}
+	}
 	// Rented GPUs (PLAN M9): templates from disk, RunPod when its key is
 	// set. The controller exists in both roles (Admin starts and stops in
 	// serve); the worker's minute tick reconciles.
 	rent := buildRental(ctx, cfg, db, gw, log)
-	deps := &jobs.Deps{DB: db, Runtime: rt, Compactor: comp, Log: log, Media: med, Agents: ags, Memory: mem, Rental: rent}
+	// Training flywheel (PLAN M10): datasets and adapters live in both
+	// roles; the worker runs the builds, the trainer container and the
+	// eval gate. The runner exists only where WS_FINETUNE_IMAGE is set
+	// and Docker answers.
+	trn := buildTraining(ctx, cfg, db, gw, blobs, rent, log, workers)
+	deps := &jobs.Deps{DB: db, Runtime: rt, Compactor: comp, Log: log, Media: med, Agents: ags, Memory: mem, Rental: rent, Training: trn}
 	if sbm != nil {
 		deps.Sandbox = sbm
 	}
@@ -344,6 +369,7 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	spawn.Enqueue = jc.EnqueueRun
 	med.Enqueue = jc.EnqueueMedia
 	ags.Enqueue = jc.EnqueueRun
+	trn.EnqueueBuild, trn.EnqueueFinetune, trn.EnqueueEval = jc.EnqueueTrainingBuild, jc.EnqueueFinetune, jc.EnqueueEval
 	// ws as an MCP server (PLAN M5): the same gateway, runtime, worker
 	// queue and task router, scoped to the API key's user per request.
 	var mcpSrv *mcpserver.Server
@@ -368,7 +394,75 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 			return models, aliases
 		}
 	}
-	return &stack{gw: gw, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, rental: rent}, nil
+	return &stack{gw: gw, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, rental: rent, training: trn}, nil
+}
+
+// buildTraining wires the training service. The targets a job can name
+// are declared from the config in both roles (serve accepts the job,
+// the worker runs it): local when a trainer image is configured, rental
+// when WS_FINETUNE_TEMPLATE names a trainer-kind rental template whose
+// provider is configured. The runners themselves exist on the worker
+// only; a declared target the worker cannot build fails the job with
+// the reason on its row.
+func buildTraining(ctx context.Context, cfg *config.Config, db *store.DB, gw *gateway.Gateway, blobs blob.Store, rent *rental.Controller, log *slog.Logger, worker bool) *training.Service {
+	t := &training.Service{
+		DB: db, Blobs: blobs, GW: gw, Log: log, JudgeSelector: cfg.TrainingJudge,
+		Endpoint: func(id string) (*gateway.Endpoint, bool) { return gw.Registry.Endpoint(id) },
+		Reload:   func(ctx context.Context) error { return db.LoadRegistry(ctx, gw.Registry) },
+	}
+	tpl, rentable := finetuneTemplate(cfg, rent, log)
+	targets := &training.Targets{RentalLabel: tpl.Name}
+	if cfg.FinetuneImage != "" {
+		t.Available = append(t.Available, training.Target{ID: training.TargetLocal, Label: "this worker's GPU"})
+	}
+	if rentable {
+		t.Available = append(t.Available, training.Target{ID: training.TargetRental, Label: "rented GPU (" + tpl.Name + ")"})
+	}
+	if !worker {
+		return t
+	}
+	if cfg.FinetuneImage != "" {
+		var env []string
+		if tok := os.Getenv("HF_TOKEN"); tok != "" {
+			env = append(env, "HF_TOKEN="+tok)
+		}
+		r, err := training.NewDockerRunner(ctx, cfg.FinetuneImage, cfg.FinetuneGPUs, cfg.TrainingDir, env)
+		if err != nil {
+			log.Warn("training: no local fine-tune runner; jobs targeting it will fail", "err", err)
+		} else {
+			targets.Local = r
+			log.Info("training: local fine-tune runner", "image", cfg.FinetuneImage, "gpus", cfg.FinetuneGPUs)
+		}
+	}
+	if rentable {
+		targets.Rental = &training.RentalRunner{Rental: rent, Template: tpl.Name, Key: func() string { return os.Getenv("WS_RENTAL_API_KEY") }, Log: log}
+		log.Info("training: rented fine-tune runner", "template", tpl.Name, "provider", tpl.Provider, "gpu", tpl.GPU)
+	}
+	if targets.Local != nil || targets.Rental != nil {
+		t.Runner = targets
+	}
+	return t
+}
+
+// finetuneTemplate resolves WS_FINETUNE_TEMPLATE to a usable trainer
+// template: it must exist, be kind trainer, and its provider must be
+// configured. Problems are logged once, in every role.
+func finetuneTemplate(cfg *config.Config, rent *rental.Controller, log *slog.Logger) (rental.Template, bool) {
+	if cfg.FinetuneTemplate == "" || rent == nil {
+		return rental.Template{}, false
+	}
+	tpl, ok := rent.Template(cfg.FinetuneTemplate)
+	switch {
+	case !ok:
+		log.Warn("training: WS_FINETUNE_TEMPLATE names no template", "template", cfg.FinetuneTemplate)
+	case !tpl.IsTrainer():
+		log.Warn("training: WS_FINETUNE_TEMPLATE is not a trainer template (kind: trainer)", "template", cfg.FinetuneTemplate)
+	case rent.Providers[tpl.Provider] == nil:
+		log.Warn("training: the fine-tune template's provider is not configured", "template", cfg.FinetuneTemplate, "provider", tpl.Provider)
+	default:
+		return tpl, true
+	}
+	return rental.Template{}, false
 }
 
 // buildRental wires the rental controller: templates, providers whose
@@ -528,6 +622,7 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		Blobs:     st.blobs,
 		Agents:    st.agents,
 		Rental:    st.rental,
+		Training:  st.training,
 		Log:       log,
 		Web:       web.Dist(),
 	}

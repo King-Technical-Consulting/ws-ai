@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type ModelsResponse } from '../api'
 import { registerPasskey } from '../lib/passkey'
 import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm } from '../components/ui'
+import { useMe } from '../App'
 
 type Passkey = { id: string; name: string; created_at: string; last_used_at: string | null }
 type Key = { id: string; name: string; prefix: string; scopes: string[]; default_policy: string; created_at: string; last_used_at: string | null }
@@ -47,10 +48,11 @@ export default function Settings() {
   const passkeys = useQuery({ queryKey: ['passkeys'], queryFn: () => api.get<Passkey[]>('/api/auth/passkeys') })
   const keys = useQuery({ queryKey: ['keys'], queryFn: () => api.get<Key[]>('/api/keys') })
   const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelsResponse>('/api/models') })
-  const [newKey, setNewKey] = useState<{ key: string; policy: string; mcp: boolean } | null>(null)
+  const [newKey, setNewKey] = useState<{ key: string; policy: string; mcp: boolean; jobs: boolean } | null>(null)
   const [keyName, setKeyName] = useState('')
   const [policy, setPolicy] = useState('auto')
   const [mcp, setMCP] = useState(false)
+  const [jobs, setJobs] = useState(false)
   const [copied, setCopied] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
@@ -67,9 +69,14 @@ export default function Settings() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['passkeys'] }),
   })
   const createKey = useMutation({
-    mutationFn: () => api.post<{ key: string }>('/api/keys', { name: keyName || 'default', default_policy: policy, scopes: mcp ? ['chat', 'mcp'] : ['chat'] }),
+    mutationFn: () =>
+      api.post<{ key: string }>('/api/keys', {
+        name: keyName || 'default',
+        default_policy: policy,
+        scopes: ['chat', ...(mcp ? ['mcp'] : []), ...(jobs ? ['jobs'] : [])],
+      }),
     onSuccess: (r) => {
-      setNewKey({ key: r.key, policy, mcp })
+      setNewKey({ key: r.key, policy, mcp, jobs })
       setCopied(false)
       setKeyName('')
       qc.invalidateQueries({ queryKey: ['keys'] })
@@ -79,6 +86,12 @@ export default function Settings() {
   const revokeKey = useMutation({
     mutationFn: (id: string) => api.del(`/api/keys/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['keys'] }),
+  })
+  const me = useMe()
+  const consent = useMutation({
+    mutationFn: (enabled: boolean) => api.put('/api/me/training-consent', { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+    onError: (e) => setErr(e.message),
   })
 
   const copyEnv = async () => {
@@ -110,6 +123,16 @@ export default function Settings() {
         </section>
 
         <section className="space-y-3">
+          <SectionHead>training</SectionHead>
+          <p className="text-sm text-fg-2">
+            The owner can build fine-tuning datasets from conversations and the thumbs people give answers. Yours are only ever included when this is on; turning it off keeps new datasets from reading them.
+          </p>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" className="accent-accent" checked={!!me.data?.training_consent} disabled={consent.isPending} onChange={(e) => consent.mutate(e.target.checked)} /> Allow my conversations in training datasets
+          </label>
+        </section>
+
+        <section className="space-y-3">
           <SectionHead>api keys</SectionHead>
           <p className="text-sm text-fg-2">
             Use the platform from Claude Code, Cursor, or any OpenAI or Anthropic compatible client. A key's policy decides where a request goes
@@ -135,6 +158,11 @@ export default function Settings() {
                   </pre>
                 </>
               )}
+              {newKey.jobs && (
+                <p className="mt-3 text-fg-2">
+                  For <code className="font-mono text-xs">wsj</code>, put the key on one line in the file its <code className="font-mono text-xs">[ws] key_file</code> names, or export it as <code className="font-mono text-xs">WSJ_WS_KEY</code>.
+                </p>
+              )}
             </Callout>
           )}
           <ListGroup empty="No API keys.">
@@ -156,8 +184,12 @@ export default function Settings() {
             <button onClick={() => createKey.mutate()} className={btn.secondarySm}>Create key</button>
           </div>
           <label className="flex items-center gap-2 text-xs text-fg-2">
-            <input type="checkbox" className="accent-accent" checked={mcp} onChange={(e) => setMCP(e.target.checked)} /> MCP access: the key may also drive ws as an MCP server (/mcp). Keys without it reach /v1 only.
+            <input type="checkbox" className="accent-accent" checked={mcp} onChange={(e) => setMCP(e.target.checked)} /> MCP access: the key may also drive ws as an MCP server (/mcp).
           </label>
+          <label className="flex items-center gap-2 text-xs text-fg-2">
+            <input type="checkbox" className="accent-accent" checked={jobs} onChange={(e) => setJobs(e.target.checked)} /> Job reporting: <code className="font-mono">wsj</code> may report Claude Code sessions with it (owner only).
+          </label>
+          <p className="text-xs text-fg-3">A key reaches only what its boxes say: /v1 always, and never the rest of this app, which takes your sign-in.</p>
           {err && <Callout kind="error">{err}</Callout>}
         </section>
       </div>

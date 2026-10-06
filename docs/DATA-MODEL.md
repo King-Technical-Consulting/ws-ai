@@ -1,6 +1,6 @@
 # Data model
 
-The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`), applied by goose at boot; this page was written from those files and last verified at commit `5e9f902` (migrations `0005` to `0008` are the only ones added since `bf89aee`). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
+The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`, `0013_run_pause`, `0014_training`), applied by goose at boot; this page was written from those files and last verified at commit `9d28c2f` (migrations `0005` to `0008` are the only ones added since `bf89aee`). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
 
 Conventions: UUID primary keys from `gen_random_uuid()` (except `usage_ledger` and `sandbox_events`, which use `bigserial`, `providers` and `endpoints`, which use `text` slug ids, and join tables, which use composite keys), `timestamptz` timestamps, `jsonb` for flexible payloads, and `ON DELETE CASCADE` from owning rows. Tables with `updated_at` get a `set_updated_at` trigger, except `sandboxes`, whose queries set `updated_at` explicitly. Extensions: `pgcrypto`, `citext`, and `vector` (pgvector, enabled by `0011`; the pool registers its types at connect). River adds its own tables through its own migration (`jobs.Migrate`), not listed here.
 
@@ -27,13 +27,13 @@ providers ── endpoints          routing_policies   budgets   usage_ledger
 
 | Table | Purpose and notable columns |
 |---|---|
-| `users` | `email` (citext, unique), `display_name`, `role` (`owner` or `member`), `disabled_at` |
+| `users` | `email` (citext, unique), `display_name`, `role` (`owner` or `member`), `disabled_at`, `training_consent` (since `0014`: only consenting users' conversations are exported into datasets) |
 | `invites` | Single-use invitations. `token_hash` (the raw token is never stored), `role`, `invited_by`, `expires_at`, `used_at`, `used_by` |
 | `passkeys` | WebAuthn credentials: `credential_id`, `public_key`, `sign_count`, `transports`, `aaguid`, backup flags, `name`, `last_used_at` |
 | `magic_links` | Email sign-in tokens: `token_hash`, `expires_at`, `used_at` |
 | `sessions` | Browser sessions: `token_hash`, `expires_at`, `user_agent`, `ip`, `revoked_at` |
 | `webauthn_sessions` | Short-lived server state between the begin and finish steps of a passkey ceremony: `kind` (`register` or `login`), `data`, `expires_at` |
-| `api_keys` | Keys for `/v1` and `/api`: `prefix` (first 8 characters, for display), `key_hash`, `scopes` (default `{chat}`), `default_policy` (default `auto`), optional `budget_id`, `last_used_at`, `revoked_at` |
+| `api_keys` | Keys for `/v1`, `/mcp` and the `wsj` job reports: `prefix` (first 8 characters, for display), `key_hash`, `scopes` (any of `chat`, `mcp`, `jobs`; default `{chat}`), `default_policy` (default `auto`), optional `budget_id`, `last_used_at`, `revoked_at` |
 
 Tokens and keys are stored only as hashes.
 
@@ -81,11 +81,11 @@ Every chat turn is a run, so these tables are in use, and since PLAN M7 first cu
 
 | Table | Purpose and notable columns |
 |---|---|
-| `agent_runs` | `conversation_id`, `agent_id` (null for plain chat turns), `user_id`, `trigger_id`, `status` (`queued`, `running`, `paused_approval`, `paused_steer`, `done`, `failed`, `cancelled`), `request` (the request skeleton without messages), `tool_policies` (resolved for the run), `max_steps`, `step_count`, `first_message_id` (the assistant message the UI streams into), `cost_usd`, `error`, `heartbeat_at` and `owner_pid` (used by the reaper), `started_at`, `ended_at` |
+| `agent_runs` | `conversation_id`, `agent_id` (null for plain chat turns), `user_id`, `trigger_id`, `status` (`queued`, `running`, `paused_approval`, `paused_steer`, `paused_manual` since `0013`: held from the monitor, `done`, `failed`, `cancelled`), `request` (the request skeleton without messages), `tool_policies` (resolved for the run), `max_steps`, `step_count`, `first_message_id` (the assistant message the UI streams into), `cost_usd`, `error`, `heartbeat_at` and `owner_pid` (used by the reaper), `started_at`, `ended_at` |
 | `agent_steps` | `(run_id, seq)` unique; `kind` (`llm`, `tool`, `approval`, `compaction`), `input`, `output`, `checkpoint`, `usage`, `error`, timestamps |
 | `approvals` | A pending tool call: `run_id`, `step_seq`, `tool_call_id`, `tool_name`, `args`, `status` (`pending`, `approved`, `denied`, `expired`), `decided_by`, `decided_at`, `note` |
 | `agents` | Definitions for long-lived agents: `goal`, `system_prompt`, `model_policy`, `tool_allowlist`, `tool_policies`, `mcp_servers`, `memory_config` (`{disabled, k, top_n}`), `max_steps`, `enabled`, and from `0010` a nullable `project_id` (cascades; the project an agent's runs live in, index `agents_project_idx`) and `last_run_at`. Used by `internal/agents` and `/api/agents`; the Agents page does not edit `mcp_servers` or `memory_config` |
-| `agent_triggers` | `kind` (`cron`, `webhook`, `repo_push`, `manual`; only `cron`, `webhook` and `manual` can be created, `repo_push` is rejected), `spec`, `secret_hash` (sha256 of a webhook's secret, shown once at creation), `enabled`, and from `0010` `name`, `next_run_at`, `last_run_at` and `last_error`. Partial index `agent_triggers_due_idx(next_run_at)` where `enabled and kind = 'cron'` |
+| `agent_triggers` | `kind` (`cron`, `webhook`, `repo_push`, `manual`; `cron`, `webhook`, `manual` and `repo_push` (a GitHub webhook) can be created), `spec`, `secret_hash` (sha256 of a webhook's secret, shown once at creation), `enabled`, and from `0010` `name`, `next_run_at`, `last_run_at` and `last_error`. Partial index `agent_triggers_due_idx(next_run_at)` where `enabled and kind = 'cron'` |
 
 ## Sandboxes
 
@@ -112,13 +112,22 @@ Every chat turn is a run, so these tables are in use, and since PLAN M7 first cu
 
 | Table | Purpose and notable columns |
 |---|---|
-| `media_jobs` | One row per image (later video) generation (`0009`), written by `internal/media` and driven by the River job `media.generate`. `user_id` and `project_id` cascade on delete; `conversation_id` sets NULL. `kind` (`image`, `video`, `edit`, `upscale`; only `image` is generated today), `selector` (the picker's choice: endpoint id, alias or `auto`), `endpoint_id` (set when the job runs), `inputs` (jsonb: `prompt`, `size`, `n`, `quality`, `seconds`, `aspect`, `source_attachment_id`, `estimate_usd`), `provider_job_id`, `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `progress`, `output_attachment_ids` (uuid array into `attachments`), `cost_usd`, `error`, `created_at`, `started_at`, `ended_at`, `updated_at` (trigger). Indexes on `(project_id, created_at desc)`, `(user_id, created_at desc)` and a partial one on open jobs. Each finished job also writes a `usage_ledger` row under task class `image` or `video` |
+| `media_jobs` | One row per media generation (`0009`), written by `internal/media` and driven by the River job `media.generate`. `user_id` and `project_id` cascade on delete; `conversation_id` sets NULL. `kind` (`image`, `video`, `edit`, `upscale`; all four run), `selector` (the picker's choice: endpoint id, alias or `auto`), `endpoint_id` (set when the job runs), `inputs` (jsonb: `prompt`, `size`, `n`, `quality`, `seconds`, `aspect`, `source_attachment_id`, `mask_attachment_id`, `scale`, `estimate_usd`), `provider_job_id`, `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `progress`, `output_attachment_ids` (uuid array into `attachments`), `cost_usd`, `error`, `created_at`, `started_at`, `ended_at`, `updated_at` (trigger). Indexes on `(project_id, created_at desc)`, `(user_id, created_at desc)` and a partial one on open jobs. Each finished job also writes a `usage_ledger` row under task class `image` or `video` |
 
 ## Rented GPUs
 
 | Table | Purpose and notable columns |
 |---|---|
 | `rental_instances` | One row per rented machine (`0012`). `provider` (`runpod`; the column comment also lists `lambda` and `vast`), `template`, `gpu`, `provider_instance_id`, `endpoint_id` (the endpoint registered while it runs), `base_url`, `hourly_usd`, `status` (`provisioning`, `warming`, `ready`, `stopping`, `stopped`, `failed`), `started_by` (set null on delete), `started_at`, `ready_at`, `last_request_at`, `stopped_at`, `hours_used`, `billed_hours` (hours already written to the ledger), `stop_reason`, `error`. Indexes on `started_at` and a partial one on open machines. Each billed hour is a `usage_ledger` row with task class `rental` |
+
+### Training flywheel (`0014`, PLAN M10)
+
+| Table | Columns |
+|---|---|
+| `message_ratings` | `message_id`, `user_id` (primary key together: one rating per user per message), `score` (`1` or `-1`), `note`, `created_at`. Cascades with the message and the user |
+| `datasets` | One export. `owner_id`, `name`, `task_class`, `filters` (`{modes, models, min_rating, since, holdout_pct, max_examples, max_conversations, max_prefix}`), `status` (`queued`, `building`, `ready`, `failed`), `blob_key` and `eval_blob_key` (the train and held-out JSONL in the blob store), `bytes`, `examples`, `eval_examples`, `error`, `created_at`, `built_at` |
+| `finetune_jobs` | One trainer run. `owner_id`, `dataset_id` (set null on delete), `base_model` (what the trainer loads), `base_endpoint_id` (the ws endpoint the adapter is registered next to), `adapter_name`, `config` (`{epochs, learning_rate, rank, alpha, max_seq_len, image, target}`), `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `progress`, `log` (the trainer's output tail), `adapter_id`, `error`, `created_at`, `started_at`, `ended_at` |
+| `adapters` | A LoRA adapter. `name` (unique; the model name its endpoint sends), `base_model`, `base_endpoint_id`, `finetune_job_id` (set null on delete), `blob_key` and `bytes` (a gzipped tar of the trainer's output), `eval_score` and `baseline_score` (0 to 1, from the eval gate), `eval` (the gate's detail), `promoted`, `endpoint_id` (the `lora/<name>` endpoints row, `enabled` by promotion), `created_at`, `evaluated_at` |
 
 ## Indexes worth knowing
 
@@ -134,7 +143,6 @@ From PLAN.md, not in any migration yet (the billing-router tables `subscription_
 | Planned | Milestone |
 |---|---|
 | `rental_templates` (templates are YAML files, not a table) | M9 |
-| `datasets`, `finetune_jobs`, `adapters` | M10 |
 
 Differences between the plan and the current schema, so nobody writes queries from PLAN.md by mistake:
 

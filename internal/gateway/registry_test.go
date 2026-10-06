@@ -73,7 +73,7 @@ func TestShippedEndpointsSeed(t *testing.T) {
 		if m := e.Capabilities.Media; m != nil {
 			// Media endpoints: an engine, something they can make, and a
 			// per-output price when hosted.
-			if m.Engine == "" || !(m.Image || m.ImageEdit || m.Video || m.ImageToVideo) {
+			if m.Engine == "" || !(m.Image || m.ImageEdit || m.Video || m.ImageToVideo || m.Upscale) {
 				t.Errorf("%s: media endpoint needs an engine and a kind: %+v", e.ID, m)
 			}
 			if !local[e.Provider] && e.Pricing.PerImage == 0 && e.Pricing.PerSecond == 0 {

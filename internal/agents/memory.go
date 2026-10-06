@@ -131,6 +131,90 @@ func (m *Memory) Recall(ctx context.Context, ag store.Agent, input string) ([]Re
 	return out, nil
 }
 
+// Search returns the k memories nearest to a query (importance only when
+// embedding fails), without the importance tail Recall adds, and marks
+// them used. It backs the recall tool.
+func (m *Memory) Search(ctx context.Context, ag store.Agent, query string, k int) ([]Recalled, error) {
+	if k <= 0 {
+		k = 8
+	}
+	if k > 50 {
+		k = 50
+	}
+	var out []Recalled
+	query = strings.TrimSpace(query)
+	if query != "" {
+		vec, err := m.embed(ctx, ag, []string{query})
+		if err != nil {
+			m.log().Warn("memory: search embed failed, importance only", "agent", ag.ID, "err", err)
+		} else if len(vec) == 1 && vec[0] != nil {
+			rows, err := m.DB.SearchMemories(ctx, store.SearchMemoriesParams{AgentID: ag.ID, Column2: *vec[0], Limit: int32(k)})
+			if err != nil {
+				return nil, err
+			}
+			for _, r := range rows {
+				out = append(out, Recalled{ID: r.ID, Kind: r.Kind, Content: r.Content, Importance: r.Importance, Distance: r.Distance})
+			}
+		}
+	}
+	if len(out) == 0 {
+		top, err := m.DB.TopMemoriesByImportance(ctx, store.TopMemoriesByImportanceParams{AgentID: ag.ID, Limit: int32(k)})
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range top {
+			out = append(out, Recalled{ID: r.ID, Kind: r.Kind, Content: r.Content, Importance: r.Importance, Distance: 2})
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	ids := make([]uuid.UUID, 0, len(out))
+	for _, r := range out {
+		ids = append(ids, r.ID)
+	}
+	if err := m.DB.TouchMemories(ctx, ids); err != nil {
+		m.log().Warn("memory: touch", "err", err)
+	}
+	return out, nil
+}
+
+// Remember stores one memory the agent wrote itself, embedded when the
+// embedding model answers. It backs the remember tool.
+func (m *Memory) Remember(ctx context.Context, ag store.Agent, kind, content string, importance float32, runID uuid.NullUUID) (*store.AgentMemory, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, fmt.Errorf("%w: content is required", ErrInvalid)
+	}
+	if len(content) > MaxMemoryContent {
+		content = content[:MaxMemoryContent]
+	}
+	switch kind {
+	case "":
+		kind = MemoryFact
+	case MemoryFact, MemoryPreference, MemoryEpisode:
+	default:
+		return nil, fmt.Errorf("%w: kind is fact, preference or episode", ErrInvalid)
+	}
+	if importance <= 0 || importance > 1 {
+		importance = 0.7
+	}
+	vecs, err := m.embed(ctx, ag, []string{content})
+	if err != nil {
+		m.log().Warn("memory: embed failed, storing without a vector", "agent", ag.ID, "err", err)
+		vecs = make([]*pgvector.Vector, 1)
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(content)))
+	row, err := m.DB.UpsertMemory(ctx, store.UpsertMemoryParams{
+		AgentID: ag.ID, Kind: kind, Content: content, ContentHash: sum[:], Embedding: vecs[0],
+		SourceRunID: runID, Importance: importance,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
 // RenderRecall is the block appended to the system prompt.
 func RenderRecall(mem []Recalled) string {
 	if len(mem) == 0 {

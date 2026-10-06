@@ -1,10 +1,12 @@
 package httpx
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -55,20 +57,23 @@ func (s *Server) mediaView(r *http.Request, job store.MediaJob) mediaJobView {
 
 // mediaModel is a media endpoint for the gallery's picker.
 type mediaModel struct {
-	ID          string   `json:"id"`
-	DisplayName string   `json:"display_name"`
-	Provider    string   `json:"provider"`
-	Local       bool     `json:"local"`
-	Engine      string   `json:"engine"`
-	Image       bool     `json:"image"`
-	ImageEdit   bool     `json:"image_edit"`
-	Video       bool     `json:"video"`
-	Sizes       []string `json:"sizes"`
-	MaxImages   int      `json:"max_images"`
-	MaxSeconds  int      `json:"max_seconds"`
-	PerImage    float64  `json:"per_image"`
-	PerSecond   float64  `json:"per_second"`
-	Health      string   `json:"health"`
+	ID           string   `json:"id"`
+	DisplayName  string   `json:"display_name"`
+	Provider     string   `json:"provider"`
+	Local        bool     `json:"local"`
+	Engine       string   `json:"engine"`
+	Image        bool     `json:"image"`
+	ImageEdit    bool     `json:"image_edit"`
+	Video        bool     `json:"video"`
+	ImageToVideo bool     `json:"image_to_video"`
+	Upscale      bool     `json:"upscale"`
+	Sizes        []string `json:"sizes"`
+	MaxImages    int      `json:"max_images"`
+	MaxSeconds   int      `json:"max_seconds"`
+	Seconds      []int    `json:"seconds"`
+	PerImage     float64  `json:"per_image"`
+	PerSecond    float64  `json:"per_second"`
+	Health       string   `json:"health"`
 }
 
 // mediaModels lists enabled media endpoints (part of GET /api/models).
@@ -80,10 +85,13 @@ func (s *Server) mediaModels() []mediaModel {
 			continue
 		}
 		mm := mediaModel{ID: e.ID, DisplayName: e.DisplayName, Provider: e.ProviderID, Local: e.Local, Engine: m.Engine,
-			Image: m.Image, ImageEdit: m.ImageEdit, Video: m.Video, Sizes: m.Sizes, MaxImages: m.MaxImages, MaxSeconds: m.MaxSeconds,
+			Image: m.Image, ImageEdit: m.ImageEdit, Video: m.Video, ImageToVideo: m.ImageToVideo, Upscale: m.Upscale, Sizes: m.Sizes, MaxImages: m.MaxImages, MaxSeconds: m.MaxSeconds, Seconds: m.Seconds,
 			Health: e.Health.Status}
 		if mm.Sizes == nil {
 			mm.Sizes = []string{}
+		}
+		if mm.Seconds == nil {
+			mm.Seconds = []int{}
 		}
 		if mm.MaxImages <= 0 {
 			mm.MaxImages = 1
@@ -147,6 +155,13 @@ func (s *Server) handleCreateMedia(w http.ResponseWriter, r *http.Request) {
 		Seconds        int    `json:"seconds"`
 		Model          string `json:"model"`
 		ConversationID string `json:"conversation_id"`
+		// SourceAttachmentID makes an image request an edit and a video
+		// request image to video; an upscale needs one.
+		SourceAttachmentID string `json:"source_attachment_id"`
+		// MaskAttachmentID, on an edit, limits the change to the mask.
+		MaskAttachmentID string `json:"mask_attachment_id"`
+		// Scale is the upscale factor, 2 (default) or 4.
+		Scale int `json:"scale"`
 	}
 	if err := decode(r, &in); err != nil {
 		writeErr(w, 400, "bad json")
@@ -168,7 +183,7 @@ func (s *Server) handleCreateMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := s.Media.Create(r.Context(), media.CreateParams{
 		UserID: p.UserID, ProjectID: id, ConversationID: conv, Kind: in.Kind, Selector: in.Model,
-		Inputs: media.Inputs{Prompt: in.Prompt, Size: in.Size, N: in.N, Quality: in.Quality, Seconds: in.Seconds},
+		Inputs: media.Inputs{Prompt: in.Prompt, Size: in.Size, N: in.N, Quality: in.Quality, Seconds: in.Seconds, SourceAttachmentID: in.SourceAttachmentID, MaskAttachmentID: in.MaskAttachmentID, Scale: in.Scale},
 	})
 	if err != nil {
 		switch {
@@ -183,6 +198,71 @@ func (s *Server) handleCreateMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, s.mediaView(r, *job))
+}
+
+// handleUploadAttachment stores an image the caller sends as multipart
+// field "file" (at most 32 MB) as an attachment they own, so it can be
+// the source of an edit or an image-to-video job. The project in the path
+// only checks membership; attachments belong to users.
+func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) {
+	p := Principal(r.Context())
+	id, err := uuidParam(r, "id")
+	if err != nil || !s.canAccessProject(r.Context(), id) {
+		writeErr(w, 404, "not found")
+		return
+	}
+	if s.Blobs == nil {
+		writeErr(w, 503, "attachments are not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxSourceBytes+1<<20)
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		writeErr(w, 400, "bad multipart body (at most 32 MB)")
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 400, "multipart field file is required")
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, media.MaxSourceBytes+1))
+	if err != nil {
+		writeErr(w, 400, "read")
+		return
+	}
+	if len(data) > media.MaxSourceBytes {
+		writeErr(w, 413, "file over 32 MB")
+		return
+	}
+	out := media.Decode(data)
+	if !strings.HasPrefix(out.MIME, "image/") {
+		writeErr(w, 400, "only images can be uploaded here")
+		return
+	}
+	key, err := blob.PutBytes(r.Context(), s.Blobs, data)
+	if err != nil {
+		writeErr(w, 500, "blob")
+		return
+	}
+	sum := sha256.Sum256(data)
+	var width, height *int32
+	if out.Width > 0 && out.Height > 0 {
+		ww, hh := int32(out.Width), int32(out.Height)
+		width, height = &ww, &hh
+	}
+	name := filepath.Base(hdr.Filename)
+	if name == "." || name == "/" || name == "" {
+		name = "upload" + filepath.Ext(hdr.Filename)
+	}
+	att, err := s.DB.CreateAttachment(r.Context(), store.CreateAttachmentParams{
+		UserID: p.UserID, BlobKey: key, Mime: out.MIME, Bytes: int64(len(data)), Sha256: sum[:], Filename: name, Width: width, Height: height,
+	})
+	if err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 201, attachmentView{ID: att.ID, URL: attachmentURL(att.ID), Mime: att.Mime, Bytes: att.Bytes, Filename: att.Filename, Width: att.Width, Height: att.Height})
 }
 
 // loadMediaJob checks the caller may see the job through its project.

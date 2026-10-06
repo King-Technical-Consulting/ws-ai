@@ -26,6 +26,7 @@ x-ws-env: &ws-env
   WS_ARTIFACT_LISTEN: ":8081"
   WS_ENDPOINTS_FILE: /app/config/endpoints.yaml
   WS_POLICIES_DIR: /app/config/policies
+  WS_PRESETS_DIR: /app/config/presets
 
 services:
   postgres:

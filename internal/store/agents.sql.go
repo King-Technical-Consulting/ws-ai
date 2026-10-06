@@ -76,7 +76,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (AgentRun, e
 }
 
 const countOpenRunsForAgent = `-- name: CountOpenRunsForAgent :one
-SELECT count(*) FROM agent_runs WHERE agent_id = $1 AND status IN ('queued','running','paused_approval','paused_steer')
+SELECT count(*) FROM agent_runs WHERE agent_id = $1 AND status IN ('queued','running','paused_approval','paused_steer','paused_manual')
 `
 
 func (q *Queries) CountOpenRunsForAgent(ctx context.Context, agentID uuid.NullUUID) (int64, error) {

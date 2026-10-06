@@ -166,12 +166,20 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 			// heartbeat; the reaper will hand it to the worker.
 			return ctx.Err()
 		}
-		// Cancelled from the monitor between steps: stop here, keeping the
-		// cancelled status (and not marking the run done).
-		if cur, err := rt.DB.GetRun(ctx, run.ID); err == nil && cur.Status == "cancelled" {
-			sink.Data("notice", map[string]string{"text": "cancelled"}, false)
-			sink.Finish("stop")
-			return nil
+		// Cancelled or paused from the monitor between steps: stop here,
+		// keeping that status (and not marking the run done). A paused run
+		// is re-queued by the monitor's resume.
+		if cur, err := rt.DB.GetRun(ctx, run.ID); err == nil {
+			switch cur.Status {
+			case "cancelled":
+				sink.Data("notice", map[string]string{"text": "cancelled"}, false)
+				sink.Finish("stop")
+				return nil
+			case "paused_manual":
+				sink.Data("notice", map[string]string{"text": "paused"}, false)
+				sink.Finish("stop")
+				return ErrPaused
+			}
 		}
 		history, err := rt.history(ctx, run.ConversationID)
 		if err != nil {

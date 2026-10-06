@@ -37,7 +37,7 @@ Without `RESEND_API_KEY`, invite and magic-link emails are printed to the `serve
 1. Open a conversation and pick a model, or leave it on `auto`, which routes by policy.
 2. Create a **code project**. The worker starts a Docker sandbox for you and you get a file tree, a terminal and a preview. Sandboxes need Docker reachable from the worker.
 3. In Admin, add providers and endpoints, set budgets and invite someone.
-4. Create an API key in Settings, pick a default policy, and copy the environment block it prints for Claude Code, or point any OpenAI- or Anthropic-compatible client at `http://localhost:8080`. See [HTTP API](API.md).
+4. Create an API key in Settings, pick a default policy, and copy the environment block it prints for Claude Code (tick MCP access as well if the key should also drive ws's MCP server), or point any OpenAI- or Anthropic-compatible client at `http://localhost:8080`. See [HTTP API](API.md).
 
 ## Where next
 

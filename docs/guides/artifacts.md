@@ -14,7 +14,7 @@ The assistant creates one with `create_artifact` and changes it with `update_art
 | `mermaid` | A diagram written in Mermaid syntax |
 | `code` | A source file, shown as code |
 
-React components and design mockups are planned and are not rendered yet.
+A `design` artifact is an HTML mockup made in a design project: the conversation's design system (the palette button in the chat header: library, colors, type, spacing, radius, components, notes) goes into the assistant's instructions and is stored on each version as its `design_context`. The panel shows the system's swatches, a diff against the previous version, a download of any version, and a variants button that asks the model for up to four alternatives of the current version, each stored as its own design in the conversation. React components are planned and are not rendered yet.
 
 ## Versions
 
@@ -26,4 +26,4 @@ Artifacts are rendered on a separate origin (`WS_ARTIFACT_URL`, port 8081 locall
 
 Do not point the app and artifact hostnames at the same host. The reasons and the full policy are in [Trust and security](../TRUST.md).
 
-*Checked against the code at master `3364287`.*
+*Checked against the code at master `13a673a`.*
