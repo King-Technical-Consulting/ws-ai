@@ -50,7 +50,7 @@ The routing mark: one line leaves a start dot and splits in two. The filled acce
 - Lockups: mark plus "ws" in Georgia with a short accent rule beneath (horizontal), or the mark over small-caps "ws" (`ink-2`, .3em tracking) and the italic tagline "a self-hosted AI workspace" (stacked).
 - Clear space is the height of the filled dot on every side; minimum size 16px. Below 32px the component thickens its strokes.
 - Favicon (`web/public/favicon.svg`): white mark, thick stroke, no dots, on an accent tile, so it holds at 16px. Apple touch icon (`web/public/apple-touch-icon.png`, 180px): cream mark with orange dots on a #2c2416 tile, full bleed because iOS rounds the corners itself.
-- README banner: `public-repo/assets/banner.svg`.
+- README banner: `public-repo/assets/banner.svg`. Its tagline is lowercase, like the stacked lockup's: "a self-hosted AI workspace: your models, your machines, one login."
 - The monogram options explored in the brand file (serif ws, small caps in a double frame, two linked nodes) are not adopted. Ask Jeremy before using one.
 
 ## Status chips

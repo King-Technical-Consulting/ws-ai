@@ -132,7 +132,9 @@ func ImportSkill(src []byte) (*SkillImport, error) {
 		return nil, fmt.Errorf("%w: the file contains a NUL byte", ErrSkill)
 	}
 	text := strings.ReplaceAll(string(src), "\r\n", "\n")
-	var warnings []string
+	// Both lists always encode as JSON arrays, never null: the form reads
+	// their length.
+	warnings := []string{}
 	text, hidden := stripHidden(text)
 	if hidden > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d hidden character(s) removed (zero-width, direction-override or control characters): the file may have carried text you could not see", hidden))
@@ -178,6 +180,9 @@ func ImportSkill(src []byte) (*SkillImport, error) {
 	requested := toolList(fm.AllowedTools)
 	requested = append(requested, toolList(fm.Tools)...)
 	requested = uniqueSorted(requested)
+	if requested == nil {
+		requested = []string{}
+	}
 	if len(requested) > 0 {
 		warnings = append(warnings, "the skill asks for tools ("+strings.Join(requested, ", ")+"); none were granted. Add the ones the goal needs by hand")
 	}

@@ -1,6 +1,6 @@
 # Data model
 
-The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`, `0013_run_pause`, `0014_training`), applied by goose at boot; this page was written from those files and last verified at commit `9d28c2f` (migrations `0005` to `0008` are the only ones added since `bf89aee`). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
+The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`, `0013_run_pause`, `0014_training`), applied by goose at boot; this page was written from those files and last verified at commit `a6a3e21` (migrations `0005` to `0008` are the only ones added since `bf89aee`). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
 
 Conventions: UUID primary keys from `gen_random_uuid()` (except `usage_ledger` and `sandbox_events`, which use `bigserial`, `providers` and `endpoints`, which use `text` slug ids, and join tables, which use composite keys), `timestamptz` timestamps, `jsonb` for flexible payloads, and `ON DELETE CASCADE` from owning rows. Tables with `updated_at` get a `set_updated_at` trigger, except `sandboxes`, whose queries set `updated_at` explicitly. Extensions: `pgcrypto`, `citext`, and `vector` (pgvector, enabled by `0011`; the pool registers its types at connect). River adds its own tables through its own migration (`jobs.Migrate`), not listed here.
 
@@ -41,14 +41,14 @@ Tokens and keys are stored only as hashes.
 
 | Table | Purpose and notable columns |
 |---|---|
-| `projects` | `owner_id`, `name`, `kind` (`chat`, `code`, `design`, `images`; the API accepts any kind, but the web app creates only `chat` and `code`), `settings`, `repo_url`, `default_branch`, `github_installation_id`, `archived_at` |
+| `projects` | `owner_id`, `name`, `kind` (`chat`, `code`, `design`, `images`; the API accepts any kind; the web app creates `chat`, `code` and `design` projects), `settings`, `repo_url`, `default_branch`, `github_installation_id`, `archived_at` |
 | `project_members` | Sharing: `(project_id, user_id)` with `role` of `viewer`, `editor` or `admin` |
 
 ## Conversations
 
 | Table | Purpose and notable columns |
 |---|---|
-| `conversations` | `project_id`, `user_id`, `title`, `mode` (`chat`, `code`, `design`, `images`, `agent`), `agent_id` (nullable FK to `agents`, added in `0002`), `model_selector` (default `auto`), `settings` (including `tool_policies`), `compaction_head_message_seq`, `archived_at` |
+| `conversations` | `project_id`, `user_id`, `title`, `mode` (`chat`, `code`, `design`, `images`, `agent`), `agent_id` (nullable FK to `agents`, added in `0002`), `model_selector` (default `auto`), `settings` (including `tool_policies` and, in a design conversation, `design_context`; the PATCH does not validate it, and a bad one is silently ignored when the prompt is built), `compaction_head_message_seq`, `archived_at` |
 | `messages` | `conversation_id`, `seq` (unique per conversation), `role` (`system`, `user`, `assistant`, `tool`), `parts` (the canonical gateway `Part` array, provider-neutral), `endpoint_id`, `model`, `usage`, `finish_reason`, `parent_id` (branching) |
 | `attachments` | Uploaded files in the blob store: `blob_key`, `mime`, `bytes`, `sha256`, `filename`, `width`, `height` |
 | `message_attachments` | Join of messages to attachments |
@@ -60,7 +60,7 @@ Messages are never rewritten by compaction; a compaction row only records what a
 
 | Table | Purpose and notable columns |
 |---|---|
-| `artifacts` | `conversation_id`, `kind` (`html`, `react`, `svg`, `markdown`, `mermaid`, `design`, `code`), `title`, `language`, `current_version` |
+| `artifacts` | `conversation_id`, `kind` (`html`, `svg`, `markdown`, `mermaid`, `design`, `code`; `react` is planned and not accepted yet), `title`, `language`, `current_version` |
 | `artifact_versions` | `(artifact_id, version)` unique; `content` or `blob_key`, `design_context`, `created_by_message_id` |
 
 ## Gateway

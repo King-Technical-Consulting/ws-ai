@@ -4,7 +4,7 @@ The Admin page is for the owner. Other users do not see a link to it, and its ro
 
 ## Invites
 
-ws is invite-only. Enter an email under **invites** and ws creates a single-use invite link, shown on the page and emailed if email is configured (without it, the email body, which contains the link, is written to the server log). New users get the `member` role. Invites expire after seven days, and inviting an address that already has an account is refused. The first account is created from the invite link the server prints at first boot, which is why `WS_OWNER_EMAIL` must be set.
+ws is invite-only. Enter an email under **invites** and ws creates a single-use invite link, shown on the page and emailed if email is configured (without it, the email body, which contains the link, is written to the server log). New users get the `member` role. Invites expire after seven days, and inviting an address that already has an account is refused: the page shows the server's reason under the form and keeps what you typed so you can correct it. The first account is created from the invite link the server prints at first boot, which is why `WS_OWNER_EMAIL` must be set.
 
 ## Endpoints and models
 

@@ -57,6 +57,7 @@ export default function Admin() {
   const qc = useQueryClient()
   const [email, setEmail] = useState('')
   const [link, setLink] = useState<string | null>(null)
+  const [inviteErr, setInviteErr] = useState<string | null>(null)
   const invites = useQuery({ queryKey: ['invites'], queryFn: () => api.get<Invite[]>('/api/admin/invites') })
   const usage = useQuery({ queryKey: ['usage'], queryFn: () => api.get<Usage>('/api/admin/usage?days=30') })
   const eps = useQuery({ queryKey: ['admin-endpoints'], queryFn: () => api.get<Endpoints>('/api/admin/endpoints') })
@@ -66,7 +67,14 @@ export default function Admin() {
     onSuccess: (r) => {
       setLink(r.link)
       setEmail('')
+      setInviteErr(null)
       qc.invalidateQueries({ queryKey: ['invites'] })
+    },
+    // The server says why (a known address, a bad one); the input keeps its
+    // text so the owner can correct it.
+    onError: (e) => {
+      setLink(null)
+      setInviteErr((e as Error).message.replace(/^auth: /, ''))
     },
   })
   const toggle = useMutation({
@@ -93,6 +101,7 @@ export default function Admin() {
             <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="friend@example.com" className={inputSm} />
             <button onClick={() => invite.mutate()} className={btn.primarySm}>Invite</button>
           </div>
+          {inviteErr && <Callout kind="error">{inviteErr}</Callout>}
           {link && (
             <p className="text-sm text-fg-2">
               Invite link, also emailed when Resend is configured: <code className="font-mono text-xs break-all select-all">{link}</code>

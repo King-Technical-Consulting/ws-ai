@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -105,6 +106,25 @@ func TestImportSkillHostileFixtures(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(out.Warnings, " "), "1 HTML comment") && !strings.Contains(strings.Join(out.Warnings, " "), "3 hidden") {
 		t.Errorf("hidden count: %v", out.Warnings)
+	}
+}
+
+// A plain skill (name, description, body, nothing asked for) must encode
+// requested_tools and warnings as empty arrays, never null: the form
+// reads their length (ui-test, board 6a73).
+func TestImportSkillPlainEncodesEmptyArrays(t *testing.T) {
+	out, err := ImportSkill([]byte("---\nname: plain\ndescription: Says hello.\n---\nGreet the person.\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RequestedTools == nil || out.Warnings == nil || len(out.RequestedTools) != 0 || len(out.Warnings) != 0 {
+		t.Fatalf("requested=%#v warnings=%#v", out.RequestedTools, out.Warnings)
+	}
+	b, _ := json.Marshal(out)
+	for _, want := range []string{`"requested_tools":[]`, `"warnings":[]`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("JSON lacks %s: %s", want, b)
+		}
 	}
 }
 

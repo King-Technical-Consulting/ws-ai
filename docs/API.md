@@ -1,6 +1,6 @@
 # HTTP API
 
-The routes `ws serve` exposes, grouped by who calls them. Verified against `internal/httpx/server.go`, `internal/externalapi/`, `internal/artifacts/origin.go`, `internal/httpx/preview.go`, `internal/sandbox/internalapi.go` and the handlers they mount. Last verified at commit `2d4e9f0`.
+The routes `ws serve` exposes, grouped by who calls them. Verified against `internal/httpx/server.go`, `internal/externalapi/`, `internal/artifacts/origin.go`, `internal/httpx/preview.go`, `internal/sandbox/internalapi.go` and the handlers they mount. Last verified at commit `a6a3e21`.
 
 This is a route and behavior map, not a full schema. Request fields are listed where a handler decodes a body; response bodies are the JSON rows from `internal/store` unless noted. The `/v1` surface is under active change for milestone M5 (passthrough, billing router), so treat that section as the contract today and check the PLAN for where it is heading.
 
@@ -133,7 +133,7 @@ All routes below need authentication.
 | `GET /api/conversations/{id}/artifacts` | Artifacts created in the conversation |
 | `GET /api/artifacts/{id}`, `GET /api/artifacts/{id}/versions/{v}` | An artifact, current or by version (`?version=N` also works). Returns `{artifact, versions, version, version_id, url, content, kind, title, design_context}`; `url` is the signed viewer URL on the artifact origin; `design_context` is the design system a `design` version was made under (null otherwise) |
 | `GET /api/artifacts/{id}/export?version=N` | The version's content as a download (`Content-Disposition: attachment`): `.html` for `html` and `design`, `.svg`, `.md`, `.mmd`, or the code language's extension. The model's document as stored, never rendered on the app origin |
-| `POST /api/artifacts/{id}/variants` | Body `{n?, instruction?, version?, model?}`. Generates `n` (default 3, at most 4) alternatives of a `design` or `html` artifact's version in parallel, each a model call billed to the caller, and stores each as a new `design` artifact in the conversation titled "`title` · variant k" with the same `design_context`. `201 {variants: [ref], errors: [string]}`; `502` when none succeeded |
+| `POST /api/artifacts/{id}/variants` | Body `{n?, instruction?, version?, model?}`. Generates `n` (default 3, at most 4) alternatives of a `design` or `html` artifact's version in parallel, each a model call billed to the caller, and stores each as a new `design` artifact in the conversation titled "`title` · variant k" with the same `design_context`. `201 {variants: [ref], errors: [string]}`; `502` when none succeeded, and also for an `n` above 4 (it is not a `400`). The call stops if the client disconnects, and there is no per-user rate limit |
 
 ### Chat and runs
 

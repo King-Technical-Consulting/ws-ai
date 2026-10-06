@@ -227,10 +227,10 @@ export function AgentForm({
           {imported && (
             <Callout kind="note">
               <p>Imported "{imported.preset.title}". Read the prompt below before you save the agent.</p>
-              {imported.requested_tools.length > 0 && <p className="mt-1">The skill asks for tools it did not get: <span className="font-mono text-xs">{imported.requested_tools.join(', ')}</span>. Add only what the goal needs.</p>}
-              {imported.warnings.length > 0 && (
+              {(imported.requested_tools ?? []).length > 0 && <p className="mt-1">The skill asks for tools it did not get: <span className="font-mono text-xs">{imported.requested_tools.join(', ')}</span>. Add only what the goal needs.</p>}
+              {(imported.warnings ?? []).length > 0 && (
                 <ul className="mt-1 list-disc pl-4">
-                  {imported.warnings.map((w) => (
+                  {(imported.warnings ?? []).map((w) => (
                     <li key={w}>{w}</li>
                   ))}
                 </ul>
