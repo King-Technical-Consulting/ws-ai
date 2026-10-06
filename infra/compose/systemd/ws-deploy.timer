@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ws-deploy every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+Unit=ws-deploy.service
+
+[Install]
+WantedBy=timers.target

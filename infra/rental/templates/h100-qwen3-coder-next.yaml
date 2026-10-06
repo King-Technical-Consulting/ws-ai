@@ -1,0 +1,27 @@
+# Qwen3-Coder-Next 80B-A3B FP8 on one H100 80 GB with vLLM: the coding
+# model for agent work when the Spark is not around.
+name: h100-qwen3-coder-next
+provider: runpod
+description: Qwen3-Coder-Next 80B-A3B FP8 on one H100 80 GB, vLLM, tools on
+gpu: NVIDIA H100 80GB HBM3
+gpu_count: 1
+cloud_type: secure
+image: vllm/vllm-openai:latest
+model: Qwen/Qwen3-Coder-Next-FP8
+args: --model Qwen/Qwen3-Coder-Next-FP8 --host 0.0.0.0 --port 8000 --api-key $WS_RENTAL_API_KEY --max-model-len 131072 --enable-auto-tool-choice --tool-call-parser hermes --gpu-memory-utilization 0.92
+env:
+  HF_TOKEN: $HF_TOKEN
+  HF_HOME: /workspace/hf
+port: 8000
+disk_gb: 40
+volume_gb: 200
+volume_path: /workspace
+idle_timeout: 20m
+max_hours: 6
+warmup_timeout: 25m
+hourly_usd: 2.69
+endpoint:
+  id: rental/qwen3-coder-next-h100
+  display_name: Qwen3-Coder-Next (rented H100)
+  capabilities: { context_window: 131072, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true }
+  pricing: { input_per_m: 0, output_per_m: 0 }

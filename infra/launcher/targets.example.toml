@@ -1,0 +1,21 @@
+# Launcher targets as seen from the ws containers. Copy to
+# secrets/targets.toml and set WS_CC_TARGETS=/secrets/targets.toml.
+# Inside the containers every target is an ssh target (the image has no
+# tmux): `host` is a Host alias from secrets/ssh_config. Keep the names in
+# step with the Mac's ~/.config/wsj/targets.toml so job rows match.
+
+default = "hostbox"
+ssh_config = "/secrets/ssh_config"   # or WS_CC_SSH_CONFIG / WSJ_SSH_CONFIG
+
+[targets.hostbox]
+type = "ssh"
+host = "hostbox"
+session = "subscription"
+default_dir = "~/ws"
+repos = ["~/ws", "~/proj"]
+
+[targets.homelab]
+type = "ssh"
+host = "homelab"
+session = "subscription"
+default_dir = "~/proj"

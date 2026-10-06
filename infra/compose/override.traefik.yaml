@@ -1,0 +1,57 @@
+# Route ws through an existing Traefik instance (the homelab pattern: an
+# external `traefik-net` network, `websecure` entrypoint, TLS from a local
+# wildcard cert, hostnames under one domain, DNS pointed at the box).
+#
+#   make up HW=cloud INGRESS=traefik CD=1       (INGRESS=traefik adds this file)
+#
+# .env:
+#   WS_HOST=ws.home.arpa            WS_PUBLIC_URL=https://ws.home.arpa
+#   WS_ART_HOST=ws-art.home.arpa    WS_ARTIFACT_URL=https://ws-art.home.arpa
+#   WS_ENV=prod                     WS_RP_ID=ws.home.arpa
+#   TRAEFIK_NETWORK=traefik-net
+#
+# Artifacts get their own hostname (not a subdomain of WS_HOST) so a single
+# *.domain wildcard certificate covers both. With https on a trusted cert,
+# passkeys work. Add both hostnames to DNS (Pi-hole) -> this box.
+#
+# The published ports from override.cloud.yaml stay on the tailnet address
+# for direct access; remove them from .env (WS_BIND_ADDR) if you want
+# Traefik to be the only way in.
+
+services:
+  app:
+    networks:
+      - default
+      - traefik
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik-net}
+      # app + API
+      traefik.http.routers.ws.rule: Host(`${WS_HOST:-ws.home.arpa}`)
+      traefik.http.routers.ws.entrypoints: websecure
+      traefik.http.routers.ws.tls: "true"
+      traefik.http.routers.ws.service: ws
+      traefik.http.services.ws.loadbalancer.server.port: "8080"
+      # artifact origin
+      traefik.http.routers.ws-art.rule: Host(`${WS_ART_HOST:-ws-art.home.arpa}`)
+      traefik.http.routers.ws-art.entrypoints: websecure
+      traefik.http.routers.ws-art.tls: "true"
+      traefik.http.routers.ws-art.service: ws-art
+      traefik.http.services.ws-art.loadbalancer.server.port: "8081"
+      # sandbox dev-server previews: ws-p-<port>-<id>.<domain>, one level
+      # under the wildcard cert. Set WS_PREVIEW_HOST=ws-p-{port}-{id}.<domain>.
+      traefik.http.routers.ws-preview.rule: HostRegexp(`^ws-p-[0-9]+-[0-9a-f]{12}\.${WS_PREVIEW_PARENT:-home.arpa}$`)
+      traefik.http.routers.ws-preview.entrypoints: websecure
+      traefik.http.routers.ws-preview.tls: "true"
+      traefik.http.routers.ws-preview.service: ws
+      # homepage dashboard
+      homepage.group: AI
+      homepage.name: ws
+      homepage.icon: mdi-chat-processing
+      homepage.href: https://${WS_HOST:-ws.home.arpa}
+      homepage.description: Self-hosted AI workspace
+
+networks:
+  traefik:
+    name: ${TRAEFIK_NETWORK:-traefik-net}
+    external: true

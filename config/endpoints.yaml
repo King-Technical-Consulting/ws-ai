@@ -1,0 +1,205 @@
+# Providers and endpoints seeded into the database on boot (upsert by id).
+# API keys are referenced by environment variable name, never stored here.
+# Pricing is USD per million tokens. Local endpoints are free but still
+# tracked. Capabilities are declared because engines rarely report them.
+#
+# Edit in the admin UI after boot; this file is only the seed. Set
+# WS_ENDPOINTS_SEED_MODE=overwrite to force this file to win.
+
+providers:
+  - id: anthropic
+    kind: anthropic
+    name: Anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+
+  - id: openrouter
+    kind: openai_compat
+    name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    headers:
+      HTTP-Referer: https://github.com/King-Technical-Consulting/ws-ai
+      X-Title: ws
+
+  - id: openai
+    kind: openai_compat
+    name: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  # Cerebras direct (wafer-scale, ~3000 tok/s on gpt-oss-120b). Also
+  # reachable through OpenRouter as a pinned route; direct is cheaper.
+  - id: cerebras
+    kind: openai_compat
+    name: Cerebras
+    base_url: https://api.cerebras.ai/v1
+    api_key_env: CEREBRAS_API_KEY
+
+  # Local inference. Base URLs come from env so the same file works on every box.
+  - id: local-llama
+    kind: openai_compat
+    name: llama-server (local)
+    base_url_env: LLAMA_SERVER_URL
+
+  - id: local-vllm
+    kind: openai_compat
+    name: vLLM (Spark)
+    base_url_env: VLLM_URL
+
+  - id: mac-studio
+    kind: openai_compat
+    name: Mac Studio (MLX)
+    base_url_env: MAC_STUDIO_URL
+
+endpoints:
+  # ---- Anthropic ----
+  - id: anthropic/claude-opus-5-5
+    provider: anthropic
+    model: claude-opus-5-5
+    display_name: Claude Opus 5.5
+    capabilities: { context_window: 1000000, max_output: 128000, tools: true, vision: true, json_mode: true, reasoning: true, prompt_cache: true }
+    pricing: { input_per_m: 4.00, output_per_m: 20.00, cache_read_per_m: 0.20, cache_write_per_m: 5.00 }
+    throughput_class: high
+    latency_class: normal
+
+  - id: anthropic/claude-sonnet-5-5
+    provider: anthropic
+    model: claude-sonnet-5-5
+    display_name: Claude Sonnet 5.5
+    capabilities: { context_window: 1000000, max_output: 128000, tools: true, vision: true, json_mode: true, reasoning: true, prompt_cache: true }
+    pricing: { input_per_m: 2.00, output_per_m: 10.00, cache_read_per_m: 0.20, cache_write_per_m: 2.50 }
+    throughput_class: high
+    latency_class: fast
+
+  - id: anthropic/claude-haiku-4-5
+    provider: anthropic
+    model: claude-haiku-4-5
+    display_name: Claude Haiku 4.5
+    capabilities: { context_window: 200000, max_output: 64000, tools: true, vision: true, json_mode: true, reasoning: true, prompt_cache: true }
+    pricing: { input_per_m: 1.00, output_per_m: 5.00, cache_read_per_m: 0.10, cache_write_per_m: 1.25 }
+    throughput_class: high
+    latency_class: fast
+
+  # ---- OpenAI embeddings (agent memory, PLAN.md M7) ----
+  # agent_memory.embedding is 768 wide, so the model is asked for that
+  # width (extra_body is merged into every request). Local nomic-embed
+  # is preferred by policy; this is the hosted fallback.
+  - id: openai/text-embedding-3-small
+    provider: openai
+    model: text-embedding-3-small
+    display_name: text-embedding-3-small (OpenAI)
+    capabilities: { context_window: 8191, embeddings: true }
+    pricing: { input_per_m: 0.02, output_per_m: 0 }
+    extra_body: { dimensions: 768 }
+    throughput_class: high
+    latency_class: fast
+
+  # ---- OpenAI Images (media endpoint, PLAN.md M6) ----
+  # `capabilities.media` makes this an image endpoint: text routing never
+  # picks it and task class `image` routes only to endpoints like it. The
+  # engine names the adapter in internal/media. gpt-image-1 reports token
+  # usage, so the per-token rates (text in, image out) price each job by
+  # its real quality and size; per_image is the estimate shown before a
+  # job runs (medium quality, 1024x1024).
+  - id: openai/gpt-image-1
+    provider: openai
+    model: gpt-image-1
+    display_name: GPT Image 1 (OpenAI)
+    capabilities: { media: { engine: openai_images, image: true, sizes: [1024x1024, 1536x1024, 1024x1536, auto], max_images: 4 } }
+    pricing: { input_per_m: 5.00, output_per_m: 40.00, per_image: 0.04 }
+    throughput_class: medium
+    latency_class: slow
+
+  # ---- OpenRouter (examples; add what you use) ----
+  - id: openrouter/google/gemini-2.5-pro
+    provider: openrouter
+    model: google/gemini-2.5-pro
+    display_name: Gemini 2.5 Pro (OpenRouter)
+    capabilities: { context_window: 1000000, max_output: 65536, tools: true, vision: true, json_mode: true, reasoning: true }
+    pricing: { input_per_m: 1.25, output_per_m: 10.00 }
+    throughput_class: high
+    latency_class: normal
+
+  - id: openrouter/deepseek/deepseek-chat-v3
+    provider: openrouter
+    model: deepseek/deepseek-chat-v3-0324
+    display_name: DeepSeek V3 (OpenRouter)
+    capabilities: { context_window: 128000, max_output: 16000, tools: true, vision: false, json_mode: true }
+    pricing: { input_per_m: 0.30, output_per_m: 0.88 }
+    throughput_class: medium
+    latency_class: normal
+
+  # ---- Cerebras direct ----
+  # Prices from cerebras.ai/pricing (Oct 2025); adjust if they change.
+  - id: cerebras/gpt-oss-120b
+    provider: cerebras
+    model: gpt-oss-120b
+    display_name: gpt-oss-120b (Cerebras)
+    capabilities: { context_window: 131072, max_output: 40960, tools: true, vision: false, json_mode: true, reasoning: true }
+    pricing: { input_per_m: 0.25, output_per_m: 0.69 }
+    throughput_class: high
+    latency_class: fast
+
+  # The same model via OpenRouter, pinned to Cerebras. `extra_body` is
+  # merged into every request; `provider.order` + `allow_fallbacks: false`
+  # is OpenRouter's provider-routing syntax. The admin UI writes entries
+  # like this from "Routes" on a catalog model.
+  - id: openrouter/openai/gpt-oss-120b@cerebras
+    provider: openrouter
+    model: openai/gpt-oss-120b
+    display_name: gpt-oss-120b via Cerebras (OpenRouter)
+    capabilities: { context_window: 131072, max_output: 40960, tools: true, vision: false, json_mode: true, reasoning: true }
+    pricing: { input_per_m: 0.35, output_per_m: 0.75 }
+    extra_body: { provider: { order: [cerebras], allow_fallbacks: false } }
+    throughput_class: high
+    latency_class: fast
+
+  # ---- Local: W7700 16 GB / Orin via llama-server ----
+  - id: local-llama/gpt-oss-20b
+    provider: local-llama
+    model: gpt-oss-20b
+    display_name: gpt-oss-20b (local)
+    local: true
+    capabilities: { context_window: 131072, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true }
+    throughput_class: low
+    latency_class: normal
+
+  - id: local-llama/qwen3-14b
+    provider: local-llama
+    model: qwen3-14b
+    display_name: Qwen3 14B (local)
+    local: true
+    capabilities: { context_window: 40960, max_output: 8192, tools: true, vision: false, json_mode: true, reasoning: true }
+    throughput_class: low
+    latency_class: normal
+
+  - id: local-llama/nomic-embed-text
+    provider: local-llama
+    model: nomic-embed-text-v1.5
+    display_name: nomic-embed (local)
+    local: true
+    capabilities: { context_window: 8192, embeddings: true }
+    throughput_class: medium
+    latency_class: fast
+
+  # ---- Local: Spark via vLLM (enable when the box arrives) ----
+  - id: local-vllm/qwen3-coder-next
+    provider: local-vllm
+    model: Qwen/Qwen3-Coder-Next
+    display_name: Qwen3-Coder-Next 80B-A3B (Spark)
+    local: true
+    enabled: false
+    capabilities: { context_window: 262144, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true }
+    throughput_class: high
+    latency_class: fast
+
+  - id: local-vllm/qwen3.6-35b-a3b
+    provider: local-vllm
+    model: Qwen/Qwen3.6-35B-A3B
+    display_name: Qwen3.6 35B-A3B (Spark)
+    local: true
+    enabled: false
+    capabilities: { context_window: 262144, max_output: 32768, tools: true, vision: true, json_mode: true, reasoning: true }
+    throughput_class: high
+    latency_class: fast

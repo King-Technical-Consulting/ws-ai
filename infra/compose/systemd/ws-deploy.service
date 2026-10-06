@@ -1,0 +1,11 @@
+[Unit]
+Description=ws continuous delivery (git pull, compose pull, compose up)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Set by `make install-cd`; the checkout this unit deploys.
+WorkingDirectory=%h/ws
+ExecStart=%h/ws/infra/compose/ws-deploy.sh
+TimeoutStartSec=15min

@@ -1,0 +1,40 @@
+# Any Linux box without a usable GPU (a VPS, a test VM). Runs llama-server
+# on CPU with a small model so the whole stack can be exercised. Slow, but
+# complete. Pair with an ingress profile like the GPU overrides.
+#
+#   docker compose -f compose.yaml -f override.cpu.yaml up -d
+#   huggingface-cli download unsloth/Qwen3-4B-GGUF Qwen3-4B-Q4_K_M.gguf --local-dir data/models
+
+services:
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: unless-stopped
+    environment:
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8000"
+    command: >
+      --model /models/Qwen3-4B-Q4_K_M.gguf
+      --alias qwen3-4b
+      --ctx-size 8192
+      --parallel 2
+      --jinja
+      --metrics
+    volumes:
+      - ../../data/models:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+
+  app:
+    environment:
+      LLAMA_SERVER_URL: http://llama:8000/v1
+    depends_on:
+      llama:
+        condition: service_healthy
+
+  worker:
+    environment:
+      LLAMA_SERVER_URL: http://llama:8000/v1

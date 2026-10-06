@@ -1,0 +1,43 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Node / web
+node_modules/
+web/dist/*
+web/.vite/
+*.tsbuildinfo
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/secrets/*
+!/secrets/.gitkeep
+
+# Data
+/data/
+/blobs/
+*.gguf
+*.safetensors
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# keep embed dir
+!web/dist/.gitkeep
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# binaries from `go build ./cmd/...` in the repo root
+/ws
+/wsj

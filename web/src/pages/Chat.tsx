@@ -1,0 +1,155 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useParams } from 'react-router'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useChat } from '@ai-sdk/react'
+import { DefaultChatTransport, lastAssistantMessageIsCompleteWithApprovalResponses, type UIMessage } from 'ai'
+import { api, type Conversation, type ModelsResponse } from '../api'
+import { MessageList } from '../components/MessageList'
+import { Composer } from '../components/Composer'
+import { ModelPicker } from '../components/ModelPicker'
+import { ArtifactContext, ArtifactPanel, type ArtifactRef } from '../components/ArtifactPanel'
+import { CodePanel } from '../components/CodePanel'
+import { PanelRight } from 'lucide-react'
+
+type ConvResponse = { conversation: Conversation; messages: UIMessage[] }
+
+export default function Chat() {
+  const { id = '' } = useParams()
+  const qc = useQueryClient()
+  const conv = useQuery({ queryKey: ['conv', id], queryFn: () => api.get<ConvResponse>(`/api/conversations/${id}`) })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelsResponse>('/api/models'), staleTime: 60_000 })
+
+  if (conv.isLoading) return <div className="p-6 meta">Loading…</div>
+  if (conv.error || !conv.data) return <div className="p-6 text-danger text-sm">Could not load this conversation.</div>
+
+  return (
+    <ChatInner
+      key={id}
+      id={id}
+      initial={conv.data}
+      models={models.data}
+      onTitleMaybeChanged={() => {
+        qc.invalidateQueries({ queryKey: ['convs'] })
+      }}
+    />
+  )
+}
+
+/** Finds the newest artifact output across all messages. */
+function latestArtifact(messages: UIMessage[]): ArtifactRef | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const parts = messages[i].parts
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const p = parts[j] as unknown as { type: string; state?: string; output?: ArtifactRef }
+      if ((p.type === 'tool-create_artifact' || p.type === 'tool-update_artifact') && p.state === 'output-available' && p.output?.artifact_id) {
+        return p.output
+      }
+    }
+  }
+  return null
+}
+
+function ChatInner({
+  id,
+  initial,
+  models,
+  onTitleMaybeChanged,
+}: {
+  id: string
+  initial: ConvResponse
+  models?: ModelsResponse
+  onTitleMaybeChanged: () => void
+}) {
+  const [model, setModel] = useState(initial.conversation.model_selector || 'auto')
+  const [reasoning, setReasoning] = useState(false)
+  const modelRef = useRef(model)
+  const reasoningRef = useRef(reasoning)
+  modelRef.current = model
+  reasoningRef.current = reasoning
+
+  const transport = useMemo(
+    () =>
+      new DefaultChatTransport({
+        api: `/api/conversations/${id}/chat`,
+        credentials: 'same-origin',
+        body: () => ({ model: modelRef.current, reasoning: reasoningRef.current }),
+      }),
+    [id],
+  )
+
+  const chat = useChat({
+    id,
+    transport,
+    messages: initial.messages,
+    // After the user answers every pending approval, re-send so the server
+    // resumes the paused run and streams the rest of the turn.
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
+    onFinish: () => onTitleMaybeChanged(),
+  })
+
+  useEffect(() => {
+    if (model !== initial.conversation.model_selector) {
+      api.patch(`/api/conversations/${id}`, { model }).catch(() => {})
+    }
+  }, [model, id, initial.conversation.model_selector])
+
+  // Artifact panel: open the newest artifact when one arrives.
+  const [panel, setPanel] = useState<{ id: string; version?: number } | null>(() => {
+    const a = latestArtifact(initial.messages)
+    return a ? { id: a.artifact_id, version: a.version } : null
+  })
+  const lastSeen = useRef<string | null>(latestArtifact(initial.messages)?.version_id ?? null)
+  useEffect(() => {
+    const a = latestArtifact(chat.messages)
+    if (a && a.version_id !== lastSeen.current) {
+      lastSeen.current = a.version_id
+      setPanel({ id: a.artifact_id, version: a.version })
+    }
+  }, [chat.messages])
+
+  const busy = chat.status === 'submitted' || chat.status === 'streaming'
+  const isCode = initial.conversation.mode === 'code'
+  const [codeOpen, setCodeOpen] = useState(isCode)
+
+  return (
+    <ArtifactContext.Provider value={{ open: (aid, version) => setPanel({ id: aid, version }) }}>
+      <div className="flex-1 min-h-0 flex">
+        <div className="flex-1 min-w-0 flex flex-col">
+          <header className="h-12 shrink-0 border-b border-line flex items-center justify-between px-4 gap-3">
+            <h2 className="reading-tight truncate text-fg">{initial.conversation.title || 'New conversation'}</h2>
+            <div className="flex items-center gap-2">
+              <ModelPicker value={model} onChange={setModel} models={models} reasoning={reasoning} onReasoning={setReasoning} />
+              {isCode && !codeOpen && (
+                <button onClick={() => setCodeOpen(true)} className="p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="Files, terminal, preview" aria-label="Open code panel">
+                  <PanelRight size={16} />
+                </button>
+              )}
+            </div>
+          </header>
+          <MessageList
+            messages={chat.messages}
+            status={chat.status}
+            error={chat.error}
+            onApproval={(approvalId, approved) => chat.addToolApprovalResponse({ id: approvalId, approved })}
+          />
+          <Composer
+            disabled={busy}
+            onStop={busy ? () => chat.stop() : undefined}
+            onSend={(text, files) => {
+              chat.sendMessage({ text, files })
+            }}
+          />
+        </div>
+        {isCode && codeOpen && <CodePanel projectId={initial.conversation.project_id} onClose={() => setCodeOpen(false)} />}
+        {panel && !(isCode && codeOpen) && (
+          <ArtifactPanel
+            id={panel.id}
+            version={panel.version}
+            onClose={() => setPanel(null)}
+            onVersion={(v) => setPanel({ id: panel.id, version: v })}
+          />
+        )}
+      </div>
+    </ArtifactContext.Provider>
+  )
+}

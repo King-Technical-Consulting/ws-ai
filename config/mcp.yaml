@@ -1,0 +1,36 @@
+# MCP servers whose tools the agent runtime exposes as mcp__<server>__<tool>.
+# Two kinds:
+#   url:     Streamable HTTP (or transport: sse), reached from serve and the
+#            worker. Stdio servers that hold credentials run behind a bridge
+#            (see the mcp-infisical sidecar in infra/compose/compose.yaml).
+#   command: a stdio server started inside the caller's coding sandbox by
+#            the worker (docker exec, user dev, cwd /workspace, the sandbox's
+#            egress proxy, no credentials). It sees the project's files and
+#            nothing else. Its tool list is read at boot by running the
+#            command once in a throwaway container of the sandbox image, so
+#            the command must work without a project. Only code projects can
+#            call it; serve skips it.
+# Each tool follows the usual policies: auto | ask | deny, with per-tool
+# overrides. Unknown or unreachable servers are skipped with a warning.
+servers:
+  # Example of a sandbox stdio server (npx fetches it through the egress
+  # proxy; bake it into infra/sandbox/Dockerfile to avoid the download):
+  # - name: fs
+  #   command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  #   policy: ask
+  #   policies: { read_file: auto, list_directory: auto, search_files: auto }
+  #   idempotent: [read_file, list_directory, search_files, get_file_info]
+
+  - name: infisical
+    url: http://mcp-infisical:8000/mcp
+    enabled: true
+    policy: ask
+    policies:
+      list-projects: auto
+      list-secrets: auto      # values are masked by the sidecar unless INFISICAL_MCP_MASK=false
+      get-secret: ask
+      create-secret: ask
+      update-secret: ask
+      delete-secret: deny
+      invite-members-to-project: deny
+    idempotent: [list-projects, list-secrets, get-secret]

@@ -1,0 +1,55 @@
+# AMD Radeon Pro W7700 (16 GB, RDNA3 gfx1101) on x86_64 Linux.
+# Uses the Vulkan build of llama.cpp: simplest to set up on RDNA3 and
+# usually faster at generation than ROCm/HIP. Swap the image tag to
+# `server-rocm` to compare prefill speed.
+#
+#   docker compose -f compose.yaml -f override.amd-rocm.yaml up -d
+#
+# Host needs: amdgpu driver, user in `video` and `render` groups.
+
+services:
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8000"
+    command: >
+      --model /models/gpt-oss-20b-Q4_K_M.gguf
+      --alias gpt-oss-20b
+      --ctx-size 16384
+      --n-gpu-layers 999
+      --parallel 2
+      --flash-attn on
+      --jinja
+      --reasoning-format deepseek
+      --metrics
+    volumes:
+      - ../../data/models:/models:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+
+  app:
+    environment:
+      LLAMA_SERVER_URL: http://llama:8000/v1
+    depends_on:
+      llama:
+        condition: service_healthy
+
+  worker:
+    environment:
+      LLAMA_SERVER_URL: http://llama:8000/v1

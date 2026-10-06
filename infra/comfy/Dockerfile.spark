@@ -1,0 +1,43 @@
+# ComfyUI for DGX Spark (GB10, arm64, sm_121). Referenced by
+# infra/compose/override.spark-cuda.yaml under --profile images (M5).
+#
+# Follows NVIDIA's Spark ComfyUI guide: PyTorch from the cu130 aarch64 wheel
+# index and SageAttention built from source for sm_121, since prebuilt
+# wheels and the stock ComfyUI containers don't target GB10.
+# UNTESTED until the Spark arrives; expect to pin versions then.
+
+FROM nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST="12.1a" \
+    CUDA_MODULE_LOADING=LAZY
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv git ninja-build libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN python3 -m venv venv
+ENV PATH=/opt/venv/bin:$PATH
+
+# PyTorch for CUDA 13 on aarch64.
+RUN pip install --index-url https://download.pytorch.org/whl/cu130 torch torchvision torchaudio
+
+# ComfyUI
+ARG COMFY_REF=master
+RUN git clone --depth 1 --branch ${COMFY_REF} https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+    && pip install -r /opt/ComfyUI/requirements.txt
+
+# SageAttention 2 from source for sm_121 (optional but much faster for FLUX/Wan).
+RUN git clone --depth 1 https://github.com/thu-ml/SageAttention.git /opt/SageAttention \
+    && cd /opt/SageAttention && pip install . || echo "SageAttention build failed; continuing without it"
+
+# Models, custom nodes, inputs and outputs live on the mounted /data volume.
+RUN mkdir -p /data && for d in models custom_nodes input output user; do \
+      rm -rf /opt/ComfyUI/$d && ln -s /data/$d /opt/ComfyUI/$d; done
+
+VOLUME ["/data"]
+EXPOSE 8188
+WORKDIR /opt/ComfyUI
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch"]

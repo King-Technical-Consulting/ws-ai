@@ -1,0 +1,71 @@
+# NVIDIA DGX Spark (GB10, arm64, sm_121, 128 GB unified). vLLM for
+# multi-user throughput. Use an image built for sm_121a; the generic NGC
+# image may require a newer driver than the Spark ships with.
+#
+#   docker compose -f compose.yaml -f override.spark-cuda.yaml up -d
+#
+# First start compiles kernels (~25 s); the healthcheck start_period covers it.
+# Benchmark NVFP4 vs FP8 for your models; NVFP4 is not always faster on GB10.
+
+services:
+  vllm:
+    # Community sm_121a build pinned by digest once chosen. Alternatives:
+    #   vllm/vllm-openai:cu130-nightly   (upstream, pin a digest)
+    #   eugr/spark-vllm-docker            (also handles two linked Sparks)
+    image: ghcr.io/timothystewart6/vllm-gb10:latest
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      TORCH_CUDA_ARCH_LIST: "12.1a"
+    command: >
+      --model Qwen/Qwen3-Coder-Next
+      --served-model-name Qwen/Qwen3-Coder-Next
+      --host 0.0.0.0 --port 8000
+      --gpu-memory-utilization 0.85
+      --max-model-len 131072
+      --max-num-seqs 8
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --enable-prefix-caching
+    volumes:
+      - ../../data/hf:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 80
+      start_period: 600s
+
+  # ComfyUI for image generation (M6). Official NVIDIA Spark guide: build
+  # torch from the cu130 aarch64 index and SageAttention for sm_121.
+  comfyui:
+    build:
+      context: ../comfy
+      dockerfile: Dockerfile.spark
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - ../../data/comfy:/data
+    ports:
+      - "127.0.0.1:8188:8188"
+    profiles: ["images"]
+
+  app:
+    environment:
+      VLLM_URL: http://vllm:8000/v1
+      COMFYUI_URL: http://comfyui:8188
+    depends_on:
+      vllm:
+        condition: service_healthy
+
+  worker:
+    environment:
+      VLLM_URL: http://vllm:8000/v1
+      COMFYUI_URL: http://comfyui:8188

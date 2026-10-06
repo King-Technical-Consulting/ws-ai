@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/* Tokens from the ws design system (claude.ai/artifact/SHvCNWYRv9D64Km7kjYnqV).
+   Palette and serif voice come from jeremyking.co; dark is a derived walnut.
+   Never hard-code a color or use Tailwind's palette. See docs/DESIGN.md. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-serif: Georgia, "Bitstream Charter", "Times New Roman", serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* paper */
+  --color-bg: #faf8f5;
+  --color-bg-2: #f0ebe4;
+  --color-bg-3: #e8e2d8;
+  /* ink */
+  --color-fg: #2c2416;
+  --color-ink-2: #4a3f30;
+  --color-fg-2: #6b5f4f;
+  --color-fg-3: #8a7e6e;
+  --color-fg-4: #a89880;
+  /* rules */
+  --color-line: #d8d0c4;
+  --color-line-soft: #e8e2d8;
+  /* the one hue */
+  --color-accent: #b85a1a;
+  --color-accent-hover: #c06020;
+  --color-accent-strong: #a0522d;
+  --color-accent-fg: #ffffff;
+  --color-link-underline: #c9a882;
+  --color-danger: #cc272e;
+
+  --radius-code: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #1b1611;
+    --color-bg-2: #231d17;
+    --color-bg-3: #2e261f;
+    --color-fg: #eee6d9;
+    --color-ink-2: #d8ccba;
+    --color-fg-2: #b6a893;
+    --color-fg-3: #998b77;
+    --color-fg-4: #7a6e5f;
+    --color-line: #3d3329;
+    --color-line-soft: #2e261f;
+    --color-accent: #e0894a;
+    --color-accent-hover: #eb9a5e;
+    --color-accent-strong: #cf8c63;
+    --color-accent-fg: #1b1611;
+    --color-link-underline: #7d5d40;
+    --color-danger: #ef6b5f;
+  }
+}
+
+html, body { background: var(--color-bg); color: var(--color-fg); -webkit-font-smoothing: antialiased; }
+* { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
+
+/* Reading voice: 17px Georgia, 1.65 leading, the site's measure. */
+.reading { font-family: var(--font-serif); font-size: 17px; line-height: 1.65; }
+.reading-tight { font-family: var(--font-serif); font-size: 17px; line-height: 1.4; }
+/* Page title: 1.6em regular, never bold. */
+.page-title { font-family: var(--font-serif); font-size: 27.2px; line-height: 1.25; font-weight: 400; letter-spacing: .02em; }
+/* Italic meta and taglines. */
+.meta { font-family: var(--font-serif); font-style: italic; font-size: 14.45px; line-height: 1.5; color: var(--color-fg-3); }
+.tagline { font-family: var(--font-serif); font-style: italic; font-size: 15.6px; line-height: 1.5; }
+/* Small-caps section head, jeremyking.co h2. */
+.section-head { font-family: var(--font-serif); font-size: 17px; line-height: 1.65; font-weight: 400; font-variant: small-caps; letter-spacing: .15em; color: var(--color-fg-3); padding-bottom: .2em; border-bottom: 1px solid var(--color-line-soft); text-transform: lowercase; }
+/* Wordmark: ws in small caps. */
+.wordmark { font-family: var(--font-serif); font-size: 18.7px; line-height: 1.5; font-variant: small-caps; letter-spacing: .2em; color: var(--color-fg-3); }
+.wordmark:hover { color: var(--color-accent-hover); }
+/* Pulsing italic "Thinking…". */
+.thinking { font-family: var(--font-serif); font-style: italic; font-size: 15.6px; color: var(--color-fg-3); animation: ws-pulse 2s cubic-bezier(.4,0,.6,1) infinite; }
+@keyframes ws-pulse { 50% { opacity: .5; } }
+/* Placeholders are italic fg-4. */
+::placeholder { color: var(--color-fg-4); font-style: italic; opacity: 1; }
+textarea::placeholder { font-family: var(--font-serif); }
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Prose: jeremyking.co .prose on ws's spacing. */
+.prose-ws { font-family: var(--font-serif); font-size: 17px; line-height: 1.65; word-spacing: .05em; color: var(--color-fg); }
+.prose-ws :is(p, ul, ol, pre, blockquote, table) { margin: 0.6em 0; }
+.prose-ws h1 { font-size: 1.6em; font-weight: 400; letter-spacing: .02em; line-height: 1.25; margin: 1em 0 .4em; }
+.prose-ws h2 { font-size: 1em; font-weight: 400; font-variant: small-caps; letter-spacing: .15em; color: var(--color-fg-3); margin: 1.6em 0 .6em; padding-bottom: .2em; border-bottom: 1px solid var(--color-line-soft); text-transform: lowercase; }
+.prose-ws h3 { font-size: 1em; font-weight: 400; font-style: italic; color: var(--color-ink-2); margin: 1.2em 0 .4em; }
+.prose-ws :is(h4, h5, h6) { font-size: 1em; font-weight: 400; margin: 1em 0 .4em; }
+.prose-ws strong { font-weight: 500; }
+.prose-ws a { color: var(--color-accent); text-decoration: none; border-bottom: 1px dotted var(--color-link-underline); }
+.prose-ws a:visited { color: var(--color-accent-strong); }
+.prose-ws a:hover { color: var(--color-accent-hover); border-bottom: 1px solid var(--color-accent-hover); }
+.prose-ws ul { list-style: disc; padding-left: 1.2em; }
+.prose-ws ol { list-style: decimal; padding-left: 1.4em; }
+.prose-ws li { margin-bottom: .4em; }
+.prose-ws blockquote { font-size: .92em; padding: 0 1.5em; border-left: 1px dotted var(--color-fg-3); color: var(--color-ink-2); margin: 1.2em 0; }
+.prose-ws pre { background: var(--color-bg-2); border-radius: var(--radius-code); padding: .8em 1em; overflow-x: auto; font-size: .82em; font-family: var(--font-mono); line-height: 1.5; }
+.prose-ws code:not(pre code) { background: var(--color-bg-2); padding: .1em .3em; border-radius: var(--radius-code); font-size: .85em; font-family: var(--font-mono); }
+.prose-ws hr { border: none; border-top: 1px solid var(--color-line-soft); margin: 2em 0; }
+.prose-ws table { border-collapse: collapse; font-size: .92em; }
+.prose-ws :is(td, th) { border: 1px solid var(--color-line); padding: 0.3em 0.6em; }
+.prose-ws th { font-weight: 400; font-variant: small-caps; letter-spacing: .1em; color: var(--color-fg-3); text-align: left; }
+.prose-ws img { border-radius: var(--radius-code); max-width: 100%; }

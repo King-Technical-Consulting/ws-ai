@@ -1,0 +1,30 @@
+# gpt-oss-120b (MXFP4, ~65 GB) on one H100 80 GB with vLLM. Secure cloud.
+# $WS_RENTAL_API_KEY and $HF_TOKEN are expanded from the ws process
+# environment when the machine starts; nothing secret lives in this file.
+name: h100-gpt-oss-120b
+provider: runpod
+description: gpt-oss-120b on one H100 80 GB, vLLM, warm in about 6 to 10 minutes
+gpu: NVIDIA H100 80GB HBM3
+gpu_count: 1
+cloud_type: secure
+image: vllm/vllm-openai:latest
+model: openai/gpt-oss-120b
+args: --model openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --api-key $WS_RENTAL_API_KEY --max-model-len 131072 --gpu-memory-utilization 0.92
+env:
+  HF_TOKEN: $HF_TOKEN
+  HF_HOME: /workspace/hf
+port: 8000
+disk_gb: 40
+volume_gb: 150
+volume_path: /workspace
+idle_timeout: 20m
+max_hours: 6
+warmup_timeout: 25m
+hourly_usd: 2.69
+endpoint:
+  id: rental/gpt-oss-120b-h100
+  display_name: gpt-oss-120b (rented H100)
+  capabilities: { context_window: 131072, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true }
+  # 0 means per-token rows are free and the hours carry the cost; set an
+  # amortized estimate here if the cost-aware router should compare it.
+  pricing: { input_per_m: 0, output_per_m: 0 }

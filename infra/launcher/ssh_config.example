@@ -1,0 +1,22 @@
+# ssh_config for the Claude Code launcher inside the ws containers.
+# Copy to secrets/ssh_config and set WS_CC_SSH_CONFIG=/secrets/ssh_config.
+# One Host block per launcher target; the alias is the `host` in targets.toml.
+
+# The box the containers run on, reached through Docker's host gateway.
+Host hostbox
+    HostName host.docker.internal
+    User jking323
+    IdentityFile /secrets/wsj_ed25519
+    IdentitiesOnly yes
+    UserKnownHostsFile /secrets/known_hosts
+    StrictHostKeyChecking yes
+
+# Another machine on the tailnet (the containers must be able to reach it:
+# the tailscale sidecar profile, or the host's tailnet via the gateway).
+Host homelab
+    HostName homelab.tailnet.ts.net
+    User jking323
+    IdentityFile /secrets/wsj_ed25519
+    IdentitiesOnly yes
+    UserKnownHostsFile /secrets/known_hosts
+    StrictHostKeyChecking yes

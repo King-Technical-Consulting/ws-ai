@@ -1,0 +1,74 @@
+# Default routing policy. Lower priority number wins. Rules are evaluated
+# top-down; the first match supplies the ordered preference list, and the
+# gateway fails over down that list on retryable errors.
+#
+# Endpoint ids refer to config/endpoints.yaml. Endpoints whose provider is
+# not configured on this box (missing base_url_env) are skipped automatically.
+
+name: default
+priority: 100
+
+rules:
+  # The task router's classifier (internal/ccrouter): one short JSON
+  # verdict per prompt the rules could not place. Only spawn_job sends
+  # task class `classify`; chat turns are `chat` or `code` and never match
+  # this rule. Cerebras first for speed (gpt-oss-120b, pinned through
+  # OpenRouter), local behind it, and no other hosted model: a prompt the
+  # rules did not flag as sensitive goes to Cerebras, nowhere else.
+  - match: { task_class: [classify] }
+    prefer:
+      - openrouter/openai/gpt-oss-120b@cerebras
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+
+  # Cheap housekeeping goes local first, then the cheapest hosted model.
+  - match: { task_class: [summarize, title, reflect] }
+    prefer:
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+      - anthropic/claude-haiku-4-5
+      - openrouter/deepseek/deepseek-chat-v3
+
+  # Embeddings (agent memory): local first, OpenAI behind it. Both are
+  # 768 wide, which agent_memory.embedding requires.
+  - match: { task_class: [embed] }
+    prefer:
+      - local-llama/nomic-embed-text
+      - openai/text-embedding-3-small
+
+  # Images (M6): only media endpoints qualify, so a text model is never
+  # tried. Put a local ComfyUI endpoint first here once one exists. Video
+  # has no endpoint in the seed yet; without a rule the router falls back
+  # to any enabled video endpoint.
+  - match: { task_class: [image] }
+    prefer:
+      - openai/gpt-image-1
+
+  # Coding and agent work wants the strongest tool-caller available.
+  - match: { task_class: [code] }
+    require: { tools: true }
+    prefer:
+      - anthropic/claude-opus-5-5
+      - local-vllm/qwen3-coder-next
+      - anthropic/claude-sonnet-5-5
+
+  - match: { task_class: [vision] }
+    require: { vision: true }
+    prefer:
+      - anthropic/claude-sonnet-5-5
+      - local-vllm/qwen3.6-35b-a3b
+      - openrouter/google/gemini-2.5-pro
+
+  # Everything else: good default chat model, with cheaper fallbacks.
+  - match: {}
+    prefer:
+      - anthropic/claude-sonnet-5-5
+      - local-vllm/qwen3.6-35b-a3b
+      - openrouter/deepseek/deepseek-chat-v3
+      - local-llama/gpt-oss-20b
+
+aliases:
+  best:  [anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5]
+  cheap: [local-llama/gpt-oss-20b, local-llama/qwen3-14b, anthropic/claude-haiku-4-5]
+  local: [local-vllm/qwen3-coder-next, local-vllm/qwen3.6-35b-a3b, local-llama/gpt-oss-20b, local-llama/qwen3-14b]
+  code:  [anthropic/claude-opus-5-5, local-vllm/qwen3-coder-next, anthropic/claude-sonnet-5-5]

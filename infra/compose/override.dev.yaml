@@ -1,0 +1,9 @@
+# Laptop development: only Postgres in Docker, the Go binary and Vite run
+# natively. `make db-up` uses this.
+#
+#   docker compose -f compose.yaml -f override.dev.yaml up -d postgres
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"

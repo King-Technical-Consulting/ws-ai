@@ -1,0 +1,18 @@
+# Web host only, no local inference: Postgres, app, worker. Models come from
+# hosted providers whose keys are set in .env (ANTHROPIC_API_KEY,
+# OPENROUTER_API_KEY, OPENAI_API_KEY). Add a GPU override later or point
+# LLAMA_SERVER_URL / VLLM_URL / MAC_STUDIO_URL at another box over Tailscale.
+#
+#   make up HW=cloud INGRESS=cloudflare
+#
+# For LAN or tailnet testing without an ingress, uncomment the ports below
+# and set WS_PUBLIC_URL=http://<host>:8080, WS_ARTIFACT_URL=http://<host>:8081,
+# WS_ENV=dev (plain http needs non-Secure cookies). Passkeys require https,
+# so sign in with magic links in that mode.
+
+# Host ports are configurable because shared boxes often have 8080/8081 taken.
+services:
+  app:
+    ports:
+      - "${WS_BIND_ADDR:-127.0.0.1}:${WS_HTTP_PORT:-8080}:8080"
+      - "${WS_BIND_ADDR:-127.0.0.1}:${WS_ART_PORT:-8081}:8081"
