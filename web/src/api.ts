@@ -42,6 +42,9 @@ export type User = { id: string; email: string; display_name: string; role: 'own
 
 // ---- training flywheel (PLAN M10) ----
 
+/** One base model from the hub search (`GET /api/training/models?q=`). */
+export type HubModel = { id: string; downloads: number; likes: number; params?: number; gated: boolean }
+
 export type DatasetFilters = {
   modes?: string[]
   models?: string[]
@@ -68,8 +71,11 @@ export type Dataset = {
   built_at: string | null
 }
 
-export type FinetuneConfig = { epochs?: number; learning_rate?: number; rank?: number; alpha?: number; max_seq_len?: number; image?: string; target?: 'local' | 'rental' }
-export type FinetuneTarget = { id: 'local' | 'rental'; label: string }
+export type FinetuneTargetID = 'local' | 'remote' | 'rental'
+export type FinetuneConfig = { epochs?: number; learning_rate?: number; rank?: number; alpha?: number; max_seq_len?: number; image?: string; target?: FinetuneTargetID }
+export type FinetuneTarget = { id: FinetuneTargetID; label: string }
+export type TrainingExample = { messages: { role: string; content?: string; tool_call_id?: string; tool_calls?: { function: { name: string; arguments: string } }[] }[]; meta: { conversation_id: string; message_id: string; mode?: string; model?: string; rating?: number } }
+export type TrainingRoute = { task_class: string; endpoint: string }
 
 export type FinetuneJob = {
   id: string

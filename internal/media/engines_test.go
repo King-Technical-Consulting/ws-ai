@@ -527,3 +527,24 @@ func TestDimensionsAndDefaults(t *testing.T) {
 		t.Error("default is 5")
 	}
 }
+
+func TestComfyUIFillDropsNotesThatAreNotNodes(t *testing.T) {
+	// A "_comment" string at the top level made ComfyUI refuse the whole
+	// workflow (its validator calls .get on every entry; board e5ff). The
+	// filled workflow carries nodes only.
+	tmpl := `{"_comment": "notes for humans", "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "{{model}}"}}, "5": {"class_type": "EmptyLatentImage", "inputs": {"width": {{width}}, "height": {{height}}, "batch_size": {{batch}}}}}`
+	ep := &gateway.Endpoint{ID: "comfyui/sdxl", ExtraBody: map[string]any{}}
+	wf, err := fill(tmpl, ep, &Request{Prompt: "a lighthouse", Model: "sd_xl_base_1.0.safetensors", Size: "512x512"}, "", "", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wf["_comment"]; ok {
+		t.Error("the note was posted to ComfyUI")
+	}
+	if len(wf) != 2 || wf["4"].(map[string]any)["inputs"].(map[string]any)["ckpt_name"] != "sd_xl_base_1.0.safetensors" {
+		t.Errorf("workflow = %v", wf)
+	}
+	if _, err := fill(`{"_comment": "only a note"}`, ep, &Request{Prompt: "x"}, "", "", 1); err == nil {
+		t.Error("a workflow with no nodes must be refused before it reaches ComfyUI")
+	}
+}

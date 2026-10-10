@@ -11,6 +11,9 @@ SELECT * FROM cc_route_decisions ORDER BY created_at DESC LIMIT $1;
 -- already known refreshes its handle fields and liveness; it never moves
 -- the job to another user or source.
 
+-- inserted is true when this call created the row (xmax is 0 on a fresh
+-- tuple, non-zero on one ON CONFLICT updated), decided in the same
+-- statement so two reports of the same new job cannot both count it.
 -- name: UpsertCCJob :one
 INSERT INTO cc_jobs (id, user_id, target, session, "window", cwd, lane, model, source, status, started_at, seen_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
@@ -20,7 +23,7 @@ ON CONFLICT (id) DO UPDATE SET
     status = EXCLUDED.status, seen_at = now(),
     ended_at = CASE WHEN EXCLUDED.status = 'dead' THEN COALESCE(cc_jobs.ended_at, now()) ELSE NULL END,
     updated_at = now()
-RETURNING *;
+RETURNING sqlc.embed(cc_jobs), (xmax = 0) AS inserted;
 
 -- name: GetCCJob :one
 SELECT * FROM cc_jobs WHERE id = $1;

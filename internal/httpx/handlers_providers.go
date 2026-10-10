@@ -36,13 +36,16 @@ func viewProvider(p store.Provider, reg *gateway.Registry) providerView {
 		v.APIKeyEnv = *p.ApiKeyEnv
 	}
 	_ = json.Unmarshal(p.Headers, &v.Headers)
-	_, v.Configured = reg.Provider(p.ID)
+	rp, loaded := reg.Provider(p.ID)
+	// A hosted provider loaded without a server key is registered but not
+	// configured for the box: only people with their own key reach it.
+	v.Configured = loaded && !(rp.Hosted && rp.APIKey == "")
 	if !v.Configured {
 		switch {
 		case v.BaseURLEnv != "" && os.Getenv(v.BaseURLEnv) == "":
 			v.Reason = v.BaseURLEnv + " is not set on this box"
 		case v.APIKeyEnv != "" && os.Getenv(v.APIKeyEnv) == "":
-			v.Reason = v.APIKeyEnv + " is not set on this box"
+			v.Reason = v.APIKeyEnv + " is not set on this box; only people who saved their own key can use it"
 		default:
 			v.Reason = "not loaded yet; the registry reloads within 30 s"
 		}

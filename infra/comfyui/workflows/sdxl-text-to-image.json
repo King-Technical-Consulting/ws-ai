@@ -1,5 +1,4 @@
 {
-  "_comment": "SDXL text to image for ws (internal/media, engine comfyui). API-format workflow; ws fills the {{placeholders}} before queueing it. {{model}} is the endpoint's model name (the checkpoint file). Export your own from ComfyUI with 'Save (API format)' and put the placeholders where the prompt, size, seed and batch go.",
   "4": {
     "class_type": "CheckpointLoaderSimple",
     "inputs": { "ckpt_name": "{{model}}" }

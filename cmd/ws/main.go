@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/jking323/ws/internal/mcpserver"
 	"github.com/jking323/ws/internal/media"
 	"github.com/jking323/ws/internal/sandbox"
+	"github.com/jking323/ws/internal/sealed"
 	"github.com/jking323/ws/internal/secrets"
 	"github.com/jking323/ws/internal/store"
 	"github.com/jking323/ws/internal/store/blob"
@@ -140,9 +142,29 @@ func buildGateway(ctx context.Context, cfg *config.Config, db *store.DB, log *sl
 		return nil, fmt.Errorf("load policies: %w", err)
 	}
 	router := gateway.NewRouter(reg, policies)
+	// Speed measurements outlive the process: load last time's, write each
+	// new one through. A write that fails costs nothing but the memory.
+	if rows, err := db.ListEndpointThroughput(ctx); err == nil {
+		for _, r := range rows {
+			router.Throughput().Load(r.EndpointID, gateway.ThroughputStat{TokensPerSec: r.TokensPerSec, TTFTMS: r.TtftMs, Samples: int(r.Samples)}, r.UpdatedAt)
+		}
+	} else {
+		log.Warn("endpoint throughput: load", "err", err)
+	}
+	router.Throughput().Persist = func(id string, s gateway.ThroughputStat, at time.Time) {
+		bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := db.UpsertEndpointThroughput(bg, store.UpsertEndpointThroughputParams{EndpointID: id, TokensPerSec: s.TokensPerSec, TtftMs: s.TTFTMS, Samples: int32(s.Samples), UpdatedAt: at}); err != nil {
+			log.Warn("endpoint throughput: persist", "endpoint", id, "err", err)
+		}
+	}
 	gw := gateway.New(reg, router, &store.UsageRecorder{DB: db, Log: log}, log)
+	secretBox := secretsBox(cfg, log)
+	keyStore := &store.KeyStore{DB: db, Box: secretBox}
+	gw.Keys = keyStore
 	gw.RegisterAdapter(gateway.ProviderAnthropic, anthropicad.New())
 	gw.RegisterAdapter(gateway.ProviderOpenAICompat, openaicompat.New())
+	gw.Priority = newPriorityFunc(db)
 	gw.Use(gateway.BudgetMiddleware(&store.BudgetStore{DB: db}, log))
 
 	// serve and worker are separate processes; each polls Postgres for the
@@ -182,6 +204,8 @@ func buildGateway(ctx context.Context, cfg *config.Config, db *store.DB, log *sl
 // stack is everything both roles share above the gateway.
 type stack struct {
 	gw        *gateway.Gateway
+	secrets   *sealed.Box
+	keyStore  *store.KeyStore
 	blobs     blob.Store
 	artifacts *artifacts.Service
 	runtime   *agent.Runtime
@@ -336,7 +360,7 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	tools.Add(agents.NewRememberTool(mem))
 	tools.Add(agents.NewRecallTool(mem))
 	// Agent presets: starting points for the new-agent form, from disk.
-	if presets, warn, err := agents.LoadPresets(cfg.PresetsDir, func(name string) bool { _, ok := tools.Get(name); return ok }); err != nil {
+	if presets, warn, err := agents.LoadPresets(cfg.PresetsDir, presetToolKnown(tools)); err != nil {
 		log.Warn("agent presets", "dir", cfg.PresetsDir, "err", err)
 	} else {
 		ags.Presets = presets
@@ -385,7 +409,7 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 			}
 			aliases := map[string][]string{}
 			for _, p := range gw.Router.Policies() {
-				for k, v := range p.Aliases {
+				for k, v := range p.Selectors() {
 					if _, ok := aliases[k]; !ok {
 						aliases[k] = v
 					}
@@ -394,26 +418,52 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 			return models, aliases
 		}
 	}
-	return &stack{gw: gw, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, rental: rent, training: trn}, nil
+	ks, _ := gw.Keys.(*store.KeyStore)
+	var box *sealed.Box
+	if ks != nil {
+		box = ks.Box
+	}
+	return &stack{gw: gw, secrets: box, keyStore: ks, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, rental: rent, training: trn}, nil
 }
 
 // buildTraining wires the training service. The targets a job can name
 // are declared from the config in both roles (serve accepts the job,
-// the worker runs it): local when a trainer image is configured, rental
-// when WS_FINETUNE_TEMPLATE names a trainer-kind rental template whose
+// the worker runs it): local when a trainer image is configured, remote
+// when WS_FINETUNE_URL names a trainer box, rental when
+// WS_FINETUNE_TEMPLATE names a trainer-kind rental template whose
 // provider is configured. The runners themselves exist on the worker
 // only; a declared target the worker cannot build fails the job with
 // the reason on its row.
 func buildTraining(ctx context.Context, cfg *config.Config, db *store.DB, gw *gateway.Gateway, blobs blob.Store, rent *rental.Controller, log *slog.Logger, worker bool) *training.Service {
 	t := &training.Service{
 		DB: db, Blobs: blobs, GW: gw, Log: log, JudgeSelector: cfg.TrainingJudge,
-		Endpoint: func(id string) (*gateway.Endpoint, bool) { return gw.Registry.Endpoint(id) },
-		Reload:   func(ctx context.Context) error { return db.LoadRegistry(ctx, gw.Registry) },
+		// The base model picker searches the hub through the server; the
+		// token (when set) lets it see gated and private models too.
+		Hub:            &training.Hub{Token: os.Getenv("HF_TOKEN")},
+		Endpoint:       func(id string) (*gateway.Endpoint, bool) { return gw.Registry.Endpoint(id) },
+		Reload:         func(ctx context.Context) error { return db.LoadRegistry(ctx, gw.Registry) },
+		ReloadPolicies: func(ctx context.Context) error { return db.ReloadPolicies(ctx, gw.Router) },
+		// What the other policies prefer for a task class: the fallbacks a
+		// training-adapters rule keeps behind the adapter.
+		BasePrefer: func(tc string) []string {
+			var others []gateway.Policy
+			for _, p := range gw.Router.Policies() {
+				if p.Name != training.AdapterPolicy {
+					others = append(others, p)
+				}
+			}
+			prefs, _ := gateway.PreferredBy(others, gateway.RouteInput{Selector: "auto", TaskClass: gateway.TaskClass(tc)}, nil)
+			return prefs
+		},
 	}
 	tpl, rentable := finetuneTemplate(cfg, rent, log)
-	targets := &training.Targets{RentalLabel: tpl.Name}
+	remote := &training.RemoteRunner{URL: cfg.FinetuneURL, Key: func() string { return os.Getenv("WS_FINETUNE_KEY") }, Log: log}
+	targets := &training.Targets{RentalLabel: tpl.Name, RemoteLabel: remote.Host()}
 	if cfg.FinetuneImage != "" {
 		t.Available = append(t.Available, training.Target{ID: training.TargetLocal, Label: "this worker's GPU"})
+	}
+	if cfg.FinetuneURL != "" {
+		t.Available = append(t.Available, training.Target{ID: training.TargetRemote, Label: training.RemoteLabel(remote.Host())})
 	}
 	if rentable {
 		t.Available = append(t.Available, training.Target{ID: training.TargetRental, Label: "rented GPU (" + tpl.Name + ")"})
@@ -434,11 +484,15 @@ func buildTraining(ctx context.Context, cfg *config.Config, db *store.DB, gw *ga
 			log.Info("training: local fine-tune runner", "image", cfg.FinetuneImage, "gpus", cfg.FinetuneGPUs)
 		}
 	}
+	if cfg.FinetuneURL != "" {
+		targets.Remote = remote
+		log.Info("training: trainer box", "url", cfg.FinetuneURL, "key", cfg.FinetuneKey != "")
+	}
 	if rentable {
 		targets.Rental = &training.RentalRunner{Rental: rent, Template: tpl.Name, Key: func() string { return os.Getenv("WS_RENTAL_API_KEY") }, Log: log}
 		log.Info("training: rented fine-tune runner", "template", tpl.Name, "provider", tpl.Provider, "gpu", tpl.GPU)
 	}
-	if targets.Local != nil || targets.Rental != nil {
+	if targets.Local != nil || targets.Remote != nil || targets.Rental != nil {
 		t.Runner = targets
 	}
 	return t
@@ -501,7 +555,7 @@ func buildSandbox(ctx context.Context, cfg *config.Config, db *store.DB, log *sl
 	}
 	m, err := sandbox.New(ctx, db, log, sandbox.Config{
 		Image: cfg.SandboxImage, Network: network, ProxyURL: proxyURL, Runtime: cfg.SandboxRuntime,
-		MemoryMB: cfg.SandboxMemoryMB, CPUs: cfg.SandboxCPUs, IdleStop: idle, Remove: remove,
+		Jail: cfg.SandboxJail, MemoryMB: cfg.SandboxMemoryMB, CPUs: cfg.SandboxCPUs, IdleStop: idle, Remove: remove,
 	})
 	if err != nil {
 		return nil, err
@@ -609,22 +663,23 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 	srv := &httpx.Server{
-		Cfg: cfg, DB: db, Auth: authSvc, GW: gw,
-		Chat:      &chat.Service{DB: db, GW: gw, Runtime: st.runtime, Log: log, Enqueue: st.jobs.EnqueueRun},
-		Artifacts: art,
-		Jobs:      st.jobs,
-		Worker:    worker,
-		Preview:   preview,
-		GitHub:    buildGitHub(cfg, db, log),
-		CCJobs:    st.ccJobs,
-		MCP:       st.mcp,
-		Media:     st.media,
-		Blobs:     st.blobs,
-		Agents:    st.agents,
-		Rental:    st.rental,
-		Training:  st.training,
-		Log:       log,
-		Web:       web.Dist(),
+		Cfg: cfg, DB: db, Auth: authSvc, GW: gw, Secrets: st.secrets, KeyStore: st.keyStore,
+		Chat:                &chat.Service{DB: db, GW: gw, Runtime: st.runtime, Log: log, Enqueue: st.jobs.EnqueueRun},
+		Artifacts:           art,
+		Jobs:                st.jobs,
+		Worker:              worker,
+		Preview:             preview,
+		GitHub:              buildGitHub(cfg, db, log),
+		CCJobs:              st.ccJobs,
+		MCP:                 st.mcp,
+		Media:               st.media,
+		Blobs:               st.blobs,
+		Agents:              st.agents,
+		GitHubWebhookSecret: cfg.GitHubWebhookSecret,
+		Rental:              st.rental,
+		Training:            st.training,
+		Log:                 log,
+		Web:                 web.Dist(),
 	}
 	h := &http.Server{
 		Addr:              cfg.Listen,
@@ -702,4 +757,75 @@ func worker(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return st.jobs.Stop(sctx)
+}
+
+// presetToolKnown says whether a preset's tool name is one the deployment
+// can offer. The serve role registers no sandbox or git tools (the worker
+// does), so those names count as known here or every boot warns about
+// presets that are fine.
+func presetToolKnown(tools *agent.Registry) func(string) bool {
+	return func(name string) bool {
+		if _, ok := tools.Get(name); ok {
+			return true
+		}
+		for _, n := range sandbox.ToolNames {
+			if n == name {
+				return true
+			}
+		}
+		for _, n := range sandbox.GitToolNames {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// secretsBox seals people's own provider keys. Without WS_SECRETS_KEY it is
+// nil and saving a key is refused, so a key is never stored unsealed; a key
+// that cannot be read is logged and treated the same way.
+func secretsBox(cfg *config.Config, log *slog.Logger) *sealed.Box {
+	if cfg.SecretsKey == "" {
+		return nil
+	}
+	b, err := sealed.New(cfg.SecretsKey)
+	if err != nil {
+		log.Warn("WS_SECRETS_KEY is set but unusable: people cannot save their own provider keys", "err", err)
+		return nil
+	}
+	return b
+}
+
+// newPriorityFunc ranks requests for a full local endpoint by who sent them:
+// the owner's go ahead of everyone else's. Roles are cached for a minute so
+// the lookup is not a query per request; an unknown user ranks as a member.
+func newPriorityFunc(db *store.DB) func(context.Context, gateway.Metadata) int {
+	type entry struct {
+		prio int
+		at   time.Time
+	}
+	var mu sync.Mutex
+	cache := map[string]entry{}
+	return func(ctx context.Context, md gateway.Metadata) int {
+		if md.UserID == "" {
+			return gateway.PriorityDefault
+		}
+		mu.Lock()
+		e, ok := cache[md.UserID]
+		mu.Unlock()
+		if ok && time.Since(e.at) < time.Minute {
+			return e.prio
+		}
+		prio := gateway.PriorityMember
+		if id, err := uuid.Parse(md.UserID); err == nil {
+			if u, err := db.GetUserByID(ctx, id); err == nil && u.Role == "owner" {
+				prio = gateway.PriorityOwner
+			}
+		}
+		mu.Lock()
+		cache[md.UserID] = entry{prio, time.Now()}
+		mu.Unlock()
+		return prio
+	}
 }

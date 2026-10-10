@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sync"
 )
 
@@ -108,7 +109,9 @@ func (wr *Writer) ReasoningStart(id string) error {
 func (wr *Writer) ReasoningDelta(id, delta string) error {
 	return wr.send(Part{"type": "reasoning-delta", "id": id, "delta": delta})
 }
-func (wr *Writer) ReasoningEnd(id string) error { return wr.send(Part{"type": "reasoning-end", "id": id}) }
+func (wr *Writer) ReasoningEnd(id string) error {
+	return wr.send(Part{"type": "reasoning-end", "id": id})
+}
 
 // Tool parts.
 func (wr *Writer) ToolInputStart(toolCallID, toolName string) error {
@@ -157,7 +160,27 @@ func (wr *Writer) File(url, mediaType string) error {
 
 // Error sends an error part. The client shows errorText.
 func (wr *Writer) Error(errText string) error {
-	return wr.send(Part{"type": "error", "errorText": errText})
+	return wr.send(Part{"type": "error", "errorText": scrubErrorText(errText)})
+}
+
+var (
+	urlInError = regexp.MustCompile(`https?://[^\s"')]+`)
+	// A Go network error names the address without a scheme: "dial tcp
+	// 10.0.0.5:8000", "lookup llama on 127.0.0.11:53", a bare IPv4 address,
+	// a bracketed IPv6 address. A four-part dotted number in other text
+	// (a version) is also replaced; that is rare in an error and the
+	// loss is harmless.
+	netInError = regexp.MustCompile(`dial (tcp|udp)6? [^\s:\[]+(:\d+)?|lookup \S+ on \S+|\[[0-9a-fA-F:.]+\](:\d+)?|\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b`)
+)
+
+// scrubErrorText removes addresses from an error shown to the person
+// chatting. A failed model call carries the upstream address in its message
+// (`Post "http://10.0.0.5:8000/v1/...": dial tcp 10.0.0.5:8000: connection
+// refused`), which is an internal host to anyone but the operator. The full
+// text stays in the server's logs and the ledger.
+func scrubErrorText(s string) string {
+	s = urlInError.ReplaceAllString(s, "<model server>")
+	return netInError.ReplaceAllString(s, "<address>")
 }
 
 // Abort signals the stream was aborted.

@@ -19,10 +19,11 @@ services:
       --parallel 2
       --jinja
       --metrics
+      ${LLAMA_EXTRA_ARGS:-}
     volumes:
       - ../../data/models:/models:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 40

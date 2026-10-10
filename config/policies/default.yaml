@@ -73,6 +73,21 @@ rules:
       - local-vllm/qwen3.6-35b-a3b
       - openrouter/google/gemini-2.5-pro
 
+  # "fast": whatever answers quickest right now. A rule rather than an
+  # alias so it can rank by the decode speed the gateway has measured
+  # (throughput_class is the prior until three replies have been seen),
+  # scaled for how busy each endpoint is. Cerebras is the fastest hosted
+  # option, the local models follow, and Haiku is the hosted fallback.
+  # Send model "fast" on /v1, or make it a key's default policy.
+  - match: { selector: [fast] }
+    rank: throughput
+    prefer:
+      - openrouter/openai/gpt-oss-120b@cerebras
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+      - local-vllm/qwen3.6-35b-a3b
+      - anthropic/claude-haiku-4-5
+
   # Everything else: good default chat model, with cheaper fallbacks.
   - match: {}
     prefer:

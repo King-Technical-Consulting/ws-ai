@@ -15,10 +15,13 @@ contract, which internal/training's RentalRunner speaks:
 A "/v1" prefix is accepted and ignored, since the rental controller hands
 out base URLs ending in /v1. Every request must carry
 "Authorization: Bearer $TRAINER_API_KEY" (the rental key the template
-expands from $WS_RENTAL_API_KEY); the server refuses to start without the
-key, because the provider's proxy makes it reachable from the internet.
-train.py runs as a subprocess with the config as environment, its stdout
-tailed for "progress <fraction>" lines. Only the standard library.
+expands from $WS_RENTAL_API_KEY, or WS_FINETUNE_KEY for a box of your own
+at WS_FINETUNE_URL); the server refuses to start without the key, because
+a rented box is reachable through the provider's proxy and a box of your
+own answers the whole tailnet. The trainer script (train.py, or
+TRAINER_SCRIPT=train_mlx.py on a Mac) runs as a subprocess with the
+config as environment, its stdout tailed for "progress <fraction>"
+lines. Only the standard library, so it runs outside the image too.
 """
 import io
 import json
@@ -33,7 +36,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA = os.environ.get("TRAINER_DATA", "/data")
 OUT = os.environ.get("TRAINER_OUT", "/out")
-TRAIN_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
+# TRAINER_SCRIPT picks the trainer: train.py (Unsloth, CUDA) by default,
+# train_mlx.py on a Mac. A bare name is looked up next to this file.
+_script = os.environ.get("TRAINER_SCRIPT") or "train.py"
+TRAIN_PY = _script if os.path.sep in _script else os.path.join(os.path.dirname(os.path.abspath(__file__)), _script)
 LOG_LINES = 2000
 MAX_BODY = 2 << 30
 
@@ -86,6 +92,7 @@ class Run:
         })
         env.pop("TRAINER_MODE", None)
         env.pop("TRAINER_API_KEY", None)
+        env.pop("TRAINER_SCRIPT", None)
         proc = subprocess.Popen([sys.executable, TRAIN_PY], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         with self.lock:
             self.proc = proc

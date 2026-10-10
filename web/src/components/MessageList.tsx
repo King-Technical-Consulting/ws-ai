@@ -49,9 +49,27 @@ export function MessageList({
   )
 }
 
+/**
+ * Where an answer came from. A message loaded from history carries it in
+ * `metadata` (the server fills it from the stored row), but one streamed in
+ * this session has no metadata: the stream announces it in a `data-model`
+ * part at the start of each step instead. Read that when `metadata` is
+ * absent, taking the last step's, as history does, so the notice shows
+ * without a reload.
+ */
+function routeMeta(m: UIMessage): { model?: string; endpoint?: string } {
+  const meta = (m.metadata ?? {}) as { model?: string; endpoint?: string }
+  if (meta.endpoint) return meta
+  for (let i = m.parts.length - 1; i >= 0; i--) {
+    const p = m.parts[i] as { type: string; data?: { endpoint?: string; model?: string } }
+    if (p.type === 'data-model' && p.data?.endpoint) return { model: p.data.model, endpoint: p.data.endpoint }
+  }
+  return meta
+}
+
 function Message({ m, streaming, onApproval, rating, onRate }: { m: UIMessage; streaming: boolean; onApproval?: OnApproval; rating?: number; onRate?: OnRate }) {
   const isUser = m.role === 'user'
-  const meta = (m.metadata ?? {}) as { model?: string; endpoint?: string }
+  const meta = routeMeta(m)
   const canRate = !isUser && !streaming && !!onRate && m.parts.some((p) => p.type === 'text')
   return (
     <div className={clsx('flex reading', isUser ? 'justify-end' : 'justify-start')}>
@@ -80,6 +98,10 @@ function Message({ m, streaming, onApproval, rating, onRate }: { m: UIMessage; s
               if (p.type === 'tool-create_artifact' || p.type === 'tool-update_artifact') {
                 const tp = p as unknown as { output?: unknown; state: string }
                 return <ArtifactCard key={i} output={tp.output} state={tp.state} />
+              }
+              if (p.type === 'tool-ask_user') {
+                const tp = p as unknown as { input?: { question?: string } }
+                return <QuestionCard key={i} question={tp.input?.question ?? ''} />
               }
               if (p.type === 'tool-generate_image' || p.type === 'tool-generate_video') {
                 const tp = p as unknown as { input?: unknown; output?: unknown; state: string; errorText?: string }
@@ -192,6 +214,16 @@ function GeneratedMedia({ video, input, output, state, errorText }: { video: boo
         {out.endpoint ? ` with ${out.endpoint}` : ''}
         {out.cost_usd ? ` · $${out.cost_usd.toFixed(3)}` : ''}
       </div>
+    </div>
+  )
+}
+
+/** ask_user: the model stopped to ask something. The turn is over; the reply goes in the composer. */
+function QuestionCard({ question }: { question: string }) {
+  return (
+    <div role="note" aria-label="Question from the assistant" className="my-2 rounded-md border border-line bg-bg-2 px-3 py-2">
+      <div className="meta">A question for you</div>
+      <p className="reading-tight mt-1 whitespace-pre-wrap">{question}</p>
     </div>
   )
 }

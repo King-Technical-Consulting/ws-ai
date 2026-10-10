@@ -29,6 +29,9 @@ export default function Media() {
     () => all.filter((m) => (kind === 'image' ? (source ? m.image_edit : m.image) : source ? m.image_to_video : m.video)),
     [all, kind, source],
   )
+  // Every endpoint that could take this request is down (its server does not
+  // answer): the router would refuse the job, so say so before it is sent.
+  const allDown = media.length > 0 && media.every((m) => m.health === 'down')
   const canEdit = all.some((m) => m.image_edit)
   const canAnimate = all.some((m) => m.image_to_video)
   const canUpscale = all.some((m) => m.upscale)
@@ -102,8 +105,11 @@ export default function Media() {
 
   // Use in chat: a new conversation in this project with the image
   // attached to the first message (the chat page reads ?attach=).
+  // Use in design: the same, with the conversation created in design mode
+  // (the server takes `mode` in any project the caller can reach).
   const useInChat = useMutation({
-    mutationFn: (att: Attachment) => api.post<Conversation>(`/api/projects/${projectID}/conversations`, {}).then((c) => ({ c, att })),
+    mutationFn: ({ att, mode }: { att: Attachment; mode?: 'design' }) =>
+      api.post<Conversation>(`/api/projects/${projectID}/conversations`, mode ? { mode } : {}).then((c) => ({ c, att })),
     onSuccess: ({ c, att }) => {
       qc.invalidateQueries({ queryKey: ['convs'] })
       nav(`/c/${c.id}?attach=${att.id}`)
@@ -136,7 +142,7 @@ export default function Media() {
   }
 
   const list = (jobs.data?.jobs ?? []).filter((j) => (kind === 'video' ? j.kind === 'video' : j.kind !== 'video'))
-  const ready = prompt.trim() && projectID && media.length > 0
+  const ready = prompt.trim() && projectID && media.length > 0 && !allDown
 
   return (
     <div className="flex-1 min-h-0 overflow-y-auto">
@@ -164,7 +170,12 @@ export default function Media() {
 
         {models.isSuccess && all.length === 0 && (
           <Callout kind="note">
-            No image or video model is configured. Add a media endpoint in Admin (engines: OpenAI Images, OpenAI Videos, fal.ai, ComfyUI) or in <code className="font-mono text-xs">config/endpoints.yaml</code>, and set its provider's key.
+            <p className="reading">{noEngineNote(kind)}</p>
+          </Callout>
+        )}
+        {models.isSuccess && allDown && (
+          <Callout kind="note">
+            <p className="reading">{downNote(kind, media.map((m) => m.id).sort())}</p>
           </Callout>
         )}
         {models.isSuccess && all.length > 0 && media.length === 0 && (
@@ -173,7 +184,9 @@ export default function Media() {
               ? kind === 'image'
                 ? 'No configured model edits images. Clear the source to generate from the prompt alone.'
                 : 'No configured model animates an image. Clear the source for text to video.'
-              : 'No configured model makes video from text.'}
+              : kind === 'image'
+                ? noEngineNote('image')
+                : 'No configured model makes video from text.'}
           </Callout>
         )}
         {projects.isSuccess && projects.data.length === 0 && (
@@ -319,7 +332,8 @@ export default function Media() {
                 canUpscale={canUpscale}
                 onSource={useAsSource}
                 onUpscale={(a) => upscale.mutate(a)}
-                onChat={(a) => useInChat.mutate(a)}
+                onChat={(a) => useInChat.mutate({ att: a })}
+                onDesign={(a) => useInChat.mutate({ att: a, mode: 'design' })}
                 onRemove={() => remove.mutate(j.id)}
               />
             ))}
@@ -330,9 +344,22 @@ export default function Media() {
   )
 }
 
+// The router's own reason (gateway.NoMediaError), word for word, so the page
+// and a failed job say the same thing.
+function noEngineNote(kind: Kind): string {
+  return `No ${kind} endpoint is configured; the owner sets COMFYUI_URL or a media provider key, or enables one under Admin, endpoints.`
+}
+
+// The router's wording for endpoints that are down (gateway.NoMediaError), less
+// the health error, which /api/models does not carry.
+function downNote(kind: Kind, ids: string[]): string {
+  if (ids.length === 1) return `The ${kind} endpoint ${ids[0]} is down; the owner checks the server it points at (COMFYUI_URL) and Admin, endpoints.`
+  return `Every ${kind} endpoint is down (${ids.join(', ')}); the owner checks the servers they point at and Admin, endpoints.`
+}
+
 function Tab({ active, onClick, disabled, title, children }: { active: boolean; onClick: () => void; disabled?: boolean; title?: string; children: React.ReactNode }) {
   return (
-    <button type="button" onClick={onClick} disabled={disabled} title={title} className={clsx('section-head border-0 px-0', active ? 'text-fg' : 'text-fg-3 hover:text-fg', disabled && 'opacity-50 hover:text-fg-3')}>
+    <button type="button" onClick={onClick} disabled={disabled} title={title} className={clsx('section-head border-0 px-0 min-h-10 md:min-h-0', active ? 'text-fg' : 'text-fg-3 hover:text-fg', disabled && 'opacity-50 hover:text-fg-3')}>
       {children}
     </button>
   )
@@ -347,6 +374,7 @@ function JobCard({
   onSource,
   onUpscale,
   onChat,
+  onDesign,
   onRemove,
 }: {
   job: MediaJob
@@ -357,6 +385,7 @@ function JobCard({
   onSource: (a: Attachment, k: Kind) => void
   onUpscale: (a: Attachment) => void
   onChat: (a: Attachment) => void
+  onDesign: (a: Attachment) => void
   onRemove: () => void
 }) {
   const open = job.status === 'queued' || job.status === 'running'
@@ -419,6 +448,11 @@ function JobCard({
             {!video && job.status === 'done' && job.outputs[0] && (
               <button onClick={() => onChat(job.outputs[0])} className="text-xs text-fg-2 hover:text-fg" title="Start a conversation with this image attached">
                 use in chat
+              </button>
+            )}
+            {!video && job.status === 'done' && job.outputs[0] && (
+              <button onClick={() => onDesign(job.outputs[0])} className="text-xs text-fg-2 hover:text-fg" title="Start a design conversation with this image attached">
+                use in design
               </button>
             )}
             {job.status !== 'running' && (

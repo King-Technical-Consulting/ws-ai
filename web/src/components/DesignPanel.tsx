@@ -48,7 +48,7 @@ export function DesignPanel({ conversationId, settings, onClose }: { conversatio
   })
 
   return (
-    <aside className="w-[46%] min-w-[380px] shrink-0 border-l border-line bg-bg-2 flex flex-col">
+    <aside className="fixed inset-0 z-20 md:static md:z-auto md:w-[46%] md:min-w-[380px] md:shrink-0 border-l border-line bg-bg-2 flex flex-col">
       <header className="h-12 shrink-0 border-b border-line flex items-center gap-2 px-3">
         <span className="min-w-0 flex-1 truncate reading-tight">Design system</span>
         <button onClick={onClose} className="p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="Close" aria-label="Close">

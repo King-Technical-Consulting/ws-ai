@@ -41,6 +41,7 @@ type Config struct {
 	SandboxNetwork     string  `env:"WS_SANDBOX_NETWORK" envDefault:"ws_sandbox-net"`
 	SandboxProxyURL    string  `env:"WS_SANDBOX_PROXY_URL" envDefault:"http://worker:3128"`
 	SandboxRuntime     string  `env:"WS_SANDBOX_RUNTIME" envDefault:"auto"` // auto | runc | runsc
+	SandboxJail        bool    `env:"WS_SANDBOX_JAIL" envDefault:"false"`
 	SandboxMemoryMB    int64   `env:"WS_SANDBOX_MEMORY_MB" envDefault:"4096"`
 	SandboxCPUs        float64 `env:"WS_SANDBOX_CPUS" envDefault:"2"`
 	SandboxIdleStop    string  `env:"WS_SANDBOX_IDLE_STOP" envDefault:"15m"`
@@ -62,6 +63,10 @@ type Config struct {
 	GitHubAppPrivateKey string `env:"GITHUB_APP_PRIVATE_KEY"`      // PEM (\n or base64 ok)
 	GitHubAppKeyFile    string `env:"GITHUB_APP_PRIVATE_KEY_FILE"` // or a path
 	GitHubAppSlug       string `env:"GITHUB_APP_SLUG"`
+	// GitHubWebhookSecret is the App's webhook secret (PLAN M7): with it set,
+	// POST /hooks/github takes the App's deliveries, verified by signature,
+	// and fans them out to every repo_push trigger that names the repository.
+	GitHubWebhookSecret string `env:"GITHUB_WEBHOOK_SECRET"`
 	GitHubToken         string `env:"GITHUB_TOKEN"`
 
 	// EndpointsFile seeds providers/endpoints on boot (idempotent upsert).
@@ -101,6 +106,15 @@ type Config struct {
 	// loopback by default, so the routes are never served to the public
 	// origin (spec §6.5). "*" disables the check. The client address is
 	// what the reverse proxy forwards (X-Forwarded-For / X-Real-IP).
+	// TrustedProxies lists the networks (CIDRs) whose X-Forwarded-For and
+	// X-Real-IP headers are believed. Empty, the default, believes none: the
+	// client address is the TCP peer. Name only the ingress, never a range
+	// that holds the sandbox network.
+	TrustedProxies string `env:"WS_TRUSTED_PROXIES"`
+	// SecretsKey is the base64 of 32 random bytes that seals people's own
+	// provider API keys at rest (AES-256-GCM). Unset, saving a key is
+	// refused: the feature stays off rather than storing keys unsealed.
+	SecretsKey string `env:"WS_SECRETS_KEY"`
 	CCWebAllow string `env:"WS_CC_WEB_ALLOW" envDefault:"100.64.0.0/10,127.0.0.0/8,::1/128"`
 	// CCWeeklyCap is the soft cap on subscription launches per week
 	// (Monday 00:00 UTC), counted locally in cc_launch_counter since
@@ -139,8 +153,14 @@ type Config struct {
 	FinetuneImage    string `env:"WS_FINETUNE_IMAGE"`
 	FinetuneGPUs     string `env:"WS_FINETUNE_GPUS" envDefault:"all"`
 	FinetuneTemplate string `env:"WS_FINETUNE_TEMPLATE"`
-	TrainingDir      string `env:"WS_TRAINING_DIR" envDefault:"data/training"`
-	TrainingJudge    string `env:"WS_TRAINING_JUDGE" envDefault:"auto"`
+	// FinetuneURL is a trainer box the operator runs (the trainer image in
+	// serve mode, or serve.py around the MLX script on a Mac), reached
+	// over the tailnet; FinetuneKey is the bearer key it requires. The
+	// target for a ws whose worker has no GPU.
+	FinetuneURL   string `env:"WS_FINETUNE_URL"`
+	FinetuneKey   string `env:"WS_FINETUNE_KEY"`
+	TrainingDir   string `env:"WS_TRAINING_DIR" envDefault:"data/training"`
+	TrainingJudge string `env:"WS_TRAINING_JUDGE" envDefault:"auto"`
 
 	// WebAuthn relying party. Derived from PublicURL when empty.
 	RPID          string   `env:"WS_RP_ID"`

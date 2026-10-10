@@ -150,17 +150,18 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 
 	// 1. Reconcile pending tool calls left by a previous process or by an
 	//    approval pause: execute decided ones, keep waiting on undecided.
-	paused, err := rt.reconcile(ctx, run, req, policies, sink)
+	outcome, err := rt.reconcile(ctx, run, req, policies, sink)
 	if err != nil {
 		return fail(err)
 	}
-	if paused {
+	if outcome == toolsPaused {
 		sink.Finish("tool-calls")
 		return ErrPaused
 	}
+	asked := outcome == toolsAsked
 
 	// 2. Step loop
-	for int(run.StepCount) < int(run.MaxSteps) {
+	for !asked && int(run.StepCount) < int(run.MaxSteps) {
 		if ctx.Err() != nil {
 			// Client went away mid-run. Leave the run running with a fresh
 			// heartbeat; the reaper will hand it to the worker.
@@ -245,14 +246,19 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 			break
 		}
 		// 3. Tools
-		paused, err := rt.runTools(ctx, run, policies, arow, calls, sink)
+		outcome, err := rt.runTools(ctx, run, policies, arow, calls, sink)
 		sink.FinishStep()
 		if err != nil {
 			return fail(err)
 		}
-		if paused {
+		if outcome == toolsPaused {
 			sink.Finish("tool-calls")
 			return ErrPaused
+		}
+		if outcome == toolsAsked {
+			// The model asked the user something: the turn ends here, the
+			// question on screen, and the user's reply starts the next run.
+			break
 		}
 	}
 
@@ -261,7 +267,7 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 		sink.Data("notice", map[string]string{"text": msg}, false)
 	}
 	sink.Finish("stop")
-	_ = rt.DB.SetRunStatus(bg, store.SetRunStatusParams{ID: run.ID, Status: "done"})
+	_ = rt.DB.FinishRun(bg, run.ID)
 	_ = rt.DB.TouchConversation(bg, run.ConversationID)
 	return nil
 }
@@ -270,10 +276,10 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 // no result yet: approvals that were decided get executed (or denied),
 // undecided ones keep the run paused, and calls abandoned by a crashed
 // process are re-run if idempotent or failed with a clear note otherwise.
-func (rt *Runtime) reconcile(ctx context.Context, run *store.AgentRun, req Request, policies map[string]Policy, sink Sink) (paused bool, err error) {
+func (rt *Runtime) reconcile(ctx context.Context, run *store.AgentRun, req Request, policies map[string]Policy, sink Sink) (toolOutcome, error) {
 	history, err := rt.history(ctx, run.ConversationID)
 	if err != nil {
-		return false, err
+		return toolsDone, err
 	}
 	// find the last assistant message and whether a tool message follows it
 	var last *gateway.Message
@@ -295,7 +301,7 @@ func (rt *Runtime) reconcile(ctx context.Context, run *store.AgentRun, req Reque
 	}
 	_ = history
 	if last == nil {
-		return false, nil
+		return toolsDone, nil
 	}
 	calls := last.Parts
 	answered := map[string]bool{}
@@ -318,14 +324,22 @@ func (rt *Runtime) reconcile(ctx context.Context, run *store.AgentRun, req Reque
 		}
 	}
 	if len(pending) == 0 {
-		return false, nil
+		return toolsDone, nil
 	}
 	return rt.runTools(ctx, run, policies, &lastRow, pending, sink)
 }
 
+// toolOutcome is what a batch of tool calls leaves behind.
+type toolOutcome int
+
+const (
+	toolsDone   toolOutcome = iota // every call has a result; the step loop goes on
+	toolsPaused                    // a call awaits approval; the run is parked
+	toolsAsked                     // ask_user ran; the turn ends and the user's reply starts the next run
+)
+
 // runTools executes a batch of tool calls from assistant row `arow`.
-// Returns paused=true if any call awaits approval.
-func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies map[string]Policy, arow *store.Message, calls []gateway.Part, sink Sink) (bool, error) {
+func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies map[string]Policy, arow *store.Message, calls []gateway.Part, sink Sink) (toolOutcome, error) {
 	bg := context.WithoutCancel(ctx)
 	approvals, _ := rt.DB.ListApprovalsForRun(ctx, run.ID)
 	decided := map[string]store.Approval{}
@@ -333,7 +347,7 @@ func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies m
 		decided[a.ToolCallID] = a
 	}
 	var results []gateway.Part
-	paused := false
+	paused, asked := false, false
 	for _, c := range calls {
 		tool, ok := rt.Tools.Get(c.ToolName)
 		pol := policies[c.ToolName]
@@ -367,7 +381,7 @@ func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies m
 			seq, _ := rt.DB.NextStepSeq(ctx, run.ID)
 			a, err := rt.DB.CreateApproval(ctx, store.CreateApprovalParams{RunID: run.ID, StepSeq: int32(seq), ToolCallID: c.ToolCallID, ToolName: c.ToolName, Args: nonEmptyJSON(c.Args)})
 			if err != nil {
-				return false, err
+				return toolsDone, err
 			}
 			sink.ApprovalRequest(a.ID.String(), c.ToolCallID)
 			paused = true
@@ -418,24 +432,64 @@ func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies m
 		rt.finishStep(bg, step.ID, stepOut, nil, stepErr)
 
 		if c.ToolName == "ask_user" {
-			// hand control back; the user's reply starts a new run
-			paused = false
+			// The question is the tool call itself (the client shows it);
+			// the result above keeps the history well-formed. The turn
+			// ends after this batch instead of calling the model again,
+			// which would have it answer its own question.
+			asked = true
 		}
 	}
 	if len(results) > 0 {
 		seq, err := rt.DB.NextMessageSeq(ctx, run.ConversationID)
 		if err != nil {
-			return false, err
+			return toolsDone, err
 		}
 		b, _ := json.Marshal(results)
 		if _, err := rt.DB.InsertMessage(bg, store.InsertMessageParams{ConversationID: run.ConversationID, Seq: int64(seq), Role: "tool", Parts: b}); err != nil {
-			return false, err
+			return toolsDone, err
 		}
 	}
-	if paused {
-		_ = rt.DB.SetRunStatus(bg, store.SetRunStatusParams{ID: run.ID, Status: "paused_approval"})
+	if !paused {
+		if asked {
+			return toolsAsked, nil
+		}
+		return toolsDone, nil
 	}
-	return paused, nil
+	// Park the run only while a decision is still outstanding. The decision
+	// can land between CreateApproval above and here (an automated approver
+	// answers within a second); then nothing is pending, the park changes
+	// no row, and the calls that were waiting are run now instead of
+	// leaving a paused run that no approval will ever wake.
+	if _, err := rt.DB.PauseRunForApproval(bg, run.ID); err == nil {
+		return toolsPaused, nil
+	}
+	if cur, err := rt.DB.GetRun(bg, run.ID); err != nil || cur.Status != "running" {
+		// cancelled or held by hand meanwhile: keep that status, stop here
+		return toolsPaused, nil
+	}
+	var waiting []gateway.Part
+	for _, c := range calls {
+		if _, done := resultFor(results, c.ToolCallID); !done {
+			waiting = append(waiting, c)
+		}
+	}
+	if len(waiting) == 0 {
+		if asked {
+			return toolsAsked, nil
+		}
+		return toolsDone, nil
+	}
+	return rt.runTools(ctx, run, policies, arow, waiting, sink)
+}
+
+// resultFor reports whether results carries a tool result for callID.
+func resultFor(results []gateway.Part, callID string) (gateway.Part, bool) {
+	for _, p := range results {
+		if p.Kind == gateway.PartToolResult && p.ToolCallID == callID {
+			return p, true
+		}
+	}
+	return gateway.Part{}, false
 }
 
 // ---- helpers ----
@@ -594,10 +648,39 @@ func strPtr(s string) *string {
 	return &s
 }
 
+// tooLongMsg is shown when the conversation does not fit the model's
+// context: the router refused it ("context too small") or the server did
+// (llama.cpp's "exceeds the available context size").
+const tooLongMsg = "This conversation is too long for the model. Start a new conversation, shorten the message, or pick a model with a larger context."
+
+const needsKeyMsg = "This model needs your own API key. Add one under Settings, provider keys, or pick a model that runs on this server."
+
+// noVisionMsg is shown when the attached image is what no model could
+// take: the model picked (or every model the alias covers) is text-only.
+const noVisionMsg = "The attached image needs a model that can read images, and this one cannot. Pick one that can in the model picker, or send the message without the image."
+
+// noVisionNeedsKeyMsg adds why the models that can read images were not
+// used either: they are hosted and the person has no key for them.
+const noVisionNeedsKeyMsg = noVisionMsg + " The models here that read images need an API key: add yours under Settings, provider keys, or the owner adds the provider's key to the server."
+
 func userFacing(err error) string {
+	var noMedia *gateway.NoMediaError
 	switch {
 	case errors.Is(err, gateway.ErrBudgetExceeded):
 		return "Your budget for this period is spent. Ask the owner to raise it, or pick a local model."
+	case errors.As(err, &noMedia):
+		return noMedia.Sentence()
+	case errors.Is(err, gateway.ErrNoRoute) && strings.Contains(err.Error(), "context too small"):
+		return tooLongMsg
+	case errors.Is(err, gateway.ErrNoRoute) && (strings.Contains(err.Error(), "no vision") || strings.Contains(err.Error(), "read images")):
+		if strings.Contains(err.Error(), "own API key") {
+			return noVisionNeedsKeyMsg
+		}
+		return noVisionMsg
+	case errors.Is(err, gateway.ErrNoRoute) && (errors.Is(err, gateway.ErrNeedsOwnKey) || strings.Contains(err.Error(), "own API key") || strings.Contains(err.Error(), "API key of yours")):
+		return needsKeyMsg
+	case strings.Contains(err.Error(), "exceeds the available context size"):
+		return tooLongMsg
 	case errors.Is(err, gateway.ErrNoRoute):
 		return "No model is available for this request right now."
 	case errors.Is(err, context.Canceled):

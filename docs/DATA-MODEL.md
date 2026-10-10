@@ -1,6 +1,6 @@
 # Data model
 
-The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`, `0013_run_pause`, `0014_training`), applied by goose at boot; this page was written from those files and last verified at commit `a6a3e21` (migrations `0005` to `0008` are the only ones added since `bf89aee`). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
+The Postgres schema as migrated. Source of truth is `internal/store/migrations/` (`0001_init`, `0002_agents`, `0003_endpoint_extra_body`, `0004_sandboxes`, `0005_cc_route_decisions`, `0006_usage_session`, `0007_cc_jobs`, `0008_cc_launch_counter`, `0009_media_jobs`, `0010_agents_m7`, `0011_agent_memory`, `0012_rental`, `0013_run_pause`, `0014_training`, `0015_user_provider_keys`, `0016_byok_routing`, `0017_endpoint_throughput`), applied by goose at boot; this page was written from those files and last verified at commit `92ae622` (2026-10-09; `0017_endpoint_throughput` is the newest migration). The schema PLAN.md sketches is larger than what exists; [Planned but not migrated](#planned-but-not-migrated) lists the difference.
 
 Conventions: UUID primary keys from `gen_random_uuid()` (except `usage_ledger` and `sandbox_events`, which use `bigserial`, `providers` and `endpoints`, which use `text` slug ids, and join tables, which use composite keys), `timestamptz` timestamps, `jsonb` for flexible payloads, and `ON DELETE CASCADE` from owning rows. Tables with `updated_at` get a `set_updated_at` trigger, except `sandboxes`, whose queries set `updated_at` explicitly. Extensions: `pgcrypto`, `citext`, and `vector` (pgvector, enabled by `0011`; the pool registers its types at connect). River adds its own tables through its own migration (`jobs.Migrate`), not listed here.
 
@@ -27,7 +27,7 @@ providers ── endpoints          routing_policies   budgets   usage_ledger
 
 | Table | Purpose and notable columns |
 |---|---|
-| `users` | `email` (citext, unique), `display_name`, `role` (`owner` or `member`), `disabled_at`, `training_consent` (since `0014`: only consenting users' conversations are exported into datasets) |
+| `users` | `email` (citext, unique), `display_name`, `role` (`owner` or `member`), `disabled_at` (set by `PUT /api/admin/users/{id}/disabled`; sessions, API keys and sign-ins are refused while set), `training_consent` (since `0014`: only consenting users' conversations are exported into datasets) |
 | `invites` | Single-use invitations. `token_hash` (the raw token is never stored), `role`, `invited_by`, `expires_at`, `used_at`, `used_by` |
 | `passkeys` | WebAuthn credentials: `credential_id`, `public_key`, `sign_count`, `transports`, `aaguid`, backup flags, `name`, `last_used_at` |
 | `magic_links` | Email sign-in tokens: `token_hash`, `expires_at`, `used_at` |
@@ -104,7 +104,7 @@ Every chat turn is a run, so these tables are in use, and since PLAN M7 first cu
 
 | Table | Purpose and notable columns |
 |---|---|
-| `cc_launch_counter` | One row per calendar week (`week`, a timestamptz that is Monday 00:00 UTC, primary key) with a `count` and `updated_at` (`0008`). Incremented when a new `cc_jobs` row is created, in the week the job started; a re-report of a known job is not a launch. The router reads it for the weekly soft cap. It is an approximation: two reports of the same new job that race can both count, and a database error on the lookup is treated as "new" |
+| `cc_launch_counter` | One row per calendar week (`week`, a timestamptz that is Monday 00:00 UTC, primary key) with a `count` and `updated_at` (`0008`). Incremented when a new `cc_jobs` row is created, in the week the job started; a re-report of a known job is not a launch. The router reads it for the weekly soft cap. The upsert of the `cc_jobs` row says in the same statement whether it inserted (`xmax = 0`), so two reports of the same new job that race count it once, and a database error never counts as a launch |
 | `cc_jobs` | The handle of each Claude Code job, for the read-only job tab (`0007`): where a tmux window lives, never what is in it. `id` (text, the tmux handle id), `user_id` (set null on delete), `target`, `session`, `window`, `cwd`, `lane`, `model`, `source` (`wsj`, `router` or `tmux`, the last for a window a refresh found that nobody reported), `status` (`alive`, `dead`, `killed`, `gone`, `unknown`), `started_at`, `seen_at`, `ended_at`, timestamps. tmux stays authoritative for liveness: `status` is what the last refresh saw. No prompt, output or credential is stored. Indexed by `started_at DESC` and, for open jobs, by `target` |
 | `cc_route_decisions` | One row per `spawn_job` call, dry run or not (`0005`). `user_id`, `conversation_id` and `run_id` are nullable foreign keys that set NULL on delete. `prompt_sha256` (the prompt text is never stored), `features` (jsonb: the counts and flags the rules saw, plus a `classification` object when the small-model classifier answered), `lane` (checked against `claude-subscription`, `api`, `openrouter`, `local`), `rule`, `reason`, `target`, `model`, `dry_run`, `job_id` (the tmux handle id), `created_at`. Indexed by `created_at DESC` and by `(lane, created_at DESC)` |
 
@@ -119,6 +119,14 @@ Every chat turn is a run, so these tables are in use, and since PLAN M7 first cu
 | Table | Purpose and notable columns |
 |---|---|
 | `rental_instances` | One row per rented machine (`0012`). `provider` (`runpod`; the column comment also lists `lambda` and `vast`), `template`, `gpu`, `provider_instance_id`, `endpoint_id` (the endpoint registered while it runs), `base_url`, `hourly_usd`, `status` (`provisioning`, `warming`, `ready`, `stopping`, `stopped`, `failed`), `started_by` (set null on delete), `started_at`, `ready_at`, `last_request_at`, `stopped_at`, `hours_used`, `billed_hours` (hours already written to the ledger), `stop_reason`, `error`. Indexes on `started_at` and a partial one on open machines. Each billed hour is a `usage_ledger` row with task class `rental` |
+
+### Bring your own key (`0015`)
+
+| Table | Notes |
+|---|---|
+| `endpoint_throughput` | `0017`. One row per endpoint id: `tokens_per_sec`, `ttft_ms`, `samples`, `updated_at`, what the gateway has measured of an endpoint's decode speed (M8). Written after every counted reply and loaded at boot, so a restart ranks by the last measurement instead of the declared `throughput_class`; a loaded row older than 15 minutes is a prior, not a trusted measurement: it stands in for the declared class when it is higher, and is replaced by fresh replies. No foreign key: endpoint ids come and go with the seed. |
+| `users.shared_provider_keys`, `usage_ledger.own_key` | `0016`. The first lets the owner grant a member the server's shared provider keys (default false; the owner always has them). The second marks a call that ran on the person's own key; the budget sums skip those rows. |
+| `user_provider_keys` | One row per (`user_id`, `provider_id`): `sealed` (AES-256-GCM under `WS_SECRETS_KEY`, bound to the user and provider), `last4`, timestamps. Cascades on user or provider delete. The key is never selectable through the API. |
 
 ### Training flywheel (`0014`, PLAN M10)
 

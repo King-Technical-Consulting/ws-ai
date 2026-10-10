@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -229,21 +230,48 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Health      string               `json:"health"`
 	}
 	var out []model
+	visible := s.providerVisible(r.Context())
 	for _, e := range s.GW.Registry.Endpoints() {
-		if !e.Enabled || e.Capabilities.Embeddings || e.Capabilities.IsMedia() {
+		if !e.Enabled || e.Capabilities.Embeddings || e.Capabilities.IsMedia() || !visible(e.ProviderID) {
 			continue
 		}
 		out = append(out, model{ID: e.ID, DisplayName: e.DisplayName, Provider: e.ProviderID, Local: e.Local, Caps: e.Capabilities, Pricing: e.Pricing, Health: e.Health.Status})
 	}
 	aliases := map[string][]string{"auto": nil}
 	for _, p := range s.GW.Router.Policies() {
-		for k, v := range p.Aliases {
+		for k, v := range p.Selectors() {
 			if _, exists := aliases[k]; !exists {
 				aliases[k] = v
 			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"models": out, "aliases": aliases, "media": s.mediaModels()})
+	writeJSON(w, 200, map[string]any{"models": out, "aliases": aliases, "media": s.mediaModels(visible)})
+}
+
+// providerVisible says which providers' models the caller is shown. A
+// hosted provider the server has no key for is reachable only through a
+// person's own key (gateway/keys.go), so its models are listed only to
+// people who saved one; everyone else sees the list they saw before it
+// was loaded. Other providers are shown to all, and the gateway's own
+// needs-key message covers a member without a key for them.
+func (s *Server) providerVisible(ctx context.Context) func(providerID string) bool {
+	var own map[string]bool
+	loaded := false
+	return func(id string) bool {
+		p, ok := s.GW.Registry.Provider(id)
+		if !ok || !p.Hosted || p.APIKey != "" {
+			return true
+		}
+		if !loaded {
+			loaded = true
+			if pr := Principal(ctx); pr != nil && s.GW.Keys != nil {
+				if acc, err := s.GW.Keys.Access(ctx, pr.UserID.String()); err == nil && acc != nil {
+					own = acc.Own
+				}
+			}
+		}
+		return own[id]
+	}
 }
 
 // apiKeyView is an API key as the UI sees it: never the hash.

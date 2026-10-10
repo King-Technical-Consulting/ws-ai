@@ -20,6 +20,11 @@ func runHealthChecks(ctx context.Context, db *store.DB, gw *gateway.Gateway, log
 	defer tick.Stop()
 	check := func() {
 		for _, p := range gw.Registry.Providers() {
+			if p.Hosted && p.APIKey == "" {
+				// Nothing to probe with; a 401 here would mark the endpoints
+				// down for the people whose own key does work.
+				continue
+			}
 			status, latency, errText := probe(ctx, client, p)
 			for _, e := range gw.Registry.Endpoints() {
 				if e.ProviderID != p.ID {

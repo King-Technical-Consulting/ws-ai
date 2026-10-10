@@ -34,9 +34,10 @@ type Compactor struct {
 	DB  *store.DB
 	GW  *gateway.Gateway
 	Log *slog.Logger
-	// BudgetTokens is the soft ceiling for what is sent (default 60k): small
-	// enough to fit every model we route to, large enough not to summarize
-	// every few turns.
+	// BudgetTokens is the soft ceiling for what is sent (default 60k). A
+	// request's budget is the smaller of this and what the endpoints its
+	// model or alias can route to will take (budgetFor), so a conversation
+	// bound for a 32k local slot is compacted to fit it.
 	BudgetTokens int
 	// KeepRecent messages are never summarized (default 8).
 	KeepRecent int
@@ -51,6 +52,33 @@ func (c *Compactor) budget() int {
 	return 60_000
 }
 
+// replyReserve is the room left for the model's answer inside its context
+// window when the request does not say how much it wants.
+const replyReserve = 4096
+
+// budgetFor is the budget for one request: BudgetTokens, lowered to the
+// largest context window among the endpoints the router could pick for it,
+// less the reply reserve. The window is what the request has to fit; the
+// global number only keeps hosted models from being sent more than needed.
+func (c *Compactor) budgetFor(req *gateway.Request, in *gateway.RouteInput) int {
+	budget := c.budget()
+	if c.GW == nil || c.GW.Router == nil {
+		return budget
+	}
+	window := c.GW.Router.ContextCeiling(*in)
+	if window <= 0 {
+		return budget
+	}
+	reserve := req.MaxTokens
+	if reserve <= 0 {
+		reserve = replyReserve
+	}
+	if fit := window - reserve; fit > 0 && fit < budget {
+		return fit
+	}
+	return budget
+}
+
 func (c *Compactor) keep() int {
 	if c.KeepRecent > 0 {
 		return c.KeepRecent
@@ -58,31 +86,54 @@ func (c *Compactor) keep() int {
 	return 8
 }
 
-// EstimateTokens is a cheap pre-flight count (4 chars per token, images
-// at a fixed cost). Authoritative counts come back in usage.
+// EstimateTokens is a cheap pre-flight count (images at a fixed cost).
+// Authoritative counts come back in usage. Plain prose comes out near 4
+// characters per token; digits, punctuation and non-ASCII text weigh more,
+// because a tokenizer splits them far finer (a run of five-digit numbers is
+// about 2 characters per token, so chars / 4 let a 63k-token prompt through
+// as 31k).
 func EstimateTokens(req *gateway.Request) int {
-	n := len(req.System)
+	n := textWeight(req.System)
 	for _, m := range req.Messages {
-		n += messageChars(m)
+		n += messageWeight(m)
 	}
-	for _, t := range req.Tools {
-		n += len(t.Name) + len(t.Description) + len(t.InputSchema)
-	}
-	return n / 4
+	return int(n) + toolTokens(req)
 }
 
-func messageChars(m gateway.Message) int {
-	n := 8
-	for _, p := range m.Parts {
-		n += len(p.Text) + len(p.Args)
-		for _, cp := range p.Content {
-			n += len(cp.Text)
-		}
-		if p.Kind == gateway.PartImage {
-			n += 6000
+// textWeight is the estimated token count of s: letters and spaces a
+// quarter token each (so plain letters match chars / 4 and prose lands a
+// few percent above it once its punctuation counts), digits just over half
+// a token, other ASCII punctuation 0.35, and anything non-ASCII 0.6 (CJK
+// and emoji run about one token per one or two characters).
+func textWeight(s string) float64 {
+	var w float64
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			w += 0.55
+		case r == ' ' || r == '\n' || r == '\t' || r == '\r' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
+			w += 0.25
+		case r < 128:
+			w += 0.35
+		default:
+			w += 0.6
 		}
 	}
-	return n
+	return w
+}
+
+func messageWeight(m gateway.Message) float64 {
+	w := 2.0 // role and framing
+	for _, p := range m.Parts {
+		w += textWeight(p.Text) + textWeight(string(p.Args))
+		for _, cp := range p.Content {
+			w += textWeight(cp.Text)
+		}
+		if p.Kind == gateway.PartImage {
+			w += 1500
+		}
+	}
+	return w
 }
 
 // Middleware trims the outgoing request to the budget. Order of operations:
@@ -100,7 +151,8 @@ func (c *Compactor) Middleware() gateway.Middleware {
 			return nil
 		}
 		est := EstimateTokens(req)
-		if est <= c.budget() {
+		budget := c.budgetFor(req, in)
+		if est <= budget {
 			in.EstTokensIn = est
 			return nil
 		}
@@ -114,13 +166,13 @@ func (c *Compactor) Middleware() gateway.Middleware {
 		}
 		// 2. still too big: truncate the oldest turns after the block and ask
 		//    for a new summary
-		if est > c.budget() {
-			req.Messages = truncateToBudget(req.Messages, req, c.budget(), c.keep())
+		if est > budget {
+			req.Messages = truncateToBudget(req.Messages, req, budget, c.keep())
 			est = EstimateTokens(req)
 			if c.Enqueue != nil {
 				c.Enqueue(ctx, convID)
 			}
-			c.Log.Info("compaction: truncated for budget", "conversation", convID, "tokens", est)
+			c.Log.Info("compaction: truncated for budget", "conversation", convID, "tokens", est, "budget", budget)
 		}
 		in.EstTokensIn = est
 		return nil
@@ -154,19 +206,19 @@ func applyBlock(msgs []gateway.Message, covers int64, blk Block) []gateway.Messa
 // never splitting an assistant tool-call message from the tool results that
 // follow it, and never dropping the last `keep` messages.
 func truncateToBudget(msgs []gateway.Message, req *gateway.Request, budget, keep int) []gateway.Message {
-	fixed := (len(req.System) + toolChars(req)) / 4
+	fixed := int(textWeight(req.System)) + toolTokens(req)
 	// find how many leading messages we can drop
 	total := fixed
 	for _, m := range msgs {
-		total += messageChars(m) / 4
+		total += int(messageWeight(m))
 	}
 	i := 0
 	for total > budget && i < len(msgs)-keep {
-		total -= messageChars(msgs[i]) / 4
+		total -= int(messageWeight(msgs[i]))
 		i++
 		// don't start the remaining history with orphaned tool results
 		for i < len(msgs)-keep && msgs[i].Role == gateway.RoleTool {
-			total -= messageChars(msgs[i]) / 4
+			total -= int(messageWeight(msgs[i]))
 			i++
 		}
 	}
@@ -177,12 +229,12 @@ func truncateToBudget(msgs []gateway.Message, req *gateway.Request, budget, keep
 	return append([]gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{note}}, {Role: gateway.RoleAssistant, Parts: []gateway.Part{gateway.TextPart("Noted.")}}}, msgs[i:]...)
 }
 
-func toolChars(req *gateway.Request) int {
-	n := 0
+func toolTokens(req *gateway.Request) int {
+	var w float64
 	for _, t := range req.Tools {
-		n += len(t.Name) + len(t.Description) + len(t.InputSchema)
+		w += textWeight(t.Name) + textWeight(t.Description) + textWeight(string(t.InputSchema))
 	}
-	return n
+	return int(w)
 }
 
 // RenderBlock turns a block into the text the model reads.
@@ -265,9 +317,9 @@ func (c *Compactor) Compact(ctx context.Context, convID uuid.UUID) error {
 	}
 
 	resp, err := c.GW.Complete(ctx, &gateway.Request{
-		Model:  "auto",
-		System: `You compress conversation history into a structured JSON record for another model to continue from. Be concrete: keep names, numbers, identifiers, URLs, decisions and anything still unresolved. Omit pleasantries. Reply with JSON only, matching: {"summary": string, "goals": [string], "decisions": [string], "open_threads": [string], "tool_state": [string]}`,
-		Messages: []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart(transcript.String())}}},
+		Model:     "auto",
+		System:    `You compress conversation history into a structured JSON record for another model to continue from. Be concrete: keep names, numbers, identifiers, URLs, decisions and anything still unresolved. Omit pleasantries. Reply with JSON only, matching: {"summary": string, "goals": [string], "decisions": [string], "open_threads": [string], "tool_state": [string]}`,
+		Messages:  []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart(transcript.String())}}},
 		MaxTokens: 2000,
 		Metadata:  gateway.Metadata{ConversationID: convID.String(), TaskClass: gateway.TaskSummarize},
 	})

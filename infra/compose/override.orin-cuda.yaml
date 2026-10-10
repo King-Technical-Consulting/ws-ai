@@ -1,10 +1,18 @@
-# Jetson AGX Orin (arm64, JetPack 6.x, CUDA 12.x). Runs the whole stack plus
-# llama-server with CUDA. Requires nvidia-container-toolkit (ships with JetPack).
+# Jetson AGX Orin (arm64, JetPack 6.x or newer). Runs the whole stack plus
+# llama-server with CUDA. Requires nvidia-container-toolkit, which may not be
+# installed or registered with Docker: check `docker info | grep -i runtimes`
+# lists nvidia, and if not install it from the Jetson apt repo and run
+# `sudo nvidia-ctk runtime configure --runtime=docker` (then restart Docker).
 #
 #   docker compose -f compose.yaml -f override.orin-cuda.yaml up -d
 #
 # Models live in ../../data/models (GGUF). Download with:
 #   huggingface-cli download unsloth/gpt-oss-20b-GGUF gpt-oss-20b-Q4_K_M.gguf --local-dir data/models
+#
+# Context: --ctx-size is shared by the --parallel slots, so each request gets
+# ctx-size / parallel tokens (131072 / 4 = 32768, the window declared for
+# local-llama/gpt-oss-20b in config/endpoints.yaml). Measured on an Orin: about
+# 2 GB more RAM than 32768 total, which only gave 8192 per request.
 #
 # Memory: 64 GB Orin fits gpt-oss-20b (~13 GB) + Qwen3-30B-A3B Q4 (~18 GB) with
 # room for KV cache. 32 GB Orin: pick one of gpt-oss-20b or Qwen3-14B.
@@ -23,19 +31,20 @@ services:
     command: >
       --model /models/gpt-oss-20b-Q4_K_M.gguf
       --alias gpt-oss-20b
-      --ctx-size 32768
+      --ctx-size 131072
       --n-gpu-layers 999
       --parallel 4
       --flash-attn on
       --jinja
       --reasoning-format deepseek
       --metrics
+      ${LLAMA_EXTRA_ARGS:-}
     volumes:
       - ../../data/models:/models:ro
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${LLAMA_BIND_ADDR:-127.0.0.1}:8000:8000"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 40
@@ -60,12 +69,22 @@ services:
     volumes:
       - ../../data/models:/models:ro
     ports:
-      - "127.0.0.1:8001:8001"
+      - "${LLAMA_BIND_ADDR:-127.0.0.1}:8001:8001"
+    # The image's built-in check probes its default port, not 8001, so it
+    # reports unhealthy while the server works.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
     profiles: ["embed"]
 
   app:
     environment:
       LLAMA_SERVER_URL: http://llama:8000/v1
+      # Used with the embed profile (llama-embed above).
+      LLAMA_EMBED_URL: http://llama-embed:8001/v1
     depends_on:
       llama:
         condition: service_healthy
@@ -73,3 +92,5 @@ services:
   worker:
     environment:
       LLAMA_SERVER_URL: http://llama:8000/v1
+      # Used with the embed profile (llama-embed above).
+      LLAMA_EMBED_URL: http://llama-embed:8001/v1

@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq less procps unzip xz-utils zip \
       build-essential pkg-config \
       python3 python3-pip python3-venv \
-      ripgrep openssh-client \
+      ripgrep openssh-client bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Node (official tarball per arch).

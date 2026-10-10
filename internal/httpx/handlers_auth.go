@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"unicode/utf8"
 	"errors"
 	"net/http"
 	"strings"
@@ -200,6 +201,31 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		consent = u.TrainingConsent
 	}
 	writeJSON(w, 200, map[string]any{"id": p.UserID, "email": p.Email, "display_name": p.DisplayName, "role": p.Role, "via_api_key": p.APIKeyID.Valid, "training_consent": consent})
+}
+
+// handleUpdateMe changes the caller's display name, the one field of a
+// person's own that is theirs to edit (the address is the sign-in and the
+// role is the owner's). The API group never admits an API key, so this is a
+// signed-in person by construction.
+func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
+	p := Principal(r.Context())
+	var in struct {
+		DisplayName string `json:"display_name"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	name := strings.TrimSpace(in.DisplayName)
+	if name == "" || utf8.RuneCountInString(name) > 80 {
+		writeErr(w, 400, "display name must be 1 to 80 characters")
+		return
+	}
+	if err := s.DB.SetDisplayName(r.Context(), store.SetDisplayNameParams{ID: p.UserID, DisplayName: name}); err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": p.UserID, "email": p.Email, "display_name": name, "role": p.Role})
 }
 
 func isUnauthorized(err error) bool { return errors.Is(err, auth.ErrUnauthorized) }

@@ -10,6 +10,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -429,6 +430,11 @@ type Capabilities struct {
 	Reasoning     bool `json:"reasoning" yaml:"reasoning"`
 	PromptCache   bool `json:"prompt_cache" yaml:"prompt_cache"`
 	Embeddings    bool `json:"embeddings" yaml:"embeddings"`
+	// MaxConcurrency is how many requests the endpoint serves at once at
+	// full speed: the slot count of a local server (llama-server
+	// --parallel). 0 means unknown, and the router assumes no limit. A
+	// rule that ranks by throughput prefers an endpoint with a free slot.
+	MaxConcurrency int `json:"max_concurrency,omitempty" yaml:"max_concurrency"`
 	// Media marks an image or video endpoint (internal/media). Text
 	// requests never route to one and media requests only route to one.
 	Media *MediaCaps `json:"media,omitempty" yaml:"media"`
@@ -458,6 +464,18 @@ type MediaCaps struct {
 	Seconds []int `json:"seconds,omitempty" yaml:"seconds"`
 }
 
+// String prints the capabilities with Media by value: a %+v of the struct
+// shows the *MediaCaps as a pointer, which makes a routing error useless in
+// a log ("Media:0xc000..."), so the router's error line reads Media:{Image:true}.
+func (c Capabilities) String() string {
+	media := "<nil>"
+	if c.Media != nil {
+		media = fmt.Sprintf("%+v", *c.Media)
+	}
+	return fmt.Sprintf("{ContextWindow:%d MaxOutput:%d Tools:%t Vision:%t JSONMode:%t Reasoning:%t PromptCache:%t Embeddings:%t MaxConcurrency:%d Media:%s}",
+		c.ContextWindow, c.MaxOutput, c.Tools, c.Vision, c.JSONMode, c.Reasoning, c.PromptCache, c.Embeddings, c.MaxConcurrency, media)
+}
+
 // IsMedia reports whether the endpoint is an image or video endpoint.
 func (c Capabilities) IsMedia() bool { return c.Media != nil }
 
@@ -477,6 +495,10 @@ type Provider struct {
 	BaseURL string            `json:"base_url"`
 	APIKey  string            `json:"-"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// Hosted marks a provider that takes an API key (the seed names an
+	// api_key_env). Strict key routing applies to these only; a local server
+	// is free to everyone.
+	Hosted bool `json:"hosted,omitempty"`
 }
 
 // Endpoint is one model on one provider.

@@ -1,12 +1,8 @@
 package training
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -83,71 +79,10 @@ func (r *RentalRunner) Run(ctx context.Context, spec RunSpec, progress func(floa
 		return nil, log, err
 	}
 	log += "trainer ready at " + base + "\n"
-	body, _ := json.Marshal(map[string]any{
-		"base_model": spec.BaseModel, "adapter_name": spec.AdapterName, "config": spec.Config,
-		"train": string(spec.Train), "eval": string(spec.Eval),
-	})
-	if err := r.do(ctx, http.MethodPost, base+"/train", body, nil); err != nil {
-		reason = "fine-tune failed to start"
-		return nil, log, fmt.Errorf("training: start the trainer: %w", err)
-	}
-	poll := r.Poll
-	if poll <= 0 {
-		poll = 10 * time.Second
-	}
-	tick := time.NewTicker(poll)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			reason = "fine-tune cancelled"
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
-			_ = r.do(cctx, http.MethodPost, base+"/cancel", nil, nil)
-			cancel()
-			return nil, log, ctx.Err()
-		case <-tick.C:
-		}
-		var st trainerStatus
-		if err := r.do(ctx, http.MethodGet, base+"/status", nil, &st); err != nil {
-			r.log().Debug("training: trainer status", "err", err)
-			continue
-		}
-		_ = r.Rental.Touch(ctx, inst.ID)
-		full := log + st.Log
-		switch st.State {
-		case "running":
-			if progress != nil {
-				progress(st.Progress, full)
-			}
-		case "done":
-			var adapter bytes.Buffer
-			if err := r.do(ctx, http.MethodGet, base+"/adapter", nil, &adapter); err != nil {
-				reason = "adapter download failed"
-				return nil, full, fmt.Errorf("training: fetch the adapter: %w", err)
-			}
-			if progress != nil {
-				progress(1, full)
-			}
-			return adapter.Bytes(), full, nil
-		case "failed":
-			reason = "fine-tune failed"
-			msg := st.Error
-			if msg == "" {
-				msg = "the trainer failed"
-			}
-			return nil, full, errors.New("training: " + msg)
-		case "idle":
-			reason = "fine-tune failed"
-			return nil, full, errors.New("training: the trainer lost the job (restarted?)")
-		}
-	}
-}
-
-type trainerStatus struct {
-	State    string  `json:"state"`
-	Progress float64 `json:"progress"`
-	Log      string  `json:"log"`
-	Error    string  `json:"error"`
+	c := &trainerClient{Key: r.Key, Client: r.Client, Poll: r.Poll, Log: r.Log}
+	adapter, full, why, err := c.drive(ctx, base, spec, progress, log, func() { _ = r.Rental.Touch(ctx, inst.ID) })
+	reason = why
+	return adapter, full, err
 }
 
 // waitReady polls the instance row until the rental controller's
@@ -193,47 +128,6 @@ func (r *RentalRunner) waitReady(ctx context.Context, id uuid.UUID) (string, err
 	}
 }
 
-// do sends a request with the rental key. out is a *bytes.Buffer for raw
-// bytes, a JSON target, or nil.
-func (r *RentalRunner) do(ctx context.Context, method, url string, body []byte, out any) error {
-	var rd io.Reader
-	if body != nil {
-		rd = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rd)
-	if err != nil {
-		return err
-	}
-	if r.Key != nil {
-		req.Header.Set("Authorization", "Bearer "+r.Key())
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	client := r.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("%s: HTTP %d: %s", strings.TrimPrefix(url, "http"), resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	switch o := out.(type) {
-	case nil:
-		return nil
-	case *bytes.Buffer:
-		_, err := io.Copy(o, io.LimitReader(resp.Body, 4<<30))
-		return err
-	default:
-		return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
-	}
-}
-
 func (r *RentalRunner) log() *slog.Logger {
 	if r.Log != nil {
 		return r.Log
@@ -245,23 +139,28 @@ func (r *RentalRunner) log() *slog.Logger {
 
 // Target is a place a fine-tune job can run.
 type Target struct {
-	ID    string `json:"id"`    // local | rental
+	ID    string `json:"id"`    // local | remote | rental
 	Label string `json:"label"` // for the page
 }
 
 // Target ids.
 const (
 	TargetLocal  = "local"
+	TargetRemote = "remote"
 	TargetRental = "rental"
 )
 
-// Targets is a Runner that picks the local Docker runner or the rented
-// one per job (FinetuneConfig.Target). Either may be nil; the default is
-// local when it exists, else rental.
+// Targets is a Runner that picks the local Docker runner, the trainer
+// box at WS_FINETUNE_URL or the rented one per job (FinetuneConfig.Target).
+// Any may be nil; the default is the first that exists in that order
+// (a box already there costs nothing; renting is last).
 type Targets struct {
 	Local  Runner
+	Remote Runner
 	Rental Runner
-	// RentalLabel names the rental template on the page.
+	// RemoteLabel names the trainer box (its host) on the page;
+	// RentalLabel names the rental template.
+	RemoteLabel string
 	RentalLabel string
 }
 
@@ -270,6 +169,9 @@ func (t *Targets) List() []Target {
 	var out []Target
 	if t.Local != nil {
 		out = append(out, Target{ID: TargetLocal, Label: "this worker's GPU"})
+	}
+	if t.Remote != nil {
+		out = append(out, Target{ID: TargetRemote, Label: RemoteLabel(t.RemoteLabel)})
 	}
 	if t.Rental != nil {
 		label := "rented GPU"
@@ -288,6 +190,9 @@ func (t *Targets) Pick(target string) (Runner, error) {
 		if t.Local != nil {
 			return t.Local, nil
 		}
+		if t.Remote != nil {
+			return t.Remote, nil
+		}
 		if t.Rental != nil {
 			return t.Rental, nil
 		}
@@ -297,6 +202,11 @@ func (t *Targets) Pick(target string) (Runner, error) {
 			return nil, fmt.Errorf("%w: no trainer image on this worker (WS_FINETUNE_IMAGE)", ErrInvalid)
 		}
 		return t.Local, nil
+	case TargetRemote:
+		if t.Remote == nil {
+			return nil, fmt.Errorf("%w: no trainer box (WS_FINETUNE_URL)", ErrInvalid)
+		}
+		return t.Remote, nil
 	case TargetRental:
 		if t.Rental == nil {
 			return nil, fmt.Errorf("%w: no rented trainer (WS_FINETUNE_TEMPLATE and a rental provider)", ErrInvalid)
@@ -313,6 +223,14 @@ func (t *Targets) Run(ctx context.Context, spec RunSpec, progress func(float64, 
 		return nil, "", err
 	}
 	return r.Run(ctx, spec, progress)
+}
+
+// RemoteLabel is the page's label for the trainer box at host.
+func RemoteLabel(host string) string {
+	if host == "" {
+		return "the trainer box"
+	}
+	return "the trainer at " + host
 }
 
 func hasTarget(ts []Target, id string) bool {

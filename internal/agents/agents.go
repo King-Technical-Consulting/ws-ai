@@ -102,6 +102,7 @@ type Store interface {
 	GetTrigger(ctx context.Context, id uuid.UUID) (store.AgentTrigger, error)
 	CreateTrigger(ctx context.Context, arg store.CreateTriggerParams) (store.AgentTrigger, error)
 	ListDueCronTriggers(ctx context.Context) ([]store.AgentTrigger, error)
+	ListRepoPushTriggers(ctx context.Context) ([]store.AgentTrigger, error)
 	SetTriggerFired(ctx context.Context, arg store.SetTriggerFiredParams) error
 }
 
@@ -405,11 +406,19 @@ type FireParams struct {
 	// GitHubEvent is the X-GitHub-Event header, set for repo_push triggers.
 	GitHubEvent string
 	// Signature is GitHub's X-Hub-Signature-256 header ("sha256=<hex>"),
-	// sent when the repository's webhook has a secret. When present it
-	// must be the HMAC of the body under the trigger's secret (the one in
-	// the URL), so a delivery is checked twice: the URL and the signature.
+	// sent when the repository's webhook has a secret. A repo_push
+	// delivery must carry it and it must be the HMAC of the body under the
+	// trigger's secret (the one in the URL): the owner pastes that secret
+	// into GitHub's webhook, so a delivery is checked twice, the URL and
+	// the signature, and one without the header (a webhook saved without
+	// the secret, or a body replayed by someone who saw the URL) is
+	// refused. A plain webhook trigger has no signer; the URL is its
+	// credential and the header is checked only when present.
 	Signature string
 }
+
+// ErrNoSignature is a repo_push delivery without X-Hub-Signature-256.
+var ErrNoSignature = errors.New("agents: GitHub delivery carries no signature; set the trigger's secret as the webhook secret")
 
 // VerifySignature checks GitHub's sha256 signature of body under secret.
 func VerifySignature(signature, secret, body string) bool {
@@ -423,19 +432,39 @@ func VerifySignature(signature, secret, body string) bool {
 	return hmac.Equal(m.Sum(nil), want)
 }
 
+// CheckHook reports ErrSecret unless id names an enabled webhook or
+// repo_push trigger and secret is its secret. The handler calls it before
+// reading the body, so an unauthenticated caller cannot make the server
+// buffer a megabyte it will then refuse.
+func (s *Service) CheckHook(ctx context.Context, id uuid.UUID, secret string) error {
+	_, err := s.checkHook(ctx, id, secret)
+	return err
+}
+
+func (s *Service) checkHook(ctx context.Context, id uuid.UUID, secret string) (*store.AgentTrigger, error) {
+	t, err := s.DB.GetTrigger(ctx, id)
+	if err != nil {
+		return nil, ErrSecret // do not reveal whether the id exists
+	}
+	sum := sha256.Sum256([]byte(secret))
+	if (t.Kind != KindWebhook && t.Kind != KindRepoPush) || !t.Enabled || len(t.SecretHash) != len(sum) || subtle.ConstantTimeCompare(t.SecretHash, sum[:]) != 1 {
+		return nil, ErrSecret
+	}
+	return &t, nil
+}
+
 // FireHook starts a run from a webhook or repo_push trigger after checking
 // its secret. A webhook's body becomes the run's input verbatim; a
 // repo_push delivery is filtered by the spec and rendered, and one that
 // matches nothing (a ping, another branch) returns ErrIgnored without a
 // run.
 func (s *Service) FireHook(ctx context.Context, p FireParams) (*store.AgentRun, error) {
-	t, err := s.DB.GetTrigger(ctx, p.TriggerID)
+	t, err := s.checkHook(ctx, p.TriggerID, p.Secret)
 	if err != nil {
-		return nil, ErrSecret // do not reveal whether the id exists
+		return nil, err
 	}
-	sum := sha256.Sum256([]byte(p.Secret))
-	if (t.Kind != KindWebhook && t.Kind != KindRepoPush) || !t.Enabled || len(t.SecretHash) != len(sum) || subtle.ConstantTimeCompare(t.SecretHash, sum[:]) != 1 {
-		return nil, ErrSecret
+	if t.Kind == KindRepoPush && p.Signature == "" {
+		return nil, ErrNoSignature
 	}
 	if p.Signature != "" && !VerifySignature(p.Signature, p.Secret, p.Body) {
 		return nil, ErrSecret
@@ -444,15 +473,9 @@ func (s *Service) FireHook(ctx context.Context, p FireParams) (*store.AgentRun, 
 	label := "webhook"
 	if t.Kind == KindRepoPush {
 		label = "github"
-		var rs RepoPushSpec
-		_ = json.Unmarshal(t.Spec, &rs)
-		rendered, ok := RenderGitHubEvent(rs, p.GitHubEvent, p.Body)
-		if !ok {
-			return nil, ErrIgnored
-		}
-		input = rendered
-		if rs.Input != "" {
-			input = strings.TrimSpace(rs.Input) + "\n\n" + input
+		input, err = s.renderRepoPush(t, p.GitHubEvent, p.Body)
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		input = strings.TrimSpace(p.Body)
@@ -470,6 +493,74 @@ func (s *Service) FireHook(ctx context.Context, p FireParams) (*store.AgentRun, 
 	}
 	_ = s.DB.SetTriggerFired(ctx, store.SetTriggerFiredParams{ID: t.ID, NextRunAt: nil, LastError: nilIfEmpty(msg)})
 	return run, err
+}
+
+// renderRepoPush renders a GitHub delivery for a repo_push trigger, or
+// ErrIgnored when the trigger's spec does not want it.
+func (s *Service) renderRepoPush(t *store.AgentTrigger, event, body string) (string, error) {
+	var rs RepoPushSpec
+	_ = json.Unmarshal(t.Spec, &rs)
+	rendered, ok := RenderGitHubEvent(rs, event, body)
+	if !ok {
+		return "", ErrIgnored
+	}
+	if rs.Input != "" {
+		rendered = strings.TrimSpace(rs.Input) + "\n\n" + rendered
+	}
+	return rendered, nil
+}
+
+// AppDelivery is one delivery on the GitHub App's hook: every repo_push
+// trigger whose spec names the delivery's repository gets it, rendered by
+// its own spec, so one webhook on the App serves every agent without a
+// per-repository webhook and a secret per trigger. The handler has
+// already checked the App's signature. Triggers with no repo in their spec
+// are skipped: on the App's hook a blank repo would mean every
+// repository the App sees. Runs that could not start (a busy or disabled
+// agent) are recorded on the trigger and skipped; the delivery is
+// accepted when at least one trigger wanted it.
+func (s *Service) AppDelivery(ctx context.Context, event, body string) ([]*store.AgentRun, error) {
+	var ev struct {
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+	}
+	_ = json.Unmarshal([]byte(body), &ev)
+	if ev.Repository.FullName == "" {
+		return nil, ErrIgnored
+	}
+	triggers, err := s.DB.ListRepoPushTriggers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var runs []*store.AgentRun
+	wanted := false
+	for i := range triggers {
+		t := &triggers[i]
+		var rs RepoPushSpec
+		_ = json.Unmarshal(t.Spec, &rs)
+		if rs.Repo == "" || !strings.EqualFold(rs.Repo, ev.Repository.FullName) {
+			continue
+		}
+		input, err := s.renderRepoPush(t, event, body)
+		if err != nil {
+			continue // not this event or branch
+		}
+		wanted = true
+		run, err := s.Start(ctx, StartParams{AgentID: t.AgentID, TriggerID: store.NullUUID(t.ID), Input: input, Label: "github"})
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		_ = s.DB.SetTriggerFired(ctx, store.SetTriggerFiredParams{ID: t.ID, NextRunAt: nil, LastError: nilIfEmpty(msg)})
+		if err == nil {
+			runs = append(runs, run)
+		}
+	}
+	if !wanted {
+		return nil, ErrIgnored
+	}
+	return runs, nil
 }
 
 // Tick starts every due cron trigger and schedules its next firing. A

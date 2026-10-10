@@ -1,7 +1,7 @@
 import { Fragment, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
-import { SectionHead, PageTitle, ListGroup, Callout, btn, inputSm } from '../components/ui'
+import { SectionHead, PageTitle, ListGroup, Row, Callout, btn, inputSm } from '../components/ui'
 
 type Invite = { id: string; email: string; role: string; created_at: string; expires_at: string; used_at: string | null }
 type Usage = {
@@ -11,7 +11,7 @@ type Usage = {
   by_user: { user_id: string | null; calls: number; cost_usd: number }[]
 }
 type MediaCaps = { engine: string; image?: boolean; image_edit?: boolean; video?: boolean; image_to_video?: boolean; upscale?: boolean; sizes?: string[]; max_images?: number; max_seconds?: number; seconds?: number[] }
-type Caps = { context_window: number; max_output: number; tools: boolean; vision: boolean; reasoning: boolean; prompt_cache: boolean; json_mode?: boolean; embeddings?: boolean; media?: MediaCaps }
+type Caps = { context_window: number; max_output: number; tools: boolean; vision: boolean; reasoning: boolean; prompt_cache: boolean; json_mode?: boolean; embeddings?: boolean; max_concurrency?: number; media?: MediaCaps }
 type Pricing = { input_per_m: number; output_per_m: number; cache_read_per_m?: number; cache_write_per_m?: number; per_image?: number; per_second?: number }
 type EndpointRow = {
   id: string; display_name: string; provider_id: string; model_name: string; enabled: boolean; local: boolean
@@ -32,6 +32,8 @@ type Endpoints = {
   all_providers?: ProviderRow[]
   engines?: EngineInfo[]
   endpoints: EndpointRow[]
+  /** Decode speed the gateway has measured since the server started; absent for an endpoint never used. */
+  throughput?: Record<string, { tokens_per_sec: number; ttft_ms: number; samples: number; in_flight: number; queued?: number }>
 }
 type CatalogModel = {
   id: string; name: string; description?: string; added: boolean; endpoint_id: string
@@ -51,7 +53,7 @@ function routeOf(e: { extra_body?: { provider?: { order?: string[]; only?: strin
 }
 type Policy = { name: string; yaml: string; priority: number; enabled: boolean; error?: string; unknown_endpoints?: string[] }
 type Budget = { id: string; scope: string; scope_id: string | null; period: string; limit_usd: number; on_exceed: string }
-type User = { id: string; email: string; display_name: string; role: string }
+type User = { id: string; email: string; display_name: string; role: string; shared_provider_keys?: boolean; disabled_at?: string | null }
 
 export default function Admin() {
   const qc = useQueryClient()
@@ -61,6 +63,15 @@ export default function Admin() {
   const invites = useQuery({ queryKey: ['invites'], queryFn: () => api.get<Invite[]>('/api/admin/invites') })
   const usage = useQuery({ queryKey: ['usage'], queryFn: () => api.get<Usage>('/api/admin/usage?days=30') })
   const eps = useQuery({ queryKey: ['admin-endpoints'], queryFn: () => api.get<Endpoints>('/api/admin/endpoints') })
+  const people = useQuery({ queryKey: ['admin-users'], queryFn: () => api.get<User[]>('/api/admin/users') })
+  const grant = useMutation({
+    mutationFn: ({ id, shared }: { id: string; shared: boolean }) => api.put(`/api/admin/users/${id}/shared-keys`, { shared }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-users'] }),
+  })
+  const disable = useMutation({
+    mutationFn: ({ id, disabled }: { id: string; disabled: boolean }) => api.put(`/api/admin/users/${id}/disabled`, { disabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-users'] }),
+  })
 
   const invite = useMutation({
     mutationFn: () => api.post<{ link: string }>('/api/admin/invites', { email }),
@@ -76,6 +87,20 @@ export default function Admin() {
       setLink(null)
       setInviteErr((e as Error).message.replace(/^auth: /, ''))
     },
+  })
+  const revokeInvite = useMutation({
+    mutationFn: (id: string) => api.del(`/api/admin/invites/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['invites'] }),
+    onError: (e) => setInviteErr((e as Error).message.replace(/^auth: /, '')),
+  })
+  const resendInvite = useMutation({
+    mutationFn: (id: string) => api.post<{ link: string }>(`/api/admin/invites/${id}/resend`, {}),
+    onSuccess: (r) => {
+      setLink(r.link)
+      setInviteErr(null)
+      qc.invalidateQueries({ queryKey: ['invites'] })
+    },
+    onError: (e) => setInviteErr((e as Error).message.replace(/^auth: /, '')),
   })
   const toggle = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.post(`/api/admin/endpoints/${id}/enabled`, { enabled }),
@@ -109,10 +134,35 @@ export default function Admin() {
           )}
           <ListGroup empty="No invites yet.">
             {invites.data?.map((i) => (
-              <li key={i.id} className="flex justify-between gap-3 px-3 py-2">
+              <li key={i.id} className="flex items-center justify-between gap-3 px-3 py-2">
                 <span className="truncate">{i.email} <span className="text-fg-3">· {i.role}</span></span>
-                <span className="meta">{i.used_at ? 'accepted' : new Date(i.expires_at) < new Date() ? 'expired' : 'pending'}</span>
+                <span className="flex items-center gap-3">
+                  <span className="meta">{i.used_at ? 'accepted' : new Date(i.expires_at) < new Date() ? 'expired' : 'pending'}</span>
+                  {!i.used_at && (
+                    <>
+                      <button onClick={() => resendInvite.mutate(i.id)} aria-label={`Resend invite to ${i.email}`} className={btn.secondarySm}>
+                        Resend
+                      </button>
+                      <button onClick={() => revokeInvite.mutate(i.id)} aria-label={`Revoke invite to ${i.email}`} className={btn.danger}>
+                        Revoke
+                      </button>
+                    </>
+                  )}
+                </span>
               </li>
+            ))}
+          </ListGroup>
+        </section>
+
+        <section className="space-y-3">
+          <SectionHead>people</SectionHead>
+          <p className="text-sm text-fg-2">
+            Members use hosted models only with their own API key (Settings, provider keys). Tick a person to let them use this server's shared keys too; spend on a shared key counts against their budget.
+            Keys shows a person's API keys so you can revoke one; Sign out everywhere ends all their browser sessions (passkeys and keys stay, and they can sign in again at once).
+          </p>
+          <ListGroup empty="No people yet.">
+            {people.data?.filter((u) => u.role !== 'owner').map((u) => (
+              <PersonRow key={u.id} user={u} onGrant={(shared) => grant.mutate({ id: u.id, shared })} onDisable={(disabled) => disable.mutate({ id: u.id, disabled })} />
             ))}
           </ListGroup>
         </section>
@@ -137,6 +187,9 @@ export default function Admin() {
                   <div className="meta">
                     {e.health.status}
                     {e.health.p50_latency_ms ? ` · ${e.health.p50_latency_ms} ms` : ''}
+                    {eps.data?.throughput?.[e.id]?.samples ? ` · ${Math.round(eps.data.throughput[e.id].tokens_per_sec)} tok/s · ${Math.round(eps.data.throughput[e.id].ttft_ms)} ms to first token` : ''}
+                    {eps.data?.throughput?.[e.id]?.in_flight ? ` · ${eps.data.throughput[e.id].in_flight}${e.capabilities?.max_concurrency ? ` of ${e.capabilities.max_concurrency}` : ''} busy` : ''}
+                    {eps.data?.throughput?.[e.id]?.queued ? ` · ${eps.data.throughput[e.id].queued} waiting` : ''}
                     {e.capabilities?.context_window ? ` · ${Math.round(e.capabilities.context_window / 1000)}k ctx` : ''}
                     {e.local ? ' · local' : e.capabilities?.media ? mediaPrice(e.pricing) : e.pricing ? ` · $${e.pricing.input_per_m}/$${e.pricing.output_per_m} per M` : ''}
                     {e.capabilities?.tools ? ' · tools' : ''}{e.capabilities?.vision ? ' · vision' : ''}
@@ -204,6 +257,72 @@ function mediaPrice(p?: Pricing): string {
   if (p.per_second) parts.push(`$${p.per_second.toFixed(3)}/s`)
   if (p.input_per_m || p.output_per_m) parts.push(`$${p.input_per_m}/$${p.output_per_m} per M tokens`)
   return parts.length ? ' · ' + parts.join(' · ') : ''
+}
+
+type AdminKey = { id: string; name: string; prefix: string; scopes: string[]; default_policy: string; created_at: string; last_used_at: string | null }
+
+/** One member in the people list: the shared-keys box, "Sign out everywhere"
+ *  and their API keys (loaded when opened), each with Revoke. */
+function PersonRow({ user: u, onGrant, onDisable }: { user: User; onGrant: (shared: boolean) => void; onDisable: (disabled: boolean) => void }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const keys = useQuery({ queryKey: ['admin-user-keys', u.id], queryFn: () => api.get<AdminKey[]>(`/api/admin/users/${u.id}/keys`), enabled: open })
+  const signOut = useMutation({
+    mutationFn: () => api.del(`/api/admin/users/${u.id}/sessions`),
+    onSuccess: () => setNote('Signed out everywhere.'),
+    onError: (e: Error) => setNote(e.message),
+  })
+  const revoke = useMutation({
+    mutationFn: (id: string) => api.del(`/api/admin/users/${u.id}/keys/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-user-keys', u.id] }),
+  })
+  return (
+    <li className="px-3 py-2 space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <span className="truncate">
+          {u.email}
+          {u.disabled_at && <span className="meta ml-2">disabled</span>}
+          {note && <span className="meta"> · {note}</span>}
+        </span>
+        <div className="flex items-center gap-3 shrink-0">
+          <label className="meta flex items-center gap-2">
+            <input
+              type="checkbox"
+              aria-label={`${u.email} may use shared keys`}
+              checked={!!u.shared_provider_keys}
+              onChange={(e) => onGrant(e.target.checked)}
+            />
+            may use shared keys
+          </label>
+          <button onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label={`${u.email} API keys`} className={btn.secondarySm}>
+            {open ? 'Hide keys' : 'Keys'}
+          </button>
+          <button onClick={() => signOut.mutate()} disabled={signOut.isPending} aria-label={`Sign ${u.email} out everywhere`} className={btn.secondarySm}>
+            Sign out everywhere
+          </button>
+          <button
+            onClick={() => onDisable(!u.disabled_at)}
+            aria-label={`${u.disabled_at ? 'Enable' : 'Disable'} ${u.email}`}
+            className={u.disabled_at ? btn.secondarySm : btn.danger}
+          >
+            {u.disabled_at ? 'Enable' : 'Disable'}
+          </button>
+        </div>
+      </div>
+      {open && (
+        <ListGroup empty="No API keys.">
+          {keys.data?.map((k) => (
+            <Row key={k.id} action={<button onClick={() => revoke.mutate(k.id)} disabled={revoke.isPending} aria-label={`Revoke ${k.name}`} className={btn.danger}>Revoke</button>}>
+              {k.name} <span className="font-mono text-xs text-fg-3">{k.prefix}…</span>
+              <span className="meta"> · policy {k.default_policy || 'auto'} · {k.scopes.join(', ') || 'no scope'}</span>
+              {k.last_used_at && <span className="meta"> · used {new Date(k.last_used_at).toLocaleDateString()}</span>}
+            </Row>
+          ))}
+        </ListGroup>
+      )}
+    </li>
+  )
 }
 
 /**
@@ -364,6 +483,7 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
   const [reasoning, setReasoning] = useState(c?.reasoning ?? false)
   const [cache, setCache] = useState(c?.prompt_cache ?? false)
   const [embeddings, setEmbeddings] = useState(c?.embeddings ?? false)
+  const [slots, setSlots] = useState(c?.max_concurrency ?? 0)
   const [inPerM, setInPerM] = useState(initial?.pricing?.input_per_m ?? 0)
   const [outPerM, setOutPerM] = useState(initial?.pricing?.output_per_m ?? 0)
   // media
@@ -403,7 +523,7 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
                 seconds: seconds.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0),
               },
             }
-          : { context_window: ctx, max_output: maxOut, tools, vision, json_mode: jsonMode, reasoning, prompt_cache: cache, embeddings }
+          : { context_window: ctx, max_output: maxOut, tools, vision, json_mode: jsonMode, reasoning, prompt_cache: cache, embeddings, max_concurrency: slots || undefined }
       const pricing: Pricing = kind === 'media' ? { input_per_m: inPerM, output_per_m: outPerM, per_image: perImage, per_second: perSecond } : { input_per_m: inPerM, output_per_m: outPerM }
       return api.put('/api/admin/endpoints', {
         id: initial?.id, provider_id: provider, model_name: model, display_name: display || model,
@@ -455,6 +575,7 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
             <label className="text-xs text-fg-2 flex items-center gap-1">max out <input type="number" value={maxOut} onChange={num(setMaxOut)} className={`${inputSm} w-24 tnum`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">$/M in <input type="number" step="0.01" value={inPerM} onChange={num(setInPerM)} className={`${inputSm} w-24 tnum`} /></label>
             <label className="text-xs text-fg-2 flex items-center gap-1">$/M out <input type="number" step="0.01" value={outPerM} onChange={num(setOutPerM)} className={`${inputSm} w-24 tnum`} /></label>
+            <label className="text-xs text-fg-2 flex items-center gap-1" title="Requests the server handles at once at full speed (llama-server --parallel). 0 means unknown.">slots <input type="number" min={0} value={slots} onChange={num(setSlots)} className={`${inputSm} w-16 tnum`} /></label>
           </div>
           <div className="flex flex-wrap gap-3">
             {check('tools', tools, setTools)}{check('vision', vision, setVision)}{check('json mode', jsonMode, setJSONMode)}{check('reasoning', reasoning, setReasoning)}{check('prompt cache', cache, setCache)}{check('embeddings', embeddings, setEmbeddings)}

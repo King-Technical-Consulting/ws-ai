@@ -40,7 +40,7 @@ export function CodePanel({ projectId, onClose }: { projectId: string; onClose: 
     retry: 1,
   })
   return (
-    <aside className="w-[46rem] max-w-[55vw] shrink-0 border-l border-line bg-bg flex flex-col min-h-0">
+    <aside className="fixed inset-0 z-20 md:static md:z-auto md:w-[46rem] md:max-w-[55vw] md:shrink-0 border-l border-line bg-bg flex flex-col min-h-0">
       <header className="h-12 shrink-0 border-b border-line flex items-center justify-between px-3 gap-2">
         <nav className="flex items-center gap-1">
           {(['files', 'terminal', 'preview'] as Tab[]).map((t) => (

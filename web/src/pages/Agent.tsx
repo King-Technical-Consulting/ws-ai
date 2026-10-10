@@ -66,8 +66,8 @@ export default function AgentMonitor() {
   const budget = d.spend.budgets.find((b) => b.period === 'month') ?? d.spend.budgets[0]
 
   return (
-    <div className="flex-1 min-h-0 flex">
-      <div className="w-[28rem] shrink-0 border-r border-line overflow-y-auto">
+    <div className="flex-1 min-h-0 flex flex-col md:flex-row overflow-y-auto md:overflow-visible">
+      <div className="w-full md:w-[28rem] md:shrink-0 border-b md:border-b-0 md:border-r border-line md:overflow-y-auto">
         <div className="p-6 space-y-6">
           <div className="space-y-1">
             <Link to="/agents" className="meta">← agents</Link>
@@ -136,7 +136,7 @@ export default function AgentMonitor() {
           </section>
         </div>
       </div>
-      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <div className="flex-1 min-w-0 min-h-[28rem] md:min-h-0 flex flex-col">
         {run ? <RunView key={run.id} run={run} onChange={refresh} /> : <p className="meta p-6">Pick a run to see its steps and transcript.</p>}
       </div>
     </div>
@@ -207,7 +207,7 @@ function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: str
           }}
         >
           <label className="flex items-center gap-1 text-xs text-fg-2">
-            $<input type="number" min={0.01} step={0.5} value={limit} onChange={(e) => setLimit(Number(e.target.value))} className={`${inputSm} w-24 tnum`} aria-label="Monthly limit in dollars" /> per month
+            $<input type="number" min={0.01} step={0.01} value={limit} onChange={(e) => setLimit(Number(e.target.value))} className={`${inputSm} w-24 tnum`} aria-label="Monthly limit in dollars" /> per month
           </label>
           <select value={onExceed} onChange={(e) => setOnExceed(e.target.value)} className={`${inputSm} w-auto`} aria-label="At the limit">
             <option value="block">at the limit, stop runs</option>
@@ -329,7 +329,7 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
       </ListGroup>
       {secretURL && (
         <Callout kind="note">
-          {secretURL.github ? 'GitHub trigger created. In the repository, add a webhook with this payload URL (it carries the secret and is shown once), content type application/json, the events you listed, and the part after the last slash as the webhook secret so GitHub signs each delivery and ws checks the signature:' : 'Webhook created. Its URL carries the secret and is shown once:'}
+          {secretURL.github ? 'GitHub trigger created. In the repository, add a webhook with this payload URL (it carries the secret and is shown once), content type application/json, the events you listed, and the part after the last slash as the webhook secret: GitHub then signs each delivery and ws accepts only signed ones. With the GitHub App webhook set up instead (GITHUB_WEBHOOK_SECRET), no repository webhook is needed; the App deliveries reach every GitHub trigger that names the repository:' : 'Webhook created. Its URL carries the secret and is shown once:'}
           <code className="block font-mono text-xs mt-1 break-all select-all">{secretURL.url}</code>
         </Callout>
       )}
@@ -366,7 +366,7 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
       </form>
       {create.error && <Callout kind="error">{(create.error as Error).message}</Callout>}
       <p className="meta">
-        Cron is five fields in UTC (or @hourly, @daily). A firing is skipped while a run is still open. A github trigger is a webhook GitHub posts to: pushes to the listed branches (and any other events you list, such as pull_request or issues) start a run with the event summarized; pings and other branches are ignored.
+        Cron is five fields in UTC (or @hourly, @daily). A firing is skipped while a run is still open. A github trigger is a webhook GitHub posts to, or a repository the GitHub App's webhook covers (then name the repository): pushes to the listed branches (and any other events you list, such as pull_request or issues) start a run with the event summarized; pings and other branches are ignored, and unsigned deliveries are refused.
       </p>
     </section>
   )

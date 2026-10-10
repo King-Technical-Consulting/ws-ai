@@ -39,8 +39,8 @@ export default function Jobs() {
   const current = list.find((j) => j.id === selected) ?? null
 
   return (
-    <div className="flex-1 min-h-0 flex">
-      <div className="w-[26rem] shrink-0 border-r border-line overflow-y-auto">
+    <div className="flex-1 min-h-0 flex flex-col md:flex-row overflow-y-auto md:overflow-visible">
+      <div className="w-full md:w-[26rem] md:shrink-0 border-b md:border-b-0 md:border-r border-line md:overflow-y-auto">
         <div className="p-6 space-y-6">
           <PageTitle>Claude Code jobs</PageTitle>
           <p className="reading text-sm text-fg-2">
@@ -87,7 +87,7 @@ export default function Jobs() {
           </section>
         </div>
       </div>
-      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <div className="flex-1 min-w-0 min-h-[28rem] md:min-h-0 flex flex-col">
         {current ? <JobTerm key={current.id} job={current} /> : <p className="meta p-6">Pick a job to watch its terminal.</p>}
       </div>
     </div>

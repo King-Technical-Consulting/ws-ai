@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,10 +48,11 @@ endpoints:
 		t.Errorf("cost = %f, want ~0.000173", cost)
 	}
 
-	// Providers without a key are dropped by Resolve; with a key they stay.
+	// A hosted provider without a server key stays, keyless and Hosted, so a
+	// person's own key can reach it; with a key it carries the key.
 	provs, eps := sf.Resolve(func(string) string { return "" })
-	if len(provs) != 0 || len(eps) != 0 {
-		t.Errorf("keyless hosted provider should be skipped, got %d/%d", len(provs), len(eps))
+	if len(provs) != 1 || len(eps) != 1 || provs[0].APIKey != "" || !provs[0].Hosted {
+		t.Errorf("keyless hosted provider should stay without a key, got %d/%d %+v", len(provs), len(eps), provs)
 	}
 	provs, eps = sf.Resolve(func(k string) string { return "sk-test" })
 	if len(provs) != 1 || len(eps) != 1 || provs[0].APIKey != "sk-test" {
@@ -87,5 +89,53 @@ func TestShippedEndpointsSeed(t *testing.T) {
 		if !local[e.Provider] && !e.Capabilities.Embeddings && e.Pricing.InputPerM == 0 {
 			t.Errorf("%s: hosted endpoint has no pricing", e.ID)
 		}
+	}
+}
+
+// Enabled and Health change while the router, the handlers and json.Marshal
+// read endpoints without a lock. Run under -race this failed when they were
+// written in place.
+func TestRegistryUpdatesDoNotRace(t *testing.T) {
+	reg := testRegistry()
+	p, _ := ParsePolicy(testPolicy)
+	r := NewRouter(reg, []Policy{p})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			reg.SetEnabled("local/small", i%2 == 0)
+			reg.SetHealth("local/small", "healthy", i, 0, "")
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		_, _, _ = r.Route(RouteInput{Selector: "auto", TaskClass: TaskSummarize})
+		if _, err := json.Marshal(reg.Endpoints()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
+}
+
+func TestSetEnabledIsASnapshotForHolders(t *testing.T) {
+	reg := testRegistry()
+	before, _ := reg.Endpoint("local/small")
+	if !reg.SetEnabled("local/small", false) {
+		t.Fatal("endpoint not found")
+	}
+	after, _ := reg.Endpoint("local/small")
+	if !before.Enabled {
+		t.Error("a pointer taken earlier changed under its holder")
+	}
+	if after.Enabled {
+		t.Error("a fresh lookup does not see the change")
+	}
+	if reg.SetEnabled("nope", true) {
+		t.Error("SetEnabled invented an endpoint")
+	}
+	// Health survives a toggle, and a toggle survives a health update.
+	reg.SetHealth("local/small", "degraded", 40, 0.1, "slow")
+	got, _ := reg.Endpoint("local/small")
+	if got.Enabled || got.Health.Status != "degraded" {
+		t.Errorf("fields lost: %+v", got)
 	}
 }

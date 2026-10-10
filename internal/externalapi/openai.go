@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -268,12 +269,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	var out []model
 	seen := map[string]bool{}
+	// Every name a policy gives meaning to: the aliases and the selectors
+	// rules match on (a rule with `match: {selector: [fast]}` makes "fast"
+	// a model name), the same set resolveSelector accepts; sorted, since
+	// the map has no order.
 	for _, pol := range s.GW.Router.Policies() {
-		for a := range pol.Aliases {
+		names := make([]string, 0)
+		for a := range pol.Selectors() {
 			if !seen[a] {
 				seen[a] = true
-				out = append(out, model{ID: a, Object: "model", Created: now, OwnedBy: "ws"})
+				names = append(names, a)
 			}
+		}
+		sort.Strings(names)
+		for _, a := range names {
+			out = append(out, model{ID: a, Object: "model", Created: now, OwnedBy: "ws"})
 		}
 	}
 	if !seen["auto"] {

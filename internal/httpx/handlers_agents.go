@@ -578,6 +578,11 @@ func (s *Server) handleAgentHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := chi.URLParam(r, "secret")
+	// Check the credential before buffering the body.
+	if err := s.Agents.CheckHook(r.Context(), id, secret); err != nil {
+		writeErr(w, 404, "not found")
+		return
+	}
 	ghEvent := r.Header.Get("X-GitHub-Event")
 	limit := int64(agents.MaxInputBytes)
 	if ghEvent != "" {
@@ -593,6 +598,8 @@ func (s *Server) handleAgentHook(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, agents.ErrSecret):
 			writeErr(w, 404, "not found")
+		case errors.Is(err, agents.ErrNoSignature):
+			writeErr(w, 403, "GitHub delivery carries no signature: set the trigger's secret as the repository webhook's secret")
 		case errors.Is(err, agents.ErrIgnored):
 			writeJSON(w, 200, map[string]any{"status": "ignored"})
 		default:
@@ -601,6 +608,43 @@ func (s *Server) handleAgentHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 202, map[string]any{"run_id": run.ID, "status": run.Status})
+}
+
+// handleGitHubAppHook is the GitHub App's one webhook: every delivery the
+// App's installations send, verified with GITHUB_WEBHOOK_SECRET, fanned
+// out to the repo_push triggers that name the delivery's repository. 404
+// until the secret is configured (so the route is not a probe target), 404
+// for a bad or missing signature, 200 ignored when no trigger wanted it,
+// 202 with the runs started otherwise.
+func (s *Server) handleGitHubAppHook(w http.ResponseWriter, r *http.Request) {
+	if s.Agents == nil || s.GitHubWebhookSecret == "" {
+		writeErr(w, 404, "not found")
+		return
+	}
+	limit := int64(1 << 20)
+	body, _ := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(body)) > limit {
+		writeErr(w, 413, "body too large")
+		return
+	}
+	if !agents.VerifySignature(r.Header.Get("X-Hub-Signature-256"), s.GitHubWebhookSecret, string(body)) {
+		writeErr(w, 404, "not found")
+		return
+	}
+	runs, err := s.Agents.AppDelivery(r.Context(), r.Header.Get("X-GitHub-Event"), string(body))
+	if err != nil {
+		if errors.Is(err, agents.ErrIgnored) {
+			writeJSON(w, 200, map[string]any{"status": "ignored"})
+			return
+		}
+		writeAgentsErr(w, err)
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(runs))
+	for _, run := range runs {
+		ids = append(ids, run.ID)
+	}
+	writeJSON(w, 202, map[string]any{"run_ids": ids, "status": "started"})
 }
 
 func writeAgentsErr(w http.ResponseWriter, err error) {

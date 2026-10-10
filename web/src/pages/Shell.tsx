@@ -1,10 +1,10 @@
-import { useState } from 'react'
-import { Outlet, NavLink, useNavigate, Link } from 'react-router'
+import { useEffect, useState } from 'react'
+import { Outlet, NavLink, useNavigate, useLocation, Link } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type Project, type Conversation } from '../api'
 import { useMe } from '../App'
 import { WsMark, btn, inputSm } from '../components/ui'
-import { Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive, Palette, FlaskConical } from 'lucide-react'
+import { Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive, Palette, FlaskConical, Menu, X } from 'lucide-react'
 import clsx from 'clsx'
 
 /** "https://github.com/a/repo.git" -> "repo" */
@@ -14,7 +14,7 @@ function repoName(url: string): string {
 }
 
 const navItem = ({ isActive }: { isActive: boolean }) =>
-  clsx('flex items-center gap-2 rounded-md px-2 py-1.5 text-sm truncate w-full text-left', isActive ? 'bg-bg-3 text-fg' : 'text-fg-2 hover:bg-bg-3 hover:text-fg')
+  clsx('flex items-center gap-2 rounded-md px-2 py-2.5 md:py-1.5 text-sm truncate w-full text-left', isActive ? 'bg-bg-3 text-fg' : 'text-fg-2 hover:bg-bg-3 hover:text-fg')
 
 export default function Shell() {
   const me = useMe()
@@ -37,6 +37,11 @@ export default function Shell() {
       nav(`/c/${c.id}`)
     },
   })
+
+  // Below md the sidebar is a drawer over the page; it closes on navigation.
+  const [drawer, setDrawer] = useState(false)
+  const loc = useLocation()
+  useEffect(() => setDrawer(false), [loc.pathname])
 
   const [showCode, setShowCode] = useState(false)
   const [codeName, setCodeName] = useState('')
@@ -98,17 +103,46 @@ export default function Shell() {
   }
 
   return (
-    <div className="h-full flex">
-      <aside className="w-64 shrink-0 border-r border-line bg-bg-2 flex flex-col">
+    <div className="h-full flex flex-col md:flex-row">
+      <header className="md:hidden h-12 shrink-0 border-b border-line bg-bg-2 flex items-center gap-2 px-2">
+        <button
+          onClick={() => setDrawer(true)}
+          className="p-2.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg"
+          aria-label="Open menu"
+          aria-expanded={drawer}
+        >
+          <Menu size={18} />
+        </button>
+        <Link to="/" className="wordmark inline-flex items-center gap-2">
+          <WsMark size={22} className="text-fg" />
+          ws
+        </Link>
+      </header>
+      {drawer && <div className="md:hidden fixed inset-0 z-30 bg-bg/80" onClick={() => setDrawer(false)} aria-hidden="true" />}
+      <aside
+        className={clsx(
+          'w-64 max-w-[85vw] shrink-0 border-r border-line bg-bg-2 flex flex-col',
+          'fixed inset-y-0 left-0 z-40 md:static md:z-auto',
+          drawer ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
+        )}
+        aria-label="Sidebar"
+      >
         <div className="px-3 pt-3 pb-2 flex items-center justify-between">
-          <Link to="/" className="wordmark inline-flex items-center gap-2">
+          <Link to="/" className="wordmark inline-flex items-center gap-2 min-h-10 md:min-h-0">
             <WsMark size={22} className="text-fg" />
             ws
           </Link>
           <button
+            onClick={() => setDrawer(false)}
+            className="md:hidden ml-auto mr-1 p-2.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg"
+            aria-label="Close menu"
+          >
+            <X size={18} />
+          </button>
+          <button
             onClick={() => newChat.mutate()}
             disabled={newChat.isPending}
-            className="p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg disabled:opacity-60"
+            className="p-2.5 md:p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg disabled:opacity-60"
             title="New conversation"
             aria-label="New conversation"
           >
@@ -149,13 +183,13 @@ export default function Shell() {
                 <MessageSquare size={14} className="shrink-0" />
                 <span className="truncate pr-10">{c.title || 'New conversation'}</span>
               </NavLink>
-              <span className="absolute right-1 top-1/2 -translate-y-1/2 hidden group-hover:flex items-center gap-0.5">
+              <span className="absolute right-1 top-1/2 -translate-y-1/2 flex md:hidden md:group-hover:flex items-center gap-0.5">
                 <button
                   onClick={() => {
                     const t = prompt('Rename conversation', c.title || '')
                     if (t !== null && t.trim()) rename.mutate({ id: c.id, title: t.trim() })
                   }}
-                  className="p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
+                  className="p-2 md:p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
                   title="Rename"
                   aria-label="Rename conversation"
                 >
@@ -165,7 +199,7 @@ export default function Shell() {
                   onClick={() => {
                     if (confirm(`Archive "${c.title || 'New conversation'}"?`)) archive.mutate(c.id)
                   }}
-                  className="p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
+                  className="p-2 md:p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
                   title="Archive"
                   aria-label="Archive conversation"
                 >
@@ -202,10 +236,12 @@ export default function Shell() {
           <button onClick={logout} className={navItem({ isActive: false })}>
             <LogOut size={14} /> Sign out
           </button>
-          <p className="px-2 pt-1 text-xs text-fg-4 truncate">{me.data?.email}</p>
+          <p className="px-2 pt-1 text-xs text-fg-4 truncate" title={me.data?.email}>
+            {me.data?.display_name || me.data?.email}
+          </p>
         </div>
       </aside>
-      <main className="flex-1 min-w-0 flex flex-col">
+      <main className="flex-1 min-w-0 min-h-0 flex flex-col">
         <Outlet />
       </main>
     </div>

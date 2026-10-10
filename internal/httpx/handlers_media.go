@@ -76,12 +76,13 @@ type mediaModel struct {
 	Health       string   `json:"health"`
 }
 
-// mediaModels lists enabled media endpoints (part of GET /api/models).
-func (s *Server) mediaModels() []mediaModel {
+// mediaModels lists enabled media endpoints (part of GET /api/models)
+// whose provider the caller is shown (providerVisible).
+func (s *Server) mediaModels(visible func(providerID string) bool) []mediaModel {
 	out := []mediaModel{}
 	for _, e := range s.GW.Registry.Endpoints() {
 		m := e.Capabilities.Media
-		if !e.Enabled || m == nil {
+		if !e.Enabled || m == nil || !visible(e.ProviderID) {
 			continue
 		}
 		mm := mediaModel{ID: e.ID, DisplayName: e.DisplayName, Provider: e.ProviderID, Local: e.Local, Engine: m.Engine,

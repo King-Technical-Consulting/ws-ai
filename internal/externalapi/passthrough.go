@@ -122,7 +122,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, raw []byte,
 			continue
 		}
 		dec.Chosen = c.Endpoint.ID
-		rec := gateway.UsageRecord{Metadata: md, EndpointID: c.Endpoint.ID, Model: c.Endpoint.ModelName, Decision: dec}
+		rec := gateway.UsageRecord{Metadata: md, EndpointID: c.Endpoint.ID, Model: c.Endpoint.ModelName, Decision: dec, OwnKey: c.OwnKey}
 		s.relay(w, resp, stream, &rec, start)
 		resp.Body.Close()
 		if record {

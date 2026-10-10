@@ -82,12 +82,12 @@ func (d *DB) LoadRegistry(ctx context.Context, reg *gateway.Registry) error {
 		}
 		p := &gateway.Provider{ID: r.ID, Kind: gateway.ProviderKind(r.Kind), Name: r.Name, BaseURL: base}
 		if r.ApiKeyEnv != nil && *r.ApiKeyEnv != "" {
+			p.Hosted = true
 			p.APIKey = os.Getenv(*r.ApiKeyEnv)
 			if p.APIKey == "" {
-				// A hosted provider that declares a key env but has none is not
-				// configured on this box; skip it so the router never tries it.
-				slog.Info("provider skipped: no API key in env", "provider", r.ID, "env", *r.ApiKeyEnv)
-				continue
+				// No server key: the provider stays registered and serves only
+				// people who saved a key of their own for it (gateway/keys.go).
+				slog.Info("provider has no server key; own keys only", "provider", r.ID, "env", *r.ApiKeyEnv)
 			}
 		}
 		_ = json.Unmarshal(r.Headers, &p.Headers)
@@ -198,6 +198,7 @@ func (u *UsageRecorder) Record(ctx context.Context, rec gateway.UsageRecord) {
 		FinishReason:     nilIfEmpty(string(rec.FinishReason)),
 		Error:            nilIfEmpty(rec.Err),
 		SessionID:        nilIfEmpty(md.SessionID),
+		OwnKey:           rec.OwnKey,
 	}
 	if _, err := u.DB.InsertUsage(ctx, params); err != nil {
 		log := u.Log

@@ -33,13 +33,14 @@ func TestRepoPushTrigger(t *testing.T) {
 	}
 	// A ping, another branch, or a plain POST without an event is ignored
 	// without a run; a wrong secret is still a 404-shaped error.
-	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "ping", Body: `{"zen":"x"}`}); !errors.Is(err, ErrIgnored) {
+	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "ping", Body: `{"zen":"x"}`, Signature: signed(secret, `{"zen":"x"}`)}); !errors.Is(err, ErrIgnored) {
 		t.Errorf("ping: %v", err)
 	}
-	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "push", Body: strings.Replace(pushPayload, "refs/heads/main", "refs/heads/dev", 1)}); !errors.Is(err, ErrIgnored) {
+	dev := strings.Replace(pushPayload, "refs/heads/main", "refs/heads/dev", 1)
+	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "push", Body: dev, Signature: signed(secret, dev)}); !errors.Is(err, ErrIgnored) {
 		t.Errorf("other branch: %v", err)
 	}
-	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, Body: pushPayload}); !errors.Is(err, ErrIgnored) {
+	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, Body: pushPayload, Signature: signed(secret, pushPayload)}); !errors.Is(err, ErrIgnored) {
 		t.Errorf("no event header: %v", err)
 	}
 	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: "nope", GitHubEvent: "push", Body: pushPayload}); !errors.Is(err, ErrSecret) {
@@ -48,7 +49,7 @@ func TestRepoPushTrigger(t *testing.T) {
 	if len(db.runs) != 0 {
 		t.Fatalf("ignored deliveries must not start runs: %d", len(db.runs))
 	}
-	run, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "push", Body: pushPayload})
+	run, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, GitHubEvent: "push", Body: pushPayload, Signature: signed(secret, pushPayload)})
 	if err != nil {
 		t.Fatal(err)
 	}

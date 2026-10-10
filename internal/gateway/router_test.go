@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +74,31 @@ func TestRouteRequireFiltersCapabilities(t *testing.T) {
 	}
 }
 
+func TestRouteBlamesTheImageBeforeTheKey(t *testing.T) {
+	p, _ := ParsePolicy(testPolicy)
+	// The shared registry's anthropic is not hosted; here it takes a key.
+	reg := testRegistry()
+	provs := []*Provider{{ID: "anthropic", Kind: ProviderAnthropic, Hosted: true, APIKey: "server-key"}, {ID: "local", Kind: ProviderOpenAICompat}}
+	reg.Replace(provs, reg.Endpoints())
+	r := NewRouter(reg, []Policy{p})
+	// "cheap" names local/small (no vision) and anthropic/haiku (vision,
+	// hosted). A member with no key for anthropic sends an image: no route,
+	// and the error names the image first, then the key.
+	noKeys := &KeyAccess{Own: map[string]bool{}}
+	_, _, err := r.Route(RouteInput{Selector: "cheap", TaskClass: TaskChat, Required: Capabilities{Vision: true}, Keys: noKeys})
+	if err == nil || !strings.Contains(err.Error(), "needs a model that can read images: needs your own API key") {
+		t.Fatalf("err = %v", err)
+	}
+	// Without the image the same person routes to the local model.
+	if cands, _, err := r.Route(RouteInput{Selector: "cheap", TaskClass: TaskChat, Keys: noKeys}); err != nil || cands[0].Endpoint.ID != "local/small" {
+		t.Fatalf("without the image: %v %v", cands, err)
+	}
+	// A text-only direct pick says so itself.
+	if _, _, err := r.Route(RouteInput{Selector: "local/small", Required: Capabilities{Vision: true}}); err == nil || !strings.Contains(err.Error(), "no vision") {
+		t.Fatalf("direct: %v", err)
+	}
+}
+
 func TestRouteAliasAndDirect(t *testing.T) {
 	p, _ := ParsePolicy(testPolicy)
 	r := NewRouter(testRegistry(), []Policy{p})
@@ -119,6 +146,22 @@ func TestRouteContextTooSmall(t *testing.T) {
 		if c.Endpoint.ID == "local/small" {
 			t.Error("32k endpoint should be excluded for 100k input")
 		}
+	}
+}
+
+// An alias or auto drops the per-endpoint reasons, so a prompt too long for
+// every endpoint must still say it is the size that left no route.
+func TestRouteNoRouteBlamesSizeOnlyWhenSizeIsTheCause(t *testing.T) {
+	p, _ := ParsePolicy(testPolicy)
+	r := NewRouter(testRegistry(), []Policy{p})
+	_, _, err := r.Route(RouteInput{Selector: "auto", TaskClass: TaskChat, EstTokensIn: 50_000_000})
+	if err == nil || !strings.Contains(err.Error(), "context too small") {
+		t.Errorf("a prompt larger than every window: err = %v, want it to say context too small", err)
+	}
+	// A request nothing could serve at any size is not blamed on its size.
+	_, _, err = r.Route(RouteInput{Selector: "auto", TaskClass: TaskChat, Required: Capabilities{Embeddings: true}, EstTokensIn: 50_000_000})
+	if err == nil || strings.Contains(err.Error(), "context too small") {
+		t.Errorf("an unservable capability: err = %v, want no size blame", err)
 	}
 }
 
@@ -300,5 +343,147 @@ func TestGatewayEmbedRoutesAndFailsOver(t *testing.T) {
 	// No inputs is a no-op.
 	if resp, err := g.Embed(context.Background(), &EmbedRequest{Model: "auto"}); err != nil || len(resp.Vectors) != 0 {
 		t.Errorf("empty = %+v %v", resp, err)
+	}
+}
+
+// ContextCeiling is the window compaction has to fit a request into: the
+// endpoint's own for a direct pick, the largest eligible one for an alias
+// or rule, and nothing a key the person lacks could unlock.
+func TestContextCeiling(t *testing.T) {
+	p, err := ParsePolicy(testPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRouter(testRegistry(), []Policy{p})
+	cases := []struct {
+		name string
+		in   RouteInput
+		want int
+	}{
+		{"direct", RouteInput{Selector: "local/small"}, 32_000},
+		{"direct down", RouteInput{Selector: "local/down"}, 0},
+		{"alias of small and haiku", RouteInput{Selector: "cheap"}, 200_000},
+		{"auto prefers opus", RouteInput{Selector: "auto", TaskClass: TaskChat}, 1_000_000},
+		{"summarize rule, down skipped", RouteInput{Selector: "auto", TaskClass: TaskSummarize}, 200_000},
+		{"budget downgrade: local only", RouteInput{Selector: "auto", TaskClass: TaskChat, Downgrade: true}, 32_000},
+		{"a size that fits nothing is ignored", RouteInput{Selector: "cheap", EstTokensIn: 5_000_000}, 200_000},
+	}
+	for _, c := range cases {
+		if got := r.ContextCeiling(c.in); got != c.want {
+			t.Errorf("%s: ceiling = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// A rule that matches on a selector gives that name meaning: it routes
+// with the rule's rank, and Selectors lists it beside the aliases so the
+// API, Settings and the MCP server offer it.
+func TestSelectorRuleIsANameWithARank(t *testing.T) {
+	p, err := ParsePolicy(`
+name: t
+rules:
+  - match: { selector: [fast] }
+    rank: throughput
+    prefer: [anthropic/haiku, local/small]
+  - match: {}
+    prefer: [anthropic/opus]
+aliases:
+  cheap: [local/small]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := testRegistry()
+	r := NewRouter(reg, []Policy{p})
+	cands, dec, err := r.Route(RouteInput{Selector: "fast", TaskClass: TaskChat})
+	if err != nil || len(cands) != 2 || dec.Reason != "rule+throughput" {
+		t.Fatalf("fast: cands=%v reason=%q err=%v", dec.Candidates, dec.Reason, err)
+	}
+	sel := p.Selectors()
+	if _, ok := sel["fast"]; !ok || len(sel["fast"]) != 2 {
+		t.Errorf("Selectors lacks fast: %v", sel)
+	}
+	if _, ok := sel["cheap"]; !ok {
+		t.Errorf("Selectors lacks the alias: %v", sel)
+	}
+	if r.ContextCeiling(RouteInput{Selector: "fast", TaskClass: TaskChat}) != 200_000 {
+		t.Errorf("fast ceiling should be haiku's window")
+	}
+}
+
+// With no media engine to go to, the router says that instead of blaming a
+// missing key; with one that is enabled, a missing key is still the reason.
+func TestRouteMediaBlame(t *testing.T) {
+	img := Capabilities{Media: &MediaCaps{Engine: "comfyui", Image: true}}
+	vid := Capabilities{Media: &MediaCaps{Engine: "fal", Video: true}}
+	providers := []*Provider{{ID: "comfyui", Kind: ProviderOpenAICompat}, {ID: "fal", Kind: ProviderOpenAICompat, Hosted: true}}
+	cases := []struct {
+		name string
+		eps  []*Endpoint
+		need *MediaCaps
+		kind string
+		off  bool // the error is a *NoMediaError with Disabled set
+		none bool // the error is a *NoMediaError
+		want string
+	}{
+		{"no media endpoint at all", nil, &MediaCaps{Image: true}, "image", false, true, "no image endpoint is configured"},
+		{"only a video endpoint for an image", []*Endpoint{{ID: "fal/v", ProviderID: "fal", Enabled: true, Capabilities: vid}}, &MediaCaps{Image: true}, "image", false, true, "no image endpoint is configured"},
+		{"the image endpoint is disabled", []*Endpoint{{ID: "comfyui/sdxl", ProviderID: "comfyui", Capabilities: img}}, &MediaCaps{Image: true}, "image", true, true, "every image endpoint is disabled"},
+		{"no video endpoint", []*Endpoint{{ID: "comfyui/sdxl", ProviderID: "comfyui", Enabled: true, Capabilities: img}}, &MediaCaps{Video: true}, "video", false, true, "no video endpoint is configured"},
+		{"an enabled endpoint that needs a key", []*Endpoint{{ID: "fal/img", ProviderID: "fal", Enabled: true, Capabilities: img}}, &MediaCaps{Image: true}, "image", false, false, "needs your own API key"},
+		{"the only image endpoint is down", []*Endpoint{
+			{ID: "comfyui/sdxl", ProviderID: "comfyui", Enabled: true, Capabilities: img, Health: Health{Status: "down", Error: "connection refused"}},
+			{ID: "fal/img", ProviderID: "fal", Enabled: true, Capabilities: img}}, &MediaCaps{Image: true}, "image", false, true,
+			"the image endpoint comfyui/sdxl is down: connection refused; the owner checks the server it points at (COMFYUI_URL) and Admin, endpoints"},
+		{"a down hosted endpoint is not the person's to fix", []*Endpoint{{ID: "fal/img", ProviderID: "fal", Enabled: true, Capabilities: img, Health: Health{Status: "down"}}}, &MediaCaps{Image: true}, "image", false, false, "no endpoint satisfies selector"},
+		{"every image endpoint is down", []*Endpoint{
+			{ID: "comfyui/sdxl", ProviderID: "comfyui", Enabled: true, Capabilities: img, Health: Health{Status: "down"}},
+			{ID: "comfyui/flux", ProviderID: "comfyui", Enabled: true, Capabilities: img, Health: Health{Status: "down"}}}, &MediaCaps{Image: true}, "image", false, true,
+			"every image endpoint is down (comfyui/flux, comfyui/sdxl)"},
+	}
+	for _, c := range cases {
+		reg := NewRegistry()
+		reg.Replace(providers, c.eps)
+		r := NewRouter(reg, nil)
+		_, _, err := r.Route(RouteInput{Selector: "auto", TaskClass: TaskImage, Required: Capabilities{Media: c.need},
+			Keys: &KeyAccess{Shared: false, Own: map[string]bool{}}})
+		if err == nil {
+			t.Fatalf("%s: routed", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: error %q lacks %q", c.name, err, c.want)
+		}
+		var nm *NoMediaError
+		if got := errors.As(err, &nm); got != c.none {
+			t.Errorf("%s: NoMediaError = %v, want %v (%v)", c.name, got, c.none, err)
+		} else if got && (nm.Kind != c.kind || nm.Disabled != c.off) {
+			t.Errorf("%s: %+v", c.name, nm)
+		}
+		if c.none && strings.Contains(err.Error(), "API key") {
+			t.Errorf("%s: blames a key: %q", c.name, err)
+		}
+		if !c.none && strings.Contains(err.Error(), " is down") {
+			t.Errorf("%s: says an endpoint is down: %q", c.name, err)
+		}
+	}
+	// A degraded endpoint is still routed to.
+	reg := NewRegistry()
+	reg.Replace(providers, []*Endpoint{{ID: "comfyui/sdxl", ProviderID: "comfyui", Enabled: true, Capabilities: img, Health: Health{Status: "degraded"}}})
+	if _, _, err := NewRouter(reg, nil).Route(RouteInput{Selector: "auto", TaskClass: TaskImage, Required: Capabilities{Media: &MediaCaps{Image: true}}}); err != nil {
+		t.Errorf("degraded endpoint: %v", err)
+	}
+}
+
+// The routing error prints the media capabilities by value, not as a pointer.
+func TestCapabilitiesStringShowsMediaByValue(t *testing.T) {
+	got := fmt.Sprintf("%+v", Capabilities{Media: &MediaCaps{Image: true}})
+	if strings.Contains(got, "0x") {
+		t.Errorf("pointer in %q", got)
+	}
+	if !strings.Contains(got, "Media:{Engine: Image:true") {
+		t.Errorf("media not printed by value: %q", got)
+	}
+	if got := fmt.Sprintf("%+v", Capabilities{Tools: true}); !strings.Contains(got, "Tools:true") || !strings.Contains(got, "Media:<nil>") {
+		t.Errorf("text caps: %q", got)
 	}
 }

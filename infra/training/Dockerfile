@@ -11,11 +11,17 @@
 # a Mac, run train.py's MLX branch by hand; see README.md.
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 HF_HOME=/cache/hf
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip git && rm -rf /var/lib/apt/lists/*
+# build-essential: unsloth and trl 1.x use Triton kernels, and Triton needs
+# a C compiler and the Python headers at first use (see Dockerfile.orin).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-dev git build-essential && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --upgrade pip && pip3 install "torch==2.5.*" --index-url https://download.pytorch.org/whl/cu124 \
     && pip3 install "unsloth[cu124-torch250]" "trl>=0.12" "datasets>=3" "peft>=0.13" "transformers>=4.46"
+# llama.cpp's LoRA converter, so train.py can also write the adapter as a
+# GGUF LoRA for llama-server (GGUF_LORA=0 skips it). Pin a commit in prod.
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
+    && pip3 install /opt/llama.cpp/gguf-py
 WORKDIR /app
-COPY train.py serve.py entry.sh /app/
+COPY train.py train_mlx.py serve.py entry.sh /app/
 RUN chmod +x /app/entry.sh
 VOLUME ["/cache/hf"]
 EXPOSE 8000

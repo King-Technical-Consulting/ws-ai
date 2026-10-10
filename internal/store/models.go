@@ -289,6 +289,14 @@ type Endpoint struct {
 	ExtraBody       json.RawMessage `json:"extra_body"`
 }
 
+type EndpointThroughput struct {
+	EndpointID   string    `json:"endpoint_id"`
+	TokensPerSec float64   `json:"tokens_per_sec"`
+	TtftMs       float64   `json:"ttft_ms"`
+	Samples      int32     `json:"samples"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 type FinetuneJob struct {
 	ID             uuid.UUID       `json:"id"`
 	OwnerID        uuid.UUID       `json:"owner_id"`
@@ -514,16 +522,27 @@ type UsageLedger struct {
 	FinishReason     *string         `json:"finish_reason"`
 	Error            *string         `json:"error"`
 	SessionID        *string         `json:"session_id"`
+	OwnKey           bool            `json:"own_key"`
 }
 
 type User struct {
-	ID              uuid.UUID  `json:"id"`
-	Email           string     `json:"email"`
-	DisplayName     string     `json:"display_name"`
-	Role            string     `json:"role"`
-	CreatedAt       time.Time  `json:"created_at"`
-	DisabledAt      *time.Time `json:"disabled_at"`
-	TrainingConsent bool       `json:"training_consent"`
+	ID                 uuid.UUID  `json:"id"`
+	Email              string     `json:"email"`
+	DisplayName        string     `json:"display_name"`
+	Role               string     `json:"role"`
+	CreatedAt          time.Time  `json:"created_at"`
+	DisabledAt         *time.Time `json:"disabled_at"`
+	TrainingConsent    bool       `json:"training_consent"`
+	SharedProviderKeys bool       `json:"shared_provider_keys"`
+}
+
+type UserProviderKey struct {
+	UserID     uuid.UUID `json:"user_id"`
+	ProviderID string    `json:"provider_id"`
+	Sealed     []byte    `json:"sealed"`
+	Last4      string    `json:"last4"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type WebauthnSession struct {

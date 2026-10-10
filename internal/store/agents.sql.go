@@ -394,6 +394,17 @@ func (q *Queries) FindToolStep(ctx context.Context, arg FindToolStepParams) (Age
 	return i, err
 }
 
+const finishRun = `-- name: FinishRun :exec
+UPDATE agent_runs SET status = 'done', ended_at = now()
+WHERE id = $1 AND status NOT IN ('paused_manual','cancelled')
+`
+
+// Mark a run done unless the monitor paused or cancelled it meanwhile.
+func (q *Queries) FinishRun(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, finishRun, id)
+	return err
+}
+
 const finishStep = `-- name: FinishStep :exec
 UPDATE agent_steps SET output = $2, usage = $3, error = $4, checkpoint = COALESCE($5, checkpoint), ended_at = now() WHERE id = $1
 `
@@ -938,6 +949,44 @@ func (q *Queries) ListQueuedRuns(ctx context.Context) ([]AgentRun, error) {
 	return items, nil
 }
 
+const listRepoPushTriggers = `-- name: ListRepoPushTriggers :many
+SELECT t.id, t.agent_id, t.kind, t.spec, t.secret_hash, t.enabled, t.created_at, t.name, t.next_run_at, t.last_run_at, t.last_error FROM agent_triggers t JOIN agents a ON a.id = t.agent_id
+WHERE t.enabled AND a.enabled AND t.kind = 'repo_push'
+ORDER BY t.created_at
+`
+
+func (q *Queries) ListRepoPushTriggers(ctx context.Context) ([]AgentTrigger, error) {
+	rows, err := q.db.Query(ctx, listRepoPushTriggers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTrigger{}
+	for rows.Next() {
+		var i AgentTrigger
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.Kind,
+			&i.Spec,
+			&i.SecretHash,
+			&i.Enabled,
+			&i.CreatedAt,
+			&i.Name,
+			&i.NextRunAt,
+			&i.LastRunAt,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForAgent = `-- name: ListRunsForAgent :many
 SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2
 `
@@ -1163,9 +1212,44 @@ func (q *Queries) NextStepSeq(ctx context.Context, runID uuid.UUID) (int32, erro
 	return column_1, err
 }
 
+const pauseRunForApproval = `-- name: PauseRunForApproval :one
+UPDATE agent_runs SET status = 'paused_approval'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'running'
+  AND EXISTS (SELECT 1 FROM approvals WHERE run_id = $1 AND status = 'pending')
+RETURNING agent_runs.id
+`
+
+// PauseRunForApproval parks a running run only while a decision is still
+// outstanding. A decision that landed while the batch was finishing leaves
+// no pending row, the update changes nothing, and the caller runs the
+// decided calls instead of pausing a run nobody will wake.
+func (q *Queries) PauseRunForApproval(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, pauseRunForApproval, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const requeueRunAfterApproval = `-- name: RequeueRunAfterApproval :one
+UPDATE agent_runs SET status = 'queued'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'paused_approval'
+  AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id = $1 AND status = 'pending')
+RETURNING agent_runs.id
+`
+
+// RequeueRunAfterApproval hands a parked run back to the worker once no
+// decision is outstanding. Only a parked run is moved: one still 'running'
+// is finishing its batch and will see the decision itself.
+func (q *Queries) RequeueRunAfterApproval(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, requeueRunAfterApproval, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const resumeRunAfterApproval = `-- name: ResumeRunAfterApproval :one
 UPDATE agent_runs SET status = 'running', owner_pid = $2, heartbeat_at = now()
-WHERE id = $1 AND status = 'paused_approval'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'paused_approval'
 RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at
 `
 

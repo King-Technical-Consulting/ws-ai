@@ -25,7 +25,9 @@ export default function Login() {
       const { options, ceremony_id } = await api.post<{ options: { publicKey: unknown }; ceremony_id: string }>('/api/auth/passkey/login/begin')
       const assertion = await startAuthentication({ optionsJSON: options.publicKey as never })
       await api.postRaw(`/api/auth/passkey/login/finish?ceremony=${ceremony_id}`, JSON.stringify(assertion))
-      await qc.invalidateQueries({ queryKey: ['me'] })
+      // Nothing on this page observes ['me'], so invalidate only marks it
+      // stale and the next page would render the cached signed-out answer.
+      await qc.refetchQueries({ queryKey: ['me'] })
       nav(from, { replace: true })
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Passkey sign-in failed.')

@@ -85,7 +85,7 @@ export function ArtifactPanel({ id, version, onClose, onVersion }: { id: string;
   const canDiff = !!d && TEXT_KINDS.has(d.kind) && cur > 1
 
   return (
-    <aside className="w-[46%] min-w-[380px] shrink-0 border-l border-line bg-bg-2 flex flex-col">
+    <aside className="fixed inset-0 z-20 md:static md:z-auto md:w-[46%] md:min-w-[380px] md:shrink-0 border-l border-line bg-bg-2 flex flex-col">
       <header className="h-12 shrink-0 border-b border-line flex items-center gap-2 px-3">
         <span className="min-w-0 flex-1 truncate reading-tight">{d?.title ?? 'Artifact'}</span>
         {d && <span className="meta">{d.kind}</span>}

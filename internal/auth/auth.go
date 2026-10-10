@@ -33,6 +33,8 @@ var (
 	ErrNotInvited    = errors.New("auth: email not invited")
 	ErrAlreadyExists = errors.New("auth: user already exists")
 	ErrUnauthorized  = errors.New("auth: unauthorized")
+	ErrNotFound      = errors.New("auth: not found")
+	ErrInviteUsed    = errors.New("auth: invite already accepted") // revoke or resend of an accepted invite
 )
 
 // Durations.
@@ -62,6 +64,8 @@ type Service struct {
 	mailer    Mailer
 	publicURL string
 	secure    bool // Secure cookie flag
+	// magicLimit brakes sign-in mail: per address and overall.
+	magicLimit *sendLimiter
 }
 
 // PasskeysEnabled reports whether WebAuthn ceremonies can run.
@@ -96,7 +100,8 @@ func New(db *store.DB, mailer Mailer, cfg Config) (*Service, error) {
 		slog.Warn("passkeys disabled: WebAuthn configuration rejected (serve on a domain over https to enable them)", "rp_id", cfg.RPID, "err", err)
 		wa = nil
 	}
-	return &Service{db: db, wa: wa, mailer: mailer, publicURL: strings.TrimRight(cfg.PublicURL, "/"), secure: cfg.SecureCookies}, nil
+	return &Service{db: db, wa: wa, mailer: mailer, publicURL: strings.TrimRight(cfg.PublicURL, "/"), secure: cfg.SecureCookies,
+		magicLimit: newSendLimiter(3, 60, 15*time.Minute)}, nil
 }
 
 // ---- tokens ----
@@ -136,12 +141,48 @@ func (s *Service) Invite(ctx context.Context, email string, invitedBy uuid.UUID,
 		return "", err
 	}
 	link := s.publicURL + "/invite/" + raw
-	if s.mailer != nil {
-		_ = s.mailer.Send(ctx, email, "You're invited to ws",
-			"You've been invited. Open this link to set up your account (expires in 7 days):\n\n"+link,
-			fmt.Sprintf(`<p>You've been invited to <b>ws</b>.</p><p><a href="%s">Accept invite</a> (expires in 7 days)</p>`, link))
-	}
+	_ = s.send(ctx, email, mail{
+		Subject: "You're invited to ws",
+		Title:   "You're invited to ws",
+		Intro:   "Someone set up an account for you on their ws workspace. Open the link to choose how you sign in.",
+		Action:  "Accept the invite",
+		Link:    link,
+		Expires: "7 days",
+	})
 	return link, nil
+}
+
+// RevokeInvite withdraws a pending invite; its link stops working.
+func (s *Service) RevokeInvite(ctx context.Context, id uuid.UUID) error {
+	inv, err := s.db.GetInvite(ctx, id)
+	if err != nil {
+		return ErrNotFound
+	}
+	if inv.UsedAt != nil {
+		return ErrInviteUsed
+	}
+	if n, err := s.db.DeletePendingInvite(ctx, id); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrInviteUsed
+	}
+	return nil
+}
+
+// ResendInvite issues a fresh link for a pending invite's address and role
+// and withdraws the old one, mailing the new link as Invite does.
+func (s *Service) ResendInvite(ctx context.Context, id uuid.UUID, by uuid.UUID) (string, error) {
+	inv, err := s.db.GetInvite(ctx, id)
+	if err != nil {
+		return "", ErrNotFound
+	}
+	if inv.UsedAt != nil {
+		return "", ErrInviteUsed
+	}
+	if _, err := s.db.DeletePendingInvite(ctx, id); err != nil {
+		return "", err
+	}
+	return s.Invite(ctx, inv.Email, by, inv.Role)
 }
 
 // BootstrapOwner creates the owner invite on first boot if no users exist.
@@ -206,24 +247,50 @@ func (s *Service) PeekInvite(ctx context.Context, rawToken string) (string, erro
 // ---- magic links ----
 
 // SendMagicLink emails a one-time login link. It does not reveal whether
-// the email exists.
+// the email exists: it always returns nil, and the work for a known address
+// (the row and the mail) happens after the reply, so a known and an unknown
+// address take the same time. An address that has asked for three links in
+// 15 minutes, or a service that has sent 60 in that time, is dropped
+// silently, with the same reply.
 func (s *Service) SendMagicLink(ctx context.Context, email string) error {
 	email = strings.ToLower(strings.TrimSpace(email))
 	u, err := s.db.GetUserByEmail(ctx, email)
-	if err != nil {
-		return nil // silent: don't leak membership
+	if err != nil || u.DisabledAt != nil {
+		return nil // silent: don't leak membership, nor that an account is disabled
 	}
+	// Keyed by the user, not the typed string: the address column is
+	// case-insensitive, and any spelling of it should share one budget.
+	ok, first := s.magicLimit.AllowReport(u.ID.String())
+	if !ok {
+		if first { // once per streak, so a flood cannot fill the log
+			slog.Warn("magic link not sent: rate limited", "user", u.ID)
+		}
+		return nil
+	}
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.issueMagicLink(bg, u.ID, email); err != nil {
+			slog.Warn("magic link failed", "user", u.ID, "err", err)
+		}
+	}()
+	return nil
+}
+
+func (s *Service) issueMagicLink(ctx context.Context, userID uuid.UUID, email string) error {
 	raw, hash := newToken()
-	if _, err := s.db.CreateMagicLink(ctx, store.CreateMagicLinkParams{UserID: u.ID, TokenHash: hash, ExpiresAt: time.Now().Add(MagicLinkTTL)}); err != nil {
+	if _, err := s.db.CreateMagicLink(ctx, store.CreateMagicLinkParams{UserID: userID, TokenHash: hash, ExpiresAt: time.Now().Add(MagicLinkTTL)}); err != nil {
 		return err
 	}
 	link := s.publicURL + "/login/magic/" + raw
-	if s.mailer == nil {
-		return nil
-	}
-	return s.mailer.Send(ctx, email, "Your ws sign-in link",
-		"Click to sign in (expires in 15 minutes):\n\n"+link,
-		fmt.Sprintf(`<p><a href="%s">Sign in to ws</a> (expires in 15 minutes)</p>`, link))
+	return s.send(ctx, email, mail{
+		Subject: "Your ws sign-in link",
+		Title:   "Sign in to ws",
+		Intro:   "Here is the one-time link you asked for. It works once, from any device.",
+		Action:  "Sign in",
+		Link:    link,
+		Expires: "15 minutes",
+	})
 }
 
 // ConsumeMagicLink validates the token and returns the user.
@@ -235,6 +302,10 @@ func (s *Service) ConsumeMagicLink(ctx context.Context, rawToken string) (*store
 	u, err := s.db.GetUserByID(ctx, ml.UserID)
 	if err != nil {
 		return nil, err
+	}
+	if u.DisabledAt != nil {
+		// A link issued before the account was disabled fails like a bad one.
+		return nil, ErrInvalidToken
 	}
 	return &u, nil
 }
@@ -517,7 +588,7 @@ func (s *Service) FinishLogin(ctx context.Context, ceremonyID uuid.UUID, r *http
 		if err != nil {
 			return nil, ErrUnauthorized
 		}
-		if subtle.ConstantTimeCompare(userHandle, u.ID[:]) != 1 {
+		if subtle.ConstantTimeCompare(userHandle, u.ID[:]) != 1 || u.DisabledAt != nil {
 			return nil, ErrUnauthorized
 		}
 		found = u

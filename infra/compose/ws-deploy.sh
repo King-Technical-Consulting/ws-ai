@@ -9,6 +9,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# One deploy at a time: the systemd timer and a `make deploy` by hand would
+# otherwise recreate the same containers at once and one of them fails on
+# the port binding. The second run waits for the first, then applies again
+# (a no-op when the first already brought everything up).
+lock="${XDG_RUNTIME_DIR:-/tmp}/ws-deploy.lock"
+exec 9>"$lock"
+if ! flock -w 600 9; then
+  printf '%s ws-deploy: another deploy has held %s for 10 minutes; giving up\n' "$(date -u +%FT%TZ)" "$lock" >&2
+  exit 1
+fi
+
 if [ -f .env ]; then
   HW="${HW:-$(grep -E '^WS_DEPLOY_HW=' .env | cut -d= -f2- || true)}"
   INGRESS="${INGRESS:-$(grep -E '^WS_DEPLOY_INGRESS=' .env | cut -d= -f2- || true)}"

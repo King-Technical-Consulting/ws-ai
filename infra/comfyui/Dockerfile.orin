@@ -1,0 +1,22 @@
+# ComfyUI for a Jetson (Orin) on JetPack 7 (L4T R39, CUDA 13): plain Ubuntu
+# with torch from PyPI, whose wheels bundle their own CUDA runtime, so
+# `--runtime nvidia` only has to hand the container the host's driver (the
+# same route as infra/training/Dockerfile.orin). ComfyUI is a black box to
+# ws; nothing of ws runs inside it.
+#
+#   docker build -f infra/comfyui/Dockerfile.orin -t ws-comfyui:orin infra/comfyui
+#
+# Run it with --runtime nvidia (not --gpus all: the Jetson container runtime
+# hook is not supported through --gpus); see README.md for the run line.
+ARG COMFY_REF=v0.39.2
+FROM ubuntu:24.04
+ARG COMFY_REF
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 PIP_BREAK_SYSTEM_PACKAGES=1 PIP_INDEX_URL=https://pypi.org/simple \
+    NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=all
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-dev build-essential git ca-certificates libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN pip3 install torch torchvision torchaudio
+RUN git clone --depth 1 --branch ${COMFY_REF} https://github.com/comfyanonymous/ComfyUI /app && cd /app && pip3 install -r requirements.txt
+WORKDIR /app
+VOLUME ["/app/models", "/app/output"]
+EXPOSE 8188
+ENTRYPOINT ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]

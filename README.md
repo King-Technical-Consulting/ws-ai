@@ -19,9 +19,9 @@
 - 🔀 **One gateway for every model.** llama.cpp, vLLM, Ollama and anything OpenAI-compatible sit next to Anthropic, OpenAI and OpenRouter. Budgets can block a call or send it to a local model, and every call is written to a usage ledger.
 - 🤖 **Claude Code, routed through ws.** Point Claude Code at ws as its gateway, or let ws launch real Claude Code sessions on your own machines through a small CLI.
 - 🗓️ **Agents that keep working.** Long-lived agents with a goal, their own tools and a monthly budget. Cron, webhook and GitHub push triggers start them, they remember between runs, and you can pause, resume or steer a run from a monitor page.
-- 🎨 **Images and video.** Generate and edit images, upscale them, and make short videos through OpenAI, fal.ai, Google or a ComfyUI you run, with the price shown first. The engines beyond OpenAI images were only tested against fakes so far.
+- 🎨 **Images and video.** Generate and edit images, upscale them, and make short videos through OpenAI, fal.ai, Google or a ComfyUI you run, with the price shown first. The ComfyUI engine has rendered on a Jetson AGX Orin; the hosted engines were tested against fake servers only, and the Google engine cannot edit, mask or upscale.
 - 🔌 **Open to your other tools.** ws is also an MCP server, and API keys carry scopes, so a key reaches only what you gave it.
-- 🧪 **Early: rented GPUs and fine-tuning.** Start a RunPod GPU from Admin with a daily cap and idle shutdown. Rate answers, opt conversations in, export a dataset, fine-tune an adapter and let an eval gate decide whether the adapter goes live. Both are first cuts: treat them as early.
+- 🧪 **Early: rented GPUs and fine-tuning.** Start a RunPod GPU from Admin with a daily cap and idle shutdown. Rate answers, opt conversations in, export a dataset, pick a base model from the Hugging Face hub, fine-tune an adapter on your own trainer box or a rented GPU, and let an eval gate decide whether the adapter goes live. Both are early: one real adapter has been trained so far.
 
 ## How it fits together
 

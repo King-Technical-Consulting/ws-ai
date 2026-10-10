@@ -266,6 +266,8 @@ func TestCreateValidatesAndEstimates(t *testing.T) {
 	}
 	if _, err := svc.Create(ctx, CreateParams{UserID: uid, ProjectID: pid, Kind: KindVideo, Inputs: Inputs{Prompt: "cat"}}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("video with no video endpoint should fail: %v", err)
+	} else if !strings.Contains(err.Error(), "no video endpoint is configured") || strings.Contains(err.Error(), "router:") {
+		t.Errorf("the person should read the router's plain reason: %v", err)
 	}
 	if _, err := svc.Create(ctx, CreateParams{UserID: uid, ProjectID: pid, Selector: "anthropic/opus", Inputs: Inputs{Prompt: "cat"}}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("text endpoint as selector should fail: %v", err)

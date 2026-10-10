@@ -28,7 +28,7 @@ import (
 
 // Store is the slice of the store the registry uses (*store.DB implements it).
 type Store interface {
-	UpsertCCJob(ctx context.Context, arg store.UpsertCCJobParams) (store.CcJob, error)
+	UpsertCCJob(ctx context.Context, arg store.UpsertCCJobParams) (store.UpsertCCJobRow, error)
 	GetCCJob(ctx context.Context, id string) (store.CcJob, error)
 	ListCCJobs(ctx context.Context, limit int32) ([]store.CcJob, error)
 	ListCCJobsOpen(ctx context.Context) ([]store.CcJob, error)
@@ -157,15 +157,19 @@ func (r *Registry) Report(ctx context.Context, userID uuid.NullUUID, source stri
 		p.Model = &m
 	}
 	// A launch counts once, in the week it started, whoever reported it;
-	// a re-report of a known job is not a launch.
-	_, lookupErr := r.DB.GetCCJob(ctx, rep.ID)
+	// a re-report of a known job is not a launch. The upsert itself says
+	// whether it inserted, so two reports of the same new job racing cannot
+	// both count, and a database error never passes for a new job.
 	row, err := r.DB.UpsertCCJob(ctx, p)
-	if err == nil && lookupErr != nil {
+	if err != nil {
+		return store.CcJob{}, err
+	}
+	if row.Inserted {
 		if _, cerr := r.DB.IncrementCCLaunchCounter(ctx, ccjobs.WeekStart(started)); cerr != nil {
 			r.warn("cc_launch_counter", cerr)
 		}
 	}
-	return row, err
+	return row.CcJob, nil
 }
 
 // Budget is this week's pool: the launches counted so far against the

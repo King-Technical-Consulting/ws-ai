@@ -21,6 +21,11 @@ UPDATE agent_runs SET status = $2, error = $3,
     started_at = COALESCE(started_at, CASE WHEN $2 = 'running' THEN now() ELSE NULL END)
 WHERE id = $1;
 
+-- name: FinishRun :exec
+-- Mark a run done unless the monitor paused or cancelled it meanwhile.
+UPDATE agent_runs SET status = 'done', ended_at = now()
+WHERE id = $1 AND status NOT IN ('paused_manual','cancelled');
+
 -- name: ClaimRun :one
 -- Atomically take a queued/paused/stale-running run for this process.
 UPDATE agent_runs SET status = 'running', owner_pid = $2, heartbeat_at = now(), started_at = COALESCE(started_at, now())
@@ -29,8 +34,27 @@ RETURNING *;
 
 -- name: ResumeRunAfterApproval :one
 UPDATE agent_runs SET status = 'running', owner_pid = $2, heartbeat_at = now()
-WHERE id = $1 AND status = 'paused_approval'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'paused_approval'
 RETURNING *;
+
+-- PauseRunForApproval parks a running run only while a decision is still
+-- outstanding. A decision that landed while the batch was finishing leaves
+-- no pending row, the update changes nothing, and the caller runs the
+-- decided calls instead of pausing a run nobody will wake.
+-- name: PauseRunForApproval :one
+UPDATE agent_runs SET status = 'paused_approval'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'running'
+  AND EXISTS (SELECT 1 FROM approvals WHERE run_id = $1 AND status = 'pending')
+RETURNING agent_runs.id;
+
+-- RequeueRunAfterApproval hands a parked run back to the worker once no
+-- decision is outstanding. Only a parked run is moved: one still 'running'
+-- is finishing its batch and will see the decision itself.
+-- name: RequeueRunAfterApproval :one
+UPDATE agent_runs SET status = 'queued'
+WHERE agent_runs.id = $1 AND agent_runs.status = 'paused_approval'
+  AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id = $1 AND status = 'pending')
+RETURNING agent_runs.id;
 
 -- name: HeartbeatRun :exec
 UPDATE agent_runs SET heartbeat_at = now() WHERE id = $1 AND owner_pid = $2;
@@ -133,6 +157,11 @@ UPDATE agent_triggers SET enabled = $3 WHERE id = $1 AND agent_id = $2;
 SELECT t.* FROM agent_triggers t JOIN agents a ON a.id = t.agent_id
 WHERE t.enabled AND a.enabled AND t.kind = 'cron' AND t.next_run_at IS NOT NULL AND t.next_run_at <= now()
 ORDER BY t.next_run_at LIMIT 50;
+
+-- name: ListRepoPushTriggers :many
+SELECT t.* FROM agent_triggers t JOIN agents a ON a.id = t.agent_id
+WHERE t.enabled AND a.enabled AND t.kind = 'repo_push'
+ORDER BY t.created_at;
 
 -- name: SetTriggerFired :exec
 UPDATE agent_triggers SET last_run_at = now(), next_run_at = $2, last_error = $3 WHERE id = $1;

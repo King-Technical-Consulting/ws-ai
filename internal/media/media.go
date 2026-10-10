@@ -519,6 +519,11 @@ func (s *Service) route(ctx context.Context, userID uuid.UUID, conv uuid.NullUUI
 		if errors.Is(err, gateway.ErrBudgetExceeded) {
 			return nil, dec, err
 		}
+		var nm *gateway.NoMediaError
+		if errors.As(err, &nm) {
+			// No engine at all: the router's wording is the whole message.
+			return nil, dec, fmt.Errorf("%w: %s", ErrInvalid, nm.Error())
+		}
 		return nil, dec, fmt.Errorf("%w: no %s endpoint for %q: %v", ErrInvalid, kind, selector, strings.TrimPrefix(err.Error(), gateway.ErrNoRoute.Error()+": "))
 	}
 	return cands, dec, nil
@@ -642,7 +647,7 @@ func (s *Service) Run(ctx context.Context, id uuid.UUID) error {
 		}
 		dec.Chosen = ep.ID
 		s.GW.Record(ctx, gateway.UsageRecord{Metadata: meta, EndpointID: ep.ID, Model: ep.ModelName, Decision: dec,
-			Usage: usage, CostUSD: cost, Latency: s.now().Sub(start), FinishReason: gateway.FinishStop})
+			Usage: usage, CostUSD: cost, Latency: s.now().Sub(start), FinishReason: gateway.FinishStop, OwnKey: c.OwnKey})
 		log.Info("media: job done", "job", job.ID, "kind", job.Kind, "endpoint", ep.ID, "outputs", len(ids), "cost_usd", cost)
 		return nil
 	}

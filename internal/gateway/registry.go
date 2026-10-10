@@ -78,13 +78,37 @@ func (r *Registry) Providers() []*Provider {
 	return out
 }
 
-// SetHealth updates health fields in place (called by the health checker).
+// A published *Endpoint is read without a lock by the router, the HTTP
+// handlers and json.Marshal, so it must never change. The two fields that
+// do change at runtime, Enabled and Health, are updated by storing a
+// modified copy under the registry's lock: a reader that already holds a
+// pointer keeps a consistent snapshot, and the next lookup sees the new one.
+
+// SetHealth records an endpoint's health (called by the health checker).
 func (r *Registry) SetHealth(id string, status string, p50ms int, errRate float64, errText string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e, ok := r.endpoints[id]; ok {
-		e.Health = Health{Status: status, P50LatencyMS: p50ms, ErrorRate: errRate, Error: errText}
+		n := *e
+		n.Health = Health{Status: status, P50LatencyMS: p50ms, ErrorRate: errRate, Error: errText}
+		r.endpoints[id] = &n
 	}
+}
+
+// SetEnabled switches an endpoint on or off. It reports whether the
+// endpoint exists. A request that already picked the endpoint finishes on
+// it; the toggle has never cancelled running requests.
+func (r *Registry) SetEnabled(id string, enabled bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.endpoints[id]
+	if !ok {
+		return false
+	}
+	n := *e
+	n.Enabled = enabled
+	r.endpoints[id] = &n
+	return true
 }
 
 // Health is the runtime health of an endpoint.
@@ -163,7 +187,9 @@ func LoadSeed(path string) (*SeedFile, error) {
 
 // Resolve turns seed entries into runtime values, reading env for keys and
 // base URLs. Providers whose base_url_env is unset are skipped along with
-// their endpoints, so one file serves every hardware target.
+// their endpoints, so one file serves every hardware target. A hosted
+// provider whose key env is unset stays, with no key: people who save their
+// own key for it can use it, nobody else can (keys.go).
 func (sf *SeedFile) Resolve(getenv func(string) string) ([]*Provider, []*Endpoint) {
 	var provs []*Provider
 	have := map[string]bool{}
@@ -175,12 +201,9 @@ func (sf *SeedFile) Resolve(getenv func(string) string) ([]*Provider, []*Endpoin
 				continue
 			}
 		}
-		p := &Provider{ID: sp.ID, Kind: sp.Kind, Name: sp.Name, BaseURL: base, Headers: sp.Headers}
+		p := &Provider{ID: sp.ID, Kind: sp.Kind, Name: sp.Name, BaseURL: base, Headers: sp.Headers, Hosted: sp.APIKeyEnv != ""}
 		if sp.APIKeyEnv != "" {
 			p.APIKey = getenv(sp.APIKeyEnv)
-			if p.APIKey == "" {
-				continue // hosted provider without a key is not configured here
-			}
 		}
 		provs = append(provs, p)
 		have[p.ID] = true

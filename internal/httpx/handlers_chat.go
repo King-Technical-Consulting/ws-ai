@@ -156,11 +156,14 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "already decided")
 		return
 	}
-	// hand the run to the worker so it continues even with no client streaming
+	// Hand the run to the worker so it continues even with no client
+	// streaming. Only a parked run with nothing left to decide is moved; one
+	// still finishing its batch sees the decision itself (PauseRunForApproval).
 	if s.Jobs != nil {
-		if pending, _ := s.DB.ListPendingApprovals(r.Context(), run.ID); len(pending) == 0 {
-			_ = s.DB.SetRunStatus(r.Context(), store.SetRunStatusParams{ID: run.ID, Status: "queued"})
-			_ = s.Jobs.EnqueueRun(r.Context(), run.ID)
+		if _, err := s.DB.RequeueRunAfterApproval(r.Context(), run.ID); err == nil {
+			if err := s.Jobs.EnqueueResume(r.Context(), run.ID); err != nil {
+				s.Log.Warn("approval: enqueue run", "run", run.ID, "err", err)
+			}
 		}
 	}
 	writeJSON(w, 200, row)

@@ -1,0 +1,55 @@
+# Trainer image for a Jetson (Orin): the same train.py and serve.py as the
+# Dockerfile next to this one, with plain transformers, peft and trl and
+# no unsloth. Unsloth cannot run on a Jetson: its install replaces torch
+# with a build that does not list the Orin's sm_87, and without Triton it
+# falls back to CPU (agx-orin, board 8d50).
+#
+# The base is plain Ubuntu and torch comes from PyPI: the PyPI wheels
+# bundle their own CUDA runtime, and --runtime nvidia hands them the
+# host's driver, so this works on JetPack 7 (L4T R39, CUDA 13) where the
+# jetson-containers r36 images do not (their torch cannot see an R39 GPU,
+# and their pip index was unreachable; agx-orin, board ec70). On an AGX
+# Orin with R39 the PyPI torch imports and reports the GPU; whether every
+# kernel runs on sm_87 is what the smoke run below checks. For JetPack 6
+# (R36) set BASE_IMAGE to a jetson-containers pytorch tag matching
+# `cat /etc/nv_tegra_release` and TORCH_SPEC to an empty string.
+#
+#   docker build -f infra/training/Dockerfile.orin -t ws-trainer:orin infra/training
+#   # smoke run, train mode, a tiny base and a few examples:
+#   docker run --rm --runtime nvidia -v $PWD/smoke:/data -v $PWD/out:/out \
+#     -e BASE_MODEL=Qwen/Qwen2.5-0.5B-Instruct -e ADAPTER_NAME=smoke -e EPOCHS=1 \
+#     -e MAX_SEQ_LEN=512 -e GGUF_LORA=0 ws-trainer:orin
+#   # serve mode (port 8090 on the host: llama-server has 8000):
+#   docker run -d --name ws-trainer --runtime nvidia -p <tailnet addr>:8090:8000 \
+#     -e TRAINER_MODE=serve -e TRAINER_API_KEY=<long random> \
+#     -v ws-hf-cache:/cache/hf ws-trainer:orin
+#
+# --runtime nvidia, not --gpus all: the Jetson container runtime hook is
+# not supported through --gpus.
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+# TORCH_SPEC: the torch to install from PyPI (empty keeps the base's torch).
+ARG TORCH_SPEC=torch
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 HF_HOME=/cache/hf TRAINER_BACKEND=peft \
+    PIP_BREAK_SYSTEM_PACKAGES=1 PIP_INDEX_URL=https://pypi.org/simple \
+    NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=all
+# The two NVIDIA_* variables are what the container runtime reads to mount
+# the driver; the nvidia/cuda bases set them, plain Ubuntu does not, and
+# without them torch finds no driver (agx-orin, board a8da).
+# build-essential: trl 1.x computes the loss with a fused Triton kernel
+# (no switch), and Triton compiles a small launcher with the system C
+# compiler at first use; without one every training step fails with
+# "Failed to find C compiler" (agx-orin, board 28e0). python3-dev: that
+# launcher includes Python.h, so the headers are needed too (board 7371).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-dev git build-essential && rm -rf /var/lib/apt/lists/*
+RUN if [ -n "$TORCH_SPEC" ]; then pip3 install "$TORCH_SPEC"; fi \
+    && pip3 install "trl>=0.12" "datasets>=3" "peft>=0.13" "transformers>=4.46" "accelerate>=1.0"
+# llama.cpp's LoRA converter, for the GGUF export (best effort, see train.py).
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
+    && pip3 install /opt/llama.cpp/gguf-py
+WORKDIR /app
+COPY train.py train_mlx.py serve.py entry.sh /app/
+RUN chmod +x /app/entry.sh
+VOLUME ["/cache/hf"]
+EXPOSE 8000
+ENTRYPOINT ["/app/entry.sh"]

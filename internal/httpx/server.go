@@ -31,6 +31,7 @@ import (
 	"github.com/jking323/ws/internal/mcpserver"
 	"github.com/jking323/ws/internal/media"
 	"github.com/jking323/ws/internal/sandbox"
+	"github.com/jking323/ws/internal/sealed"
 	"github.com/jking323/ws/internal/store"
 	"github.com/jking323/ws/internal/store/blob"
 	"github.com/jking323/ws/internal/training"
@@ -61,6 +62,9 @@ type Server struct {
 	Media *media.Service
 	// Blobs serves attachments; nil answers 503 for them.
 	Blobs blob.Store
+	// GitHubWebhookSecret, when set, opens POST /hooks/github for the GitHub
+	// App's deliveries (signed with it), fanned out to repo_push triggers.
+	GitHubWebhookSecret string
 	// Agents starts and steers long-lived agent runs; nil answers 503 on
 	// the routes that need it.
 	Agents *agents.Service
@@ -69,6 +73,11 @@ type Server struct {
 	// Training is the flywheel (datasets, fine-tunes, adapters); nil
 	// answers 503 on those routes (ratings and consent still work).
 	Training *training.Service
+	// Secrets seals people's own provider keys; nil leaves saving them off.
+	Secrets *sealed.Box
+	// KeyStore tells the gateway whose key to use; the key routes drop its
+	// cache for a person when they change their keys. nil in tests.
+	KeyStore *store.KeyStore
 	Log      *slog.Logger
 	// Web is the built frontend (web/dist). nil disables static serving.
 	Web fs.FS
@@ -102,7 +111,13 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) appHandler() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// The client address comes from a forwarded header only when the TCP
+	// peer is a trusted proxy (WS_TRUSTED_PROXIES); see clientip.go.
+	var trusted string
+	if s.Cfg != nil {
+		trusted = s.Cfg.TrustedProxies
+	}
+	r.Use(trustedRealIP(parsePrefixes(trusted)))
 	r.Use(s.logging)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(15 * time.Minute)) // long streams
@@ -115,6 +130,7 @@ func (s *Server) appHandler() http.Handler {
 
 	// Agent webhooks (PLAN M7): the secret in the path is the credential.
 	r.Post("/hooks/agents/{id}/{secret}", s.handleAgentHook)
+	r.Post("/hooks/github", s.handleGitHubAppHook)
 
 	// External API for Claude Code, Cursor, opencode, etc. Bearer / x-api-key.
 	ext := &externalapi.Server{GW: s.GW, Log: s.Log, Principal: func(ctx context.Context) *externalapi.Principal {
@@ -150,6 +166,7 @@ func (s *Server) appHandler() http.Handler {
 		api.Group(func(pr chi.Router) {
 			pr.Use(requireAuth)
 			pr.Get("/me", s.handleMe)
+			pr.Put("/me", s.handleUpdateMe)
 			pr.Get("/models", s.handleModels)
 
 			pr.Get("/projects", s.handleListProjects)
@@ -217,6 +234,12 @@ func (s *Server) appHandler() http.Handler {
 			// Training flywheel (PLAN M10): everyone rates and consents;
 			// the datasets, jobs and adapters are the owner's.
 			pr.Put("/me/training-consent", s.handleSetTrainingConsent)
+
+			// Bring your own key: a person's own API key for a hosted
+			// provider. Session only (never an API key), write-only.
+			pr.Get("/me/provider-keys", s.handleListProviderKeys)
+			pr.Put("/me/provider-keys/{provider}", s.handlePutProviderKey)
+			pr.Delete("/me/provider-keys/{provider}", s.handleDeleteProviderKey)
 			pr.Put("/messages/{id}/rating", s.handleRateMessage)
 			pr.Delete("/messages/{id}/rating", s.handleUnrateMessage)
 			pr.Get("/conversations/{id}/ratings", s.handleConversationRatings)
@@ -229,7 +252,14 @@ func (s *Server) appHandler() http.Handler {
 				ad.Use(requireOwner)
 				ad.Get("/admin/invites", s.handleListInvites)
 				ad.Post("/admin/invites", s.handleCreateInvite)
+				ad.Delete("/admin/invites/{id}", s.handleRevokeInvite)
+				ad.Post("/admin/invites/{id}/resend", s.handleResendInvite)
 				ad.Get("/admin/users", s.handleListUsers)
+				ad.Put("/admin/users/{id}/shared-keys", s.handleSetSharedKeys)
+				ad.Delete("/admin/users/{id}/sessions", s.handleAdminRevokeUserSessions)
+				ad.Get("/admin/users/{id}/keys", s.handleAdminListUserKeys)
+				ad.Delete("/admin/users/{id}/keys/{keyId}", s.handleAdminRevokeUserKey)
+				ad.Put("/admin/users/{id}/disabled", s.handleSetDisabled)
 				ad.Get("/admin/usage", s.handleUsage)
 				ad.Get("/admin/github", s.handleGitHubStatus)
 				ad.Get("/admin/endpoints", s.handleAdminEndpoints)
@@ -242,7 +272,7 @@ func (s *Server) appHandler() http.Handler {
 				ad.Get("/admin/rentals/offers/{provider}", s.handleRentalOffers)
 				ad.Put("/admin/endpoints", s.handleUpsertEndpoint)
 				ad.Delete("/admin/endpoints/*", s.handleDeleteEndpoint)
-				ad.Post("/admin/endpoints/{id}/enabled", s.handleSetEndpointEnabled)
+				ad.Post("/admin/endpoints/*", s.handleSetEndpointEnabled)
 				ad.Get("/admin/providers/{id}/catalog", s.handleProviderCatalog)
 				ad.Get("/admin/providers/{id}/routes", s.handleProviderRoutes)
 				ad.Get("/admin/policies", s.handleListPolicies)

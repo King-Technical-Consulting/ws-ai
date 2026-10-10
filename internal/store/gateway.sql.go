@@ -136,8 +136,8 @@ const insertUsage = `-- name: InsertUsage :one
 INSERT INTO usage_ledger (
   user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision,
   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error,
-  session_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+  session_id, own_key
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 RETURNING id
 `
 
@@ -162,6 +162,7 @@ type InsertUsageParams struct {
 	FinishReason     *string         `json:"finish_reason"`
 	Error            *string         `json:"error"`
 	SessionID        *string         `json:"session_id"`
+	OwnKey           bool            `json:"own_key"`
 }
 
 func (q *Queries) InsertUsage(ctx context.Context, arg InsertUsageParams) (int64, error) {
@@ -186,6 +187,7 @@ func (q *Queries) InsertUsage(ctx context.Context, arg InsertUsageParams) (int64
 		arg.FinishReason,
 		arg.Error,
 		arg.SessionID,
+		arg.OwnKey,
 	)
 	var id int64
 	err := row.Scan(&id)
@@ -282,6 +284,36 @@ func (q *Queries) ListBudgetsForScope(ctx context.Context, arg ListBudgetsForSco
 			&i.LimitUsd,
 			&i.OnExceed,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEndpointThroughput = `-- name: ListEndpointThroughput :many
+SELECT endpoint_id, tokens_per_sec, ttft_ms, samples, updated_at FROM endpoint_throughput
+`
+
+func (q *Queries) ListEndpointThroughput(ctx context.Context) ([]EndpointThroughput, error) {
+	rows, err := q.db.Query(ctx, listEndpointThroughput)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []EndpointThroughput{}
+	for rows.Next() {
+		var i EndpointThroughput
+		if err := rows.Scan(
+			&i.EndpointID,
+			&i.TokensPerSec,
+			&i.TtftMs,
+			&i.Samples,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -402,7 +434,7 @@ func (q *Queries) ListRoutingPolicies(ctx context.Context) ([]RoutingPolicy, err
 }
 
 const listUsageAll = `-- name: ListUsageAll :many
-SELECT id, created_at, user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error, session_id FROM usage_ledger ORDER BY created_at DESC LIMIT $1 OFFSET $2
+SELECT id, created_at, user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error, session_id, own_key FROM usage_ledger ORDER BY created_at DESC LIMIT $1 OFFSET $2
 `
 
 type ListUsageAllParams struct {
@@ -442,6 +474,7 @@ func (q *Queries) ListUsageAll(ctx context.Context, arg ListUsageAllParams) ([]U
 			&i.FinishReason,
 			&i.Error,
 			&i.SessionID,
+			&i.OwnKey,
 		); err != nil {
 			return nil, err
 		}
@@ -454,7 +487,7 @@ func (q *Queries) ListUsageAll(ctx context.Context, arg ListUsageAllParams) ([]U
 }
 
 const listUsageForUser = `-- name: ListUsageForUser :many
-SELECT id, created_at, user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error, session_id FROM usage_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
+SELECT id, created_at, user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error, session_id, own_key FROM usage_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
 `
 
 type ListUsageForUserParams struct {
@@ -495,6 +528,7 @@ func (q *Queries) ListUsageForUser(ctx context.Context, arg ListUsageForUserPara
 			&i.FinishReason,
 			&i.Error,
 			&i.SessionID,
+			&i.OwnKey,
 		); err != nil {
 			return nil, err
 		}
@@ -521,7 +555,7 @@ func (q *Queries) SetEndpointEnabled(ctx context.Context, arg SetEndpointEnabled
 }
 
 const sumUsageForAPIKeySince = `-- name: SumUsageForAPIKeySince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE api_key_id = $1 AND created_at >= $2
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE api_key_id = $1 AND created_at >= $2 AND NOT own_key
 `
 
 type SumUsageForAPIKeySinceParams struct {
@@ -537,7 +571,7 @@ func (q *Queries) SumUsageForAPIKeySince(ctx context.Context, arg SumUsageForAPI
 }
 
 const sumUsageForAgentSince = `-- name: SumUsageForAgentSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE agent_id = $1 AND created_at >= $2
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE agent_id = $1 AND created_at >= $2 AND NOT own_key
 `
 
 type SumUsageForAgentSinceParams struct {
@@ -553,7 +587,7 @@ func (q *Queries) SumUsageForAgentSince(ctx context.Context, arg SumUsageForAgen
 }
 
 const sumUsageForUserSince = `-- name: SumUsageForUserSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE user_id = $1 AND created_at >= $2
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE user_id = $1 AND created_at >= $2 AND NOT own_key
 `
 
 type SumUsageForUserSinceParams struct {
@@ -569,7 +603,7 @@ func (q *Queries) SumUsageForUserSince(ctx context.Context, arg SumUsageForUserS
 }
 
 const sumUsageSince = `-- name: SumUsageSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE created_at >= $1
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE created_at >= $1 AND NOT own_key
 `
 
 func (q *Queries) SumUsageSince(ctx context.Context, createdAt time.Time) (float64, error) {
@@ -675,6 +709,33 @@ func (q *Queries) UpsertEndpoint(ctx context.Context, arg UpsertEndpointParams) 
 		arg.IsLocal,
 		arg.Enabled,
 		arg.ExtraBody,
+	)
+	return err
+}
+
+const upsertEndpointThroughput = `-- name: UpsertEndpointThroughput :exec
+INSERT INTO endpoint_throughput (endpoint_id, tokens_per_sec, ttft_ms, samples, updated_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (endpoint_id) DO UPDATE SET
+    tokens_per_sec = EXCLUDED.tokens_per_sec, ttft_ms = EXCLUDED.ttft_ms,
+    samples = EXCLUDED.samples, updated_at = EXCLUDED.updated_at
+`
+
+type UpsertEndpointThroughputParams struct {
+	EndpointID   string    `json:"endpoint_id"`
+	TokensPerSec float64   `json:"tokens_per_sec"`
+	TtftMs       float64   `json:"ttft_ms"`
+	Samples      int32     `json:"samples"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func (q *Queries) UpsertEndpointThroughput(ctx context.Context, arg UpsertEndpointThroughputParams) error {
+	_, err := q.db.Exec(ctx, upsertEndpointThroughput,
+		arg.EndpointID,
+		arg.TokensPerSec,
+		arg.TtftMs,
+		arg.Samples,
+		arg.UpdatedAt,
 	)
 	return err
 }

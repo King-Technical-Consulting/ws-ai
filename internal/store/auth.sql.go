@@ -232,7 +232,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 }
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (email, display_name, role) VALUES ($1, $2, $3) RETURNING id, email, display_name, role, created_at, disabled_at, training_consent
+INSERT INTO users (email, display_name, role) VALUES ($1, $2, $3) RETURNING id, email, display_name, role, created_at, disabled_at, training_consent, shared_provider_keys
 `
 
 type CreateUserParams struct {
@@ -252,6 +252,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CreatedAt,
 		&i.DisabledAt,
 		&i.TrainingConsent,
+		&i.SharedProviderKeys,
 	)
 	return i, err
 }
@@ -298,6 +299,20 @@ type DeletePasskeyParams struct {
 func (q *Queries) DeletePasskey(ctx context.Context, arg DeletePasskeyParams) error {
 	_, err := q.db.Exec(ctx, deletePasskey, arg.ID, arg.UserID)
 	return err
+}
+
+const deletePendingInvite = `-- name: DeletePendingInvite :execrows
+DELETE FROM invites WHERE id = $1 AND used_at IS NULL
+`
+
+// DeletePendingInvite revokes an invite that was not accepted: the row goes
+// and with it the only copy of the token hash, so the link stops working.
+func (q *Queries) DeletePendingInvite(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deletePendingInvite, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteWebAuthnSession = `-- name: DeleteWebAuthnSession :exec
@@ -348,6 +363,27 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash []byte) (GetAPIKe
 		&i.RevokedAt,
 		&i.Email,
 		&i.Role,
+	)
+	return i, err
+}
+
+const getInvite = `-- name: GetInvite :one
+SELECT id, email, token_hash, invited_by, role, created_at, expires_at, used_at, used_by FROM invites WHERE id = $1
+`
+
+func (q *Queries) GetInvite(ctx context.Context, id uuid.UUID) (Invite, error) {
+	row := q.db.QueryRow(ctx, getInvite, id)
+	var i Invite
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.Role,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.UsedBy,
 	)
 	return i, err
 }
@@ -438,7 +474,7 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users WHERE email = $1
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent, shared_provider_keys FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -452,12 +488,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.CreatedAt,
 		&i.DisabledAt,
 		&i.TrainingConsent,
+		&i.SharedProviderKeys,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users WHERE id = $1
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent, shared_provider_keys FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -471,6 +508,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.CreatedAt,
 		&i.DisabledAt,
 		&i.TrainingConsent,
+		&i.SharedProviderKeys,
 	)
 	return i, err
 }
@@ -602,7 +640,7 @@ func (q *Queries) ListPasskeysByUser(ctx context.Context, userID uuid.UUID) ([]P
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, display_name, role, created_at, disabled_at, training_consent FROM users ORDER BY created_at
+SELECT id, email, display_name, role, created_at, disabled_at, training_consent, shared_provider_keys FROM users ORDER BY created_at
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -622,6 +660,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.CreatedAt,
 			&i.DisabledAt,
 			&i.TrainingConsent,
+			&i.SharedProviderKeys,
 		); err != nil {
 			return nil, err
 		}
@@ -633,13 +672,55 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
-const purgeExpiredWebAuthnSessions = `-- name: PurgeExpiredWebAuthnSessions :exec
+const purgeExpiredWebAuthnSessions = `-- name: PurgeExpiredWebAuthnSessions :execrows
 DELETE FROM webauthn_sessions WHERE expires_at <= now()
 `
 
-func (q *Queries) PurgeExpiredWebAuthnSessions(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, purgeExpiredWebAuthnSessions)
-	return err
+func (q *Queries) PurgeExpiredWebAuthnSessions(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeExpiredWebAuthnSessions)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const purgeInvites = `-- name: PurgeInvites :execrows
+DELETE FROM invites WHERE used_at IS NULL AND expires_at < now() - interval '30 days'
+`
+
+// Invites that expired unused 30 days ago.
+func (q *Queries) PurgeInvites(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeInvites)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const purgeMagicLinks = `-- name: PurgeMagicLinks :execrows
+DELETE FROM magic_links WHERE expires_at < now() - interval '1 day'
+`
+
+// Expired links a day after they stopped working; used ones go with them.
+func (q *Queries) PurgeMagicLinks(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeMagicLinks)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const purgeSessions = `-- name: PurgeSessions :execrows
+DELETE FROM sessions WHERE expires_at < now() - interval '30 days' OR revoked_at < now() - interval '30 days'
+`
+
+// Sessions that expired or were revoked 30 days ago (kept that long for the audit trail).
+func (q *Queries) PurgeSessions(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeSessions)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const revokeAPIKey = `-- name: RevokeAPIKey :exec
@@ -672,6 +753,69 @@ UPDATE sessions SET revoked_at = now() WHERE id = $1
 func (q *Queries) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeSession, id)
 	return err
+}
+
+const revokeUserAPIKey = `-- name: RevokeUserAPIKey :execrows
+UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeUserAPIKeyParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The owner revoking one of a person's keys: the key must be that person's.
+func (q *Queries) RevokeUserAPIKey(ctx context.Context, arg RevokeUserAPIKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeUserAPIKey, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setDisplayName = `-- name: SetDisplayName :exec
+UPDATE users SET display_name = $2 WHERE id = $1
+`
+
+type SetDisplayNameParams struct {
+	ID          uuid.UUID `json:"id"`
+	DisplayName string    `json:"display_name"`
+}
+
+func (q *Queries) SetDisplayName(ctx context.Context, arg SetDisplayNameParams) error {
+	_, err := q.db.Exec(ctx, setDisplayName, arg.ID, arg.DisplayName)
+	return err
+}
+
+const setUserDisabled = `-- name: SetUserDisabled :one
+UPDATE users SET disabled_at = CASE WHEN $2::boolean THEN COALESCE(disabled_at, now()) ELSE NULL END
+WHERE id = $1 AND role <> 'owner'
+RETURNING id, email, display_name, role, created_at, disabled_at, training_consent, shared_provider_keys
+`
+
+type SetUserDisabledParams struct {
+	ID       uuid.UUID `json:"id"`
+	Disabled bool      `json:"disabled"`
+}
+
+// SetUserDisabled parks or restores a member. The owner is never disabled,
+// whatever the caller says; an already-disabled user keeps the original
+// time. Sessions and API keys are refused while disabled_at is set
+// (GetSessionByTokenHash, GetAPIKeyByHash).
+func (q *Queries) SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserDisabled, arg.ID, arg.Disabled)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.DisplayName,
+		&i.Role,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.TrainingConsent,
+		&i.SharedProviderKeys,
+	)
+	return i, err
 }
 
 const touchAPIKey = `-- name: TouchAPIKey :exec

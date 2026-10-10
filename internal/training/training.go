@@ -27,7 +27,7 @@ import (
 var (
 	ErrInvalid  = errors.New("training: invalid")
 	ErrNotFound = errors.New("training: not found")
-	ErrNoRunner = errors.New("training: no fine-tune runner is configured (set WS_FINETUNE_IMAGE on a worker with Docker and a GPU)")
+	ErrNoRunner = errors.New("training: no fine-tune runner is configured (WS_FINETUNE_IMAGE on a worker with Docker and a GPU, WS_FINETUNE_URL for a trainer box, or WS_FINETUNE_TEMPLATE for a rented one)")
 	ErrNotReady = errors.New("training: not ready")
 )
 
@@ -73,6 +73,11 @@ type Store interface {
 	UpsertEndpoint(ctx context.Context, arg store.UpsertEndpointParams) error
 	SetEndpointEnabled(ctx context.Context, arg store.SetEndpointEnabledParams) error
 	DeleteEndpoint(ctx context.Context, id string) error
+
+	// The training-adapters routing policy (policy.go).
+	GetRoutingPolicyByName(ctx context.Context, name string) (store.RoutingPolicy, error)
+	UpsertRoutingPolicy(ctx context.Context, arg store.UpsertRoutingPolicyParams) (store.RoutingPolicy, error)
+	DeleteRoutingPolicyByName(ctx context.Context, name string) error
 }
 
 // Completer is the slice of the gateway the eval gate uses.
@@ -90,8 +95,9 @@ type FinetuneConfig struct {
 	// Image overrides the worker's trainer image for this job (local
 	// target only; a rented trainer runs its template's image).
 	Image string `json:"image,omitempty"`
-	// Target is where the job runs: local (the worker's Docker and GPU) or
-	// rental (a trainer-kind rental template); empty takes the default.
+	// Target is where the job runs: local (the worker's Docker and GPU),
+	// remote (the trainer box at WS_FINETUNE_URL) or rental (a
+	// trainer-kind rental template); empty takes the default.
 	Target string `json:"target,omitempty"`
 }
 
@@ -132,6 +138,10 @@ type Runner interface {
 
 // Service owns datasets, fine-tune jobs and adapters.
 type Service struct {
+	// Hub searches the Hugging Face model hub for base models (nil: the
+	// search route answers with the suggested list only).
+	Hub *Hub
+
 	DB    Store
 	Blobs blob.Store
 	GW    Completer
@@ -140,6 +150,12 @@ type Service struct {
 	Endpoint func(id string) (*gateway.Endpoint, bool)
 	// Reload reloads the gateway registry after an endpoint row changes.
 	Reload func(ctx context.Context) error
+	// ReloadPolicies reloads the router's policies after the
+	// training-adapters policy changes; BasePrefer says what the other
+	// policies prefer for a task class, the fallbacks a rule of ours keeps
+	// behind the routed endpoints. nil means no policy is written.
+	ReloadPolicies func(ctx context.Context) error
+	BasePrefer     func(taskClass string) []string
 	// Runner trains; it exists on the worker only.
 	Runner Runner
 	// Available declares where this deployment can run a fine-tune job
@@ -352,6 +368,12 @@ func (s *Service) StartFinetune(ctx context.Context, ownerID uuid.UUID, spec Fin
 			return nil, fmt.Errorf("%w: unknown base endpoint %q", ErrInvalid, spec.BaseEndpointID)
 		}
 		if spec.BaseModel == "" {
+			// The trainer loads a Hugging Face id (org/name) or a path it
+			// can see; an endpoint's model name is often neither (a
+			// llama-server model is named after its GGUF, "gpt-oss-20b").
+			if !strings.Contains(ep.ModelName, "/") {
+				return nil, fmt.Errorf("%w: base model id is required: the endpoint's model is named %q, which is not a Hugging Face id (org/name) the trainer can load", ErrInvalid, ep.ModelName)
+			}
 			spec.BaseModel = ep.ModelName
 		}
 	}
@@ -367,6 +389,8 @@ func (s *Service) StartFinetune(ctx context.Context, ownerID uuid.UUID, spec Fin
 		switch spec.Config.Target {
 		case TargetLocal:
 			return nil, fmt.Errorf("%w: no trainer image on the worker (WS_FINETUNE_IMAGE)", ErrInvalid)
+		case TargetRemote:
+			return nil, fmt.Errorf("%w: no trainer box (WS_FINETUNE_URL)", ErrInvalid)
 		case TargetRental:
 			return nil, fmt.Errorf("%w: no rented trainer (WS_FINETUNE_TEMPLATE and a rental provider)", ErrInvalid)
 		}
@@ -464,9 +488,15 @@ func (s *Service) registerAdapter(ctx context.Context, job store.FinetuneJob, ke
 			id := "lora/" + job.AdapterName
 			caps, _ := json.Marshal(base.Capabilities)
 			pricing, _ := json.Marshal(base.Pricing)
-			extra := base.ExtraBody
-			if extra == nil {
-				extra = map[string]any{}
+			extra := map[string]any{}
+			for k, v := range base.ExtraBody {
+				extra[k] = v
+			}
+			if llamaServer(base) {
+				// llama-server ignores the model name; the adapter is
+				// picked per request by its slot on the server (the
+				// first one loaded with --lora-init-without-apply).
+				extra["lora"] = []map[string]any{{"id": 0, "scale": 1.0}}
 			}
 			eb, _ := json.Marshal(extra)
 			if err := s.DB.UpsertEndpoint(ctx, store.UpsertEndpointParams{
@@ -485,6 +515,12 @@ func (s *Service) registerAdapter(ctx context.Context, job store.FinetuneJob, ke
 		return nil, err
 	}
 	return &ad, nil
+}
+
+// llamaServer guesses whether an endpoint is served by llama-server, from
+// its provider id (the seed names them local-llama, llama-embed and so on).
+func llamaServer(ep *gateway.Endpoint) bool {
+	return ep != nil && strings.Contains(strings.ToLower(ep.ProviderID), "llama")
 }
 
 // CancelFinetune marks a job cancelled; the worker running it sees the
@@ -531,6 +567,9 @@ func (s *Service) DeleteAdapter(ctx context.Context, id uuid.UUID) error {
 	if ad.EndpointID != nil {
 		_ = s.DB.DeleteEndpoint(ctx, *ad.EndpointID)
 		s.reload(ctx)
+		if err := s.RemoveRoute(ctx, "", *ad.EndpointID); err != nil {
+			return err
+		}
 	}
 	if err := s.DB.DeleteAdapter(ctx, id); err != nil {
 		return err
@@ -541,14 +580,21 @@ func (s *Service) DeleteAdapter(ctx context.Context, id uuid.UUID) error {
 
 // Promote enables an adapter's endpoint so the router can use it, after
 // the eval gate: the adapter must have been evaluated and scored at
-// least its base, unless force. Unpromote disables it again.
-func (s *Service) Promote(ctx context.Context, id uuid.UUID, force bool) error {
+// least its base, unless force. With a task class, the adapter also goes
+// first for that class in the training-adapters policy (AddRoute), so
+// nothing in Admin needs editing. Unpromote disables it again and takes
+// it out of the policy.
+func (s *Service) Promote(ctx context.Context, id uuid.UUID, force bool, taskClass string) error {
 	ad, err := s.DB.GetAdapter(ctx, id)
 	if err != nil {
 		return ErrNotFound
 	}
 	if ad.EndpointID == nil {
 		return fmt.Errorf("%w: the adapter has no endpoint (its job named no base endpoint); register one in Admin", ErrInvalid)
+	}
+	taskClass = strings.ToLower(strings.TrimSpace(taskClass))
+	if taskClass != "" && !taskClassRe.MatchString(taskClass) {
+		return fmt.Errorf("%w: task class: lowercase letters, digits, dashes and underscores", ErrInvalid)
 	}
 	if !force {
 		if ad.EvalScore == nil || ad.BaselineScore == nil {
@@ -565,6 +611,11 @@ func (s *Service) Promote(ctx context.Context, id uuid.UUID, force bool) error {
 		return err
 	}
 	s.reload(ctx)
+	if taskClass != "" {
+		if err := s.addRoute(ctx, taskClass, *ad.EndpointID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -577,6 +628,9 @@ func (s *Service) Unpromote(ctx context.Context, id uuid.UUID) error {
 	if ad.EndpointID != nil {
 		_ = s.DB.SetEndpointEnabled(ctx, store.SetEndpointEnabledParams{ID: *ad.EndpointID, Enabled: false})
 		s.reload(ctx)
+		if err := s.RemoveRoute(ctx, "", *ad.EndpointID); err != nil {
+			return err
+		}
 	}
 	return s.DB.SetAdapterPromoted(ctx, store.SetAdapterPromotedParams{ID: id, Promoted: false})
 }

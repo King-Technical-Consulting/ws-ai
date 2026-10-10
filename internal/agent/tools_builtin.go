@@ -236,8 +236,11 @@ func htmlToText(s string) string {
 
 // ---- ask_user ----
 
-// AskUserTool lets the model pause and ask a clarifying question. The run
-// pauses in paused_steer until the user replies.
+// AskUserTool lets the model stop and ask a clarifying question. The
+// runtime ends the turn after the call (the run finishes with the question
+// as its last tool call, which the client shows as a question card) and
+// the user's reply starts the next run with the question and this result
+// in the history.
 type AskUserTool struct{}
 
 func (AskUserTool) Def() gateway.ToolDef {
@@ -250,8 +253,8 @@ func (AskUserTool) Def() gateway.ToolDef {
 func (AskUserTool) DefaultPolicy() Policy { return PolicyAuto }
 func (AskUserTool) Idempotent() bool      { return true }
 func (AskUserTool) Call(ctx context.Context, tc ToolCtx, args json.RawMessage) (Result, error) {
-	// The runtime intercepts ask_user before Call; reaching here means the
-	// question was answered and the answer is in the next user message.
+	// Nothing to do: the question is the call itself. The runtime ends the
+	// turn after this batch; the user's reply is the next user message.
 	return Result{Text: "The user has been asked. Their reply follows as the next message."}, nil
 }
 

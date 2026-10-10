@@ -31,6 +31,10 @@ export default function Chat() {
       models={models.data}
       onTitleMaybeChanged={() => {
         qc.invalidateQueries({ queryKey: ['convs'] })
+        // The cached conversation seeds the chat when this page is opened
+        // again; without this, going back to it shows the empty copy loaded
+        // when it was created, until a reload.
+        qc.invalidateQueries({ queryKey: ['conv', id] })
       }}
     />
   )
@@ -188,6 +192,7 @@ function ChatInner({
           />
           <Composer
             disabled={busy}
+            imageNote={noVisionNote(model, models)}
             initialFiles={initialFiles}
             onStop={busy ? () => chat.stop() : undefined}
             onSend={(text, files) => {
@@ -208,4 +213,20 @@ function ChatInner({
       </div>
     </ArtifactContext.Provider>
   )
+}
+
+/**
+ * Why an attached image would fail with this model choice, or undefined
+ * when it would not: a direct pick without vision, or an alias none of
+ * whose listed models has it (the router then refuses the message).
+ */
+function noVisionNote(selector: string, models?: ModelsResponse): string | undefined {
+  if (!models) return undefined
+  const direct = models.models.find((m) => m.id === selector)
+  if (direct) return direct.capabilities.vision ? undefined : `${direct.display_name} can't read images; pick a model that can.`
+  const ids = models.aliases[selector]
+  if (!ids || ids.length === 0) return undefined
+  const listed = models.models.filter((m) => ids.includes(m.id))
+  if (listed.length === 0 || listed.some((m) => m.capabilities.vision)) return undefined
+  return `No model under "${selector}" can read images; pick one that can.`
 }

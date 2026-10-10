@@ -77,7 +77,7 @@ func (g *Gateway) Embed(ctx context.Context, req *EmbedRequest) (*EmbedResponse,
 		}
 		g.record(ctx, UsageRecord{Metadata: req.Metadata, EndpointID: c.Endpoint.ID, Model: resp.Model,
 			Decision: withChosen(dec, c.Endpoint.ID), Usage: resp.Usage, CostUSD: c.Endpoint.Pricing.Cost(resp.Usage),
-			Latency: time.Since(start), FinishReason: FinishStop})
+			Latency: time.Since(start), FinishReason: FinishStop, OwnKey: c.OwnKey})
 		return resp, nil
 	}
 	if lastErr == nil {

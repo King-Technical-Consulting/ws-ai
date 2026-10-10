@@ -291,7 +291,7 @@ ON CONFLICT (id) DO UPDATE SET
     status = EXCLUDED.status, seen_at = now(),
     ended_at = CASE WHEN EXCLUDED.status = 'dead' THEN COALESCE(cc_jobs.ended_at, now()) ELSE NULL END,
     updated_at = now()
-RETURNING id, user_id, target, session, "window", cwd, lane, model, source, status, started_at, seen_at, ended_at, created_at, updated_at
+RETURNING cc_jobs.id, cc_jobs.user_id, cc_jobs.target, cc_jobs.session, cc_jobs."window", cc_jobs.cwd, cc_jobs.lane, cc_jobs.model, cc_jobs.source, cc_jobs.status, cc_jobs.started_at, cc_jobs.seen_at, cc_jobs.ended_at, cc_jobs.created_at, cc_jobs.updated_at, (xmax = 0) AS inserted
 `
 
 type UpsertCCJobParams struct {
@@ -308,10 +308,18 @@ type UpsertCCJobParams struct {
 	StartedAt time.Time     `json:"started_at"`
 }
 
+type UpsertCCJobRow struct {
+	CcJob    CcJob `json:"cc_job"`
+	Inserted bool  `json:"inserted"`
+}
+
 // Job handles for the read-only web tab (§6.5). A report of a job that is
 // already known refreshes its handle fields and liveness; it never moves
 // the job to another user or source.
-func (q *Queries) UpsertCCJob(ctx context.Context, arg UpsertCCJobParams) (CcJob, error) {
+// inserted is true when this call created the row (xmax is 0 on a fresh
+// tuple, non-zero on one ON CONFLICT updated), decided in the same
+// statement so two reports of the same new job cannot both count it.
+func (q *Queries) UpsertCCJob(ctx context.Context, arg UpsertCCJobParams) (UpsertCCJobRow, error) {
 	row := q.db.QueryRow(ctx, upsertCCJob,
 		arg.ID,
 		arg.UserID,
@@ -325,23 +333,24 @@ func (q *Queries) UpsertCCJob(ctx context.Context, arg UpsertCCJobParams) (CcJob
 		arg.Status,
 		arg.StartedAt,
 	)
-	var i CcJob
+	var i UpsertCCJobRow
 	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.Target,
-		&i.Session,
-		&i.Window,
-		&i.Cwd,
-		&i.Lane,
-		&i.Model,
-		&i.Source,
-		&i.Status,
-		&i.StartedAt,
-		&i.SeenAt,
-		&i.EndedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
+		&i.CcJob.ID,
+		&i.CcJob.UserID,
+		&i.CcJob.Target,
+		&i.CcJob.Session,
+		&i.CcJob.Window,
+		&i.CcJob.Cwd,
+		&i.CcJob.Lane,
+		&i.CcJob.Model,
+		&i.CcJob.Source,
+		&i.CcJob.Status,
+		&i.CcJob.StartedAt,
+		&i.CcJob.SeenAt,
+		&i.CcJob.EndedAt,
+		&i.CcJob.CreatedAt,
+		&i.CcJob.UpdatedAt,
+		&i.Inserted,
 	)
 	return i, err
 }

@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -70,5 +71,67 @@ func TestEstimateTokens(t *testing.T) {
 	req := &gateway.Request{System: strings.Repeat("s", 400), Messages: []gateway.Message{msg(gateway.RoleUser, 1, strings.Repeat("u", 400))}}
 	if n := EstimateTokens(req); n < 195 || n > 210 {
 		t.Errorf("estimate = %d, want ~200", n)
+	}
+}
+
+func TestEstimateTokensByContent(t *testing.T) {
+	est := func(s string) int {
+		return EstimateTokens(&gateway.Request{Messages: []gateway.Message{msg(gateway.RoleUser, 1, s)}})
+	}
+	// Prose stays near 4 characters per token (the old estimate).
+	prose := strings.Repeat("The quick brown fox jumps over the lazy dog, again. ", 400)
+	if n, old := est(prose), len(prose)/4; n < old*8/10 || n > old*13/10 {
+		t.Errorf("prose estimate %d, want near %d", n, old)
+	}
+	// Dense digits run about 2 characters per token: 21,000 five-digit
+	// numbers measured 63,207 tokens in 126,000 characters.
+	var sb strings.Builder
+	for i := 0; i < 21000; i++ {
+		fmt.Fprintf(&sb, "%05d ", (i*7919)%100000)
+	}
+	if n := est(sb.String()); n < 52000 || n > 75000 {
+		t.Errorf("digit estimate %d, want near 63000 (chars/4 gave %d)", n, sb.Len()/4)
+	}
+	// CJK is far denser than 4 bytes per token.
+	if n, old := est(strings.Repeat("漢字", 3000)), len(strings.Repeat("漢字", 3000))/4; n <= old/2 {
+		t.Errorf("cjk estimate %d, want well over %d bytes/4", n, old/2)
+	}
+}
+
+// A request's budget is the global ceiling lowered to what its endpoints
+// can take: a conversation bound for a 32k slot is cut to fit it, one that
+// can reach a 200k model keeps the global number.
+func TestBudgetForFollowsTheEndpointWindow(t *testing.T) {
+	reg := gateway.NewRegistry()
+	reg.Replace(
+		[]*gateway.Provider{{ID: "local", Kind: gateway.ProviderOpenAICompat}, {ID: "big", Kind: gateway.ProviderOpenAICompat}},
+		[]*gateway.Endpoint{
+			{ID: "local/small", ProviderID: "local", ModelName: "small", Enabled: true, Local: true, Capabilities: gateway.Capabilities{ContextWindow: 32_000}},
+			{ID: "big/model", ProviderID: "big", ModelName: "model", Enabled: true, Capabilities: gateway.Capabilities{ContextWindow: 200_000}},
+		},
+	)
+	pol, err := gateway.ParsePolicy("name: t\nrules:\n  - match: {}\n    prefer: [big/model, local/small]\naliases:\n  local: [local/small]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gateway.New(reg, gateway.NewRouter(reg, []gateway.Policy{pol}), nil, nil)
+	c := &Compactor{GW: gw}
+	in := func(sel string) *gateway.RouteInput {
+		return &gateway.RouteInput{Selector: sel, TaskClass: gateway.TaskChat}
+	}
+	if got := c.budgetFor(&gateway.Request{}, in("local/small")); got != 32_000-replyReserve {
+		t.Errorf("direct 32k slot: budget %d", got)
+	}
+	if got := c.budgetFor(&gateway.Request{}, in("local")); got != 32_000-replyReserve {
+		t.Errorf("local alias: budget %d", got)
+	}
+	if got := c.budgetFor(&gateway.Request{MaxTokens: 1000}, in("local")); got != 31_000 {
+		t.Errorf("max_tokens is the reserve: budget %d", got)
+	}
+	if got := c.budgetFor(&gateway.Request{}, in("auto")); got != 60_000 {
+		t.Errorf("a 200k model keeps the global budget: %d", got)
+	}
+	if got := (&Compactor{}).budgetFor(&gateway.Request{}, in("local")); got != 60_000 {
+		t.Errorf("no gateway: global budget, got %d", got)
 	}
 }

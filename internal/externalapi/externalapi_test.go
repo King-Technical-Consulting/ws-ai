@@ -55,7 +55,7 @@ func newTestServer(t *testing.T) http.Handler {
 		[]*gateway.Provider{{ID: "local", Kind: gateway.ProviderOpenAICompat}},
 		[]*gateway.Endpoint{{ID: "local/m", ProviderID: "local", ModelName: "m", Enabled: true, Local: true, Capabilities: gateway.Capabilities{ContextWindow: 32000, Tools: true}}},
 	)
-	pol, _ := gateway.ParsePolicy("name: t\nrules:\n  - match: {}\n    prefer: [local/m]\naliases:\n  cheap: [local/m]\n")
+	pol, _ := gateway.ParsePolicy("name: t\nrules:\n  - match: {selector: [fast]}\n    prefer: [local/m]\n  - match: {}\n    prefer: [local/m]\naliases:\n  cheap: [local/m]\n")
 	gw := gateway.New(reg, gateway.NewRouter(reg, []gateway.Policy{pol}), nil, nil)
 	gw.RegisterAdapter(gateway.ProviderOpenAICompat, &fakeAdapter{})
 	s := &Server{GW: gw, Principal: func(context.Context) *Principal {
@@ -268,8 +268,9 @@ func TestModelsAndCountTokens(t *testing.T) {
 	h := newTestServer(t)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
-	if !strings.Contains(rec.Body.String(), `"id":"cheap"`) || !strings.Contains(rec.Body.String(), `"id":"local/m"`) {
-		t.Errorf("models = %s", rec.Body.String())
+	// The aliases, the selectors rules match on ("fast"), then the endpoints.
+	if b := rec.Body.String(); !strings.Contains(b, `"id":"cheap"`) || !strings.Contains(b, `"id":"fast"`) || !strings.Contains(b, `"id":"local/m"`) || strings.Index(b, `"id":"fast"`) > strings.Index(b, `"id":"local/m"`) {
+		t.Errorf("models = %s", b)
 	}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"hello world, twelve chars"}]}`)))

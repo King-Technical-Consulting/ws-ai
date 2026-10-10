@@ -10,6 +10,18 @@ INSERT INTO users (email, display_name, role) VALUES ($1, $2, $3) RETURNING *;
 -- name: ListUsers :many
 SELECT * FROM users ORDER BY created_at;
 
+-- SetUserDisabled parks or restores a member. The owner is never disabled,
+-- whatever the caller says; an already-disabled user keeps the original
+-- time. Sessions and API keys are refused while disabled_at is set
+-- (GetSessionByTokenHash, GetAPIKeyByHash).
+-- name: SetUserDisabled :one
+UPDATE users SET disabled_at = CASE WHEN sqlc.arg(disabled)::boolean THEN COALESCE(disabled_at, now()) ELSE NULL END
+WHERE id = $1 AND role <> 'owner'
+RETURNING *;
+
+-- name: SetDisplayName :exec
+UPDATE users SET display_name = $2 WHERE id = $1;
+
 -- name: CountUsers :one
 SELECT count(*) FROM users;
 
@@ -25,6 +37,14 @@ UPDATE invites SET used_at = now(), used_by = $2 WHERE id = $1;
 
 -- name: ListInvites :many
 SELECT * FROM invites ORDER BY created_at DESC;
+
+-- name: GetInvite :one
+SELECT * FROM invites WHERE id = $1;
+
+-- DeletePendingInvite revokes an invite that was not accepted: the row goes
+-- and with it the only copy of the token hash, so the link stops working.
+-- name: DeletePendingInvite :execrows
+DELETE FROM invites WHERE id = $1 AND used_at IS NULL;
 
 -- name: CreatePasskey :one
 INSERT INTO passkeys (user_id, credential_id, public_key, attestation_type, transports, aaguid, sign_count, backup_eligible, backup_state, name)
@@ -51,7 +71,7 @@ SELECT * FROM webauthn_sessions WHERE id = $1 AND expires_at > now();
 -- name: DeleteWebAuthnSession :exec
 DELETE FROM webauthn_sessions WHERE id = $1;
 
--- name: PurgeExpiredWebAuthnSessions :exec
+-- name: PurgeExpiredWebAuthnSessions :execrows
 DELETE FROM webauthn_sessions WHERE expires_at <= now();
 
 -- name: CreateMagicLink :one
@@ -93,3 +113,19 @@ SELECT * FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL ORDER BY create
 
 -- name: RevokeAPIKey :exec
 UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND user_id = $2;
+
+-- name: PurgeMagicLinks :execrows
+-- Expired links a day after they stopped working; used ones go with them.
+DELETE FROM magic_links WHERE expires_at < now() - interval '1 day';
+
+-- name: PurgeInvites :execrows
+-- Invites that expired unused 30 days ago.
+DELETE FROM invites WHERE used_at IS NULL AND expires_at < now() - interval '30 days';
+
+-- name: PurgeSessions :execrows
+-- Sessions that expired or were revoked 30 days ago (kept that long for the audit trail).
+DELETE FROM sessions WHERE expires_at < now() - interval '30 days' OR revoked_at < now() - interval '30 days';
+
+-- name: RevokeUserAPIKey :execrows
+-- The owner revoking one of a person's keys: the key must be that person's.
+UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL;

@@ -1,13 +1,13 @@
-import { useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import clsx from 'clsx'
-import { api, type Adapter, type Dataset, type FinetuneConfig, type FinetuneJob, type FinetuneTarget, type ModelsResponse } from '../api'
-
-type FinetuneConfigTarget = FinetuneConfig['target']
+import { api, type Adapter, type Dataset, type FinetuneJob, type FinetuneTarget, type FinetuneTargetID, type HubModel, type ModelsResponse, type TrainingExample, type TrainingRoute } from '../api'
 import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm } from '../components/ui'
 import { ago } from './Agents'
 
 const MODES = ['chat', 'code', 'design', 'agent']
+// Task classes a route or a promotion can name (config/policies/default.yaml).
+const TASK_CLASSES = ['chat', 'code', 'summarize', 'title', 'reflect', 'classify', 'vision']
 
 /**
  * Training (PLAN M10, owner only): datasets exported from opted-in
@@ -27,6 +27,7 @@ export default function Training() {
     refetchInterval: (q) => (q.state.data?.jobs.some((j) => j.status === 'queued' || j.status === 'running') ? 3000 : false),
   })
   const adapters = useQuery({ queryKey: ['training', 'adapters'], queryFn: () => api.get<{ adapters: Adapter[] }>('/api/training/adapters'), refetchInterval: 10000 })
+  const routes = useQuery({ queryKey: ['training', 'routes'], queryFn: () => api.get<{ routes: TrainingRoute[]; policy: string }>('/api/training/routes') })
   const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelsResponse>('/api/models'), staleTime: 60_000 })
   const refresh = () => qc.invalidateQueries({ queryKey: ['training'] })
 
@@ -40,6 +41,7 @@ export default function Training() {
         <Datasets datasets={datasets.data?.datasets ?? []} onChange={refresh} />
         <Jobs jobs={jobs.data?.jobs ?? []} runner={!!jobs.data?.runner} targets={jobs.data?.targets ?? []} datasets={datasets.data?.datasets ?? []} models={models.data} onChange={refresh} />
         <Adapters adapters={adapters.data?.adapters ?? []} onChange={refresh} />
+        <Routes routes={routes.data?.routes ?? []} policy={routes.data?.policy ?? 'training-adapters'} models={models.data} onChange={refresh} />
       </div>
     </div>
   )
@@ -75,6 +77,7 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
     },
   })
   const remove = useMutation({ mutationFn: (id: string) => api.del(`/api/training/datasets/${id}`), onSuccess: onChange })
+  const [previewID, setPreviewID] = useState<string | null>(null)
   return (
     <section className="space-y-3">
       <SectionHead aside={datasets.length ? `${datasets.length}` : undefined}>datasets</SectionHead>
@@ -86,8 +89,11 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
               <span className="flex items-center gap-3">
                 {d.status === 'ready' && (
                   <>
-                    <a href={`/api/training/datasets/${d.id}/download`} download className="text-xs text-fg-2 hover:text-fg">train</a>
-                    {d.eval_examples > 0 && <a href={`/api/training/datasets/${d.id}/download?split=eval`} download className="text-xs text-fg-2 hover:text-fg">eval</a>}
+                    <button onClick={() => setPreviewID(previewID === d.id ? null : d.id)} className="text-xs text-fg-2 hover:text-fg">
+                      {previewID === d.id ? 'hide' : 'preview'}
+                    </button>
+                    <a href={`/api/training/datasets/${d.id}/download`} download title="Download the train split as JSONL" className="text-xs text-fg-2 hover:text-fg">train.jsonl</a>
+                    {d.eval_examples > 0 && <a href={`/api/training/datasets/${d.id}/download?split=eval`} download title="Download the held-out split as JSONL" className="text-xs text-fg-2 hover:text-fg">eval.jsonl</a>}
                   </>
                 )}
                 <button onClick={() => remove.mutate(d.id)} className={btn.danger}>remove</button>
@@ -107,6 +113,7 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
           </Row>
         ))}
       </ListGroup>
+      {previewID && <Preview id={previewID} />}
       <form
         className="space-y-2 rounded-lg border border-line bg-bg-2 p-3"
         onSubmit={(e) => {
@@ -142,6 +149,91 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
   )
 }
 
+/** The first examples of a dataset, as a trainer would read them. */
+function Preview({ id }: { id: string }) {
+  const [split, setSplit] = useState<'train' | 'eval'>('train')
+  const q = useQuery({ queryKey: ['training', 'preview', id, split], queryFn: () => api.get<{ examples: TrainingExample[] }>(`/api/training/datasets/${id}/preview?split=${split}&n=5`) })
+  const exs = q.data?.examples ?? []
+  return (
+    <div className="space-y-2 rounded-lg border border-line bg-bg-2 p-3">
+      <div className="flex items-center gap-3 text-xs text-fg-2">
+        <span className="section-head border-0">preview</span>
+        <button onClick={() => setSplit('train')} className={clsx('hover:text-fg', split === 'train' && 'text-fg')}>train</button>
+        <button onClick={() => setSplit('eval')} className={clsx('hover:text-fg', split === 'eval' && 'text-fg')}>held out</button>
+        <span className="text-fg-3">first {exs.length} of the split</span>
+      </div>
+      {q.error && <Callout kind="error">{q.error.message}</Callout>}
+      {exs.map((e, i) => (
+        <div key={e.meta.message_id || i} className="reading space-y-1 border-t border-line pt-2 text-sm">
+          {e.messages.map((m, j) => (
+            <p key={j}>
+              <span className="section-head border-0 mr-2">{m.role}</span>
+              {m.content || (m.tool_calls ? m.tool_calls.map((c) => `${c.function.name}(${c.function.arguments})`).join(', ') : '')}
+            </p>
+          ))}
+          <p className="meta">
+            {e.meta.mode ?? ''} {e.meta.model ? `· ${e.meta.model}` : ''} {e.meta.rating ? `· rated ${e.meta.rating > 0 ? 'up' : 'down'}` : ''}
+          </p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * The training-adapters policy: one rule per task class, routed endpoints
+ * first (a promoted adapter, or a frontier model whose answers a later
+ * dataset collects: distillation), then what the other policies prefer.
+ */
+function Routes({ routes, policy, models, onChange }: { routes: TrainingRoute[]; policy: string; models?: ModelsResponse; onChange: () => void }) {
+  const [taskClass, setTaskClass] = useState('chat')
+  const [endpoint, setEndpoint] = useState('')
+  const [err, setErr] = useState('')
+  const all = models?.models ?? []
+  const add = useMutation({ mutationFn: () => api.put('/api/training/routes', { task_class: taskClass, endpoint_id: endpoint }), onSuccess: () => { setErr(''); onChange() }, onError: (e) => setErr(e.message) })
+  const remove = useMutation({ mutationFn: (r: TrainingRoute) => api.post('/api/training/routes/remove', { task_class: r.task_class, endpoint_id: r.endpoint }), onSuccess: onChange, onError: (e) => setErr(e.message) })
+  return (
+    <section className="space-y-3">
+      <SectionHead aside={routes.length ? `${routes.length}` : undefined}>routes</SectionHead>
+      <p className="text-sm text-fg-2">
+        Where a task class goes first, written into the <code className="font-mono text-xs">{policy}</code> policy ahead of the default one: an adapter promoted into a class lands here, and routing a class to a frontier model collects its answers for a distillation dataset (filter that dataset by the model). The rest of the class's usual list stays behind it, so a box that is down still fails over.
+      </p>
+      <ListGroup empty="No routes: every class follows the default policy.">
+        {routes.map((r) => (
+          <Row key={r.task_class + r.endpoint} action={<button onClick={() => remove.mutate(r)} className={btn.danger}>remove</button>}>
+            <span className="flex items-center gap-2">
+              <span className="section-head border-0 shrink-0">{r.task_class}</span>
+              <span className="font-mono text-xs">{r.endpoint}</span>
+            </span>
+          </Row>
+        ))}
+      </ListGroup>
+      <form
+        className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-bg-2 p-3"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (endpoint) add.mutate()
+        }}
+      >
+        <select value={taskClass} onChange={(e) => setTaskClass(e.target.value)} className={clsx(inputSm, 'w-auto')} aria-label="Task class">
+          {TASK_CLASSES.map((c) => (
+            <option key={c} value={c}>{c}</option>
+          ))}
+        </select>
+        <span className="text-xs text-fg-2">goes first to</span>
+        <select value={endpoint} onChange={(e) => setEndpoint(e.target.value)} className={clsx(inputSm, 'w-auto max-w-[20rem]')} aria-label="Endpoint">
+          <option value="">pick an endpoint</option>
+          {all.map((m) => (
+            <option key={m.id} value={m.id}>{m.display_name} ({m.id})</option>
+          ))}
+        </select>
+        <button type="submit" disabled={add.isPending || !endpoint} className={btn.primarySm}>Route</button>
+      </form>
+      {err && <Callout kind="error">{err}</Callout>}
+    </section>
+  )
+}
+
 function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: FinetuneJob[]; runner: boolean; targets: FinetuneTarget[]; datasets: Dataset[]; models?: ModelsResponse; onChange: () => void }) {
   const ready = datasets.filter((d) => d.status === 'ready')
   const local = (models?.models ?? []).filter((m) => m.local)
@@ -161,7 +253,7 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
         base_endpoint_id: base || undefined,
         base_model: baseModel || undefined,
         adapter_name: name,
-        config: { epochs, rank, learning_rate: Number(lr) || undefined, target: (target || undefined) as FinetuneConfigTarget },
+        config: { epochs, rank, learning_rate: Number(lr) || undefined, target: (target || undefined) as FinetuneTargetID | undefined },
       }),
     onSuccess: () => {
       setName('')
@@ -175,7 +267,7 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
       <SectionHead aside={jobs.length ? `${jobs.length}` : undefined}>fine-tune jobs</SectionHead>
       {!runner && (
         <Callout>
-          No fine-tune runner on the worker: set <code className="font-mono text-xs">WS_FINETUNE_IMAGE</code> where Docker and a GPU are, or <code className="font-mono text-xs">WS_FINETUNE_TEMPLATE</code> to a trainer rental template to train on a rented GPU (see <code className="font-mono text-xs">infra/training</code>). Datasets and ratings work without it.
+          No fine-tune runner on the worker: set <code className="font-mono text-xs">WS_FINETUNE_IMAGE</code> where Docker and a GPU are, <code className="font-mono text-xs">WS_FINETUNE_URL</code> to a trainer box on the tailnet (the Orin, the Spark or a Mac running the trainer), or <code className="font-mono text-xs">WS_FINETUNE_TEMPLATE</code> to a trainer rental template to train on a rented GPU (see <code className="font-mono text-xs">infra/training</code>). Datasets and ratings work without it.
         </Callout>
       )}
       <ListGroup empty="No jobs yet.">
@@ -199,7 +291,7 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
             </span>
             <span className="meta block">
               {j.status === 'running' ? `${Math.round(j.progress * 100)}% · ` : ''}
-              {j.config.epochs ?? 2} epochs, rank {j.config.rank ?? 16}{j.config.target === 'rental' ? ' · rented GPU' : ''} · {ago(j.created_at)}
+              {j.config.epochs ?? 2} epochs, rank {j.config.rank ?? 16}{j.config.target === 'rental' ? ' · rented GPU' : j.config.target === 'remote' ? ' · trainer box' : ''} · {ago(j.created_at)}
               {j.error ? ` · ${j.error}` : ''}
             </span>
           </Row>
@@ -226,7 +318,7 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
               <option key={m.id} value={m.id}>{m.display_name}</option>
             ))}
           </select>
-          <input value={baseModel} onChange={(e) => setBaseModel(e.target.value)} placeholder="base model id the trainer loads (defaults to the endpoint's)" className={clsx(inputSm, 'flex-1 min-w-64 font-mono')} />
+          <BaseModelPicker value={baseModel} onChange={setBaseModel} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="adapter name, e.g. chat-v1" className={clsx(inputSm, 'w-48 font-mono')} />
@@ -250,14 +342,27 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
 
 function Adapters({ adapters, onChange }: { adapters: Adapter[]; onChange: () => void }) {
   const [err, setErr] = useState('')
+  // The task class a promotion routes to; '' enables the endpoint only.
+  const [taskClass, setTaskClass] = useState('chat')
   const evaluate = useMutation({ mutationFn: (id: string) => api.post(`/api/training/adapters/${id}/evaluate`, {}), onSuccess: onChange, onError: (e) => setErr(e.message) })
-  const promote = useMutation({ mutationFn: ({ id, force }: { id: string; force: boolean }) => api.post(`/api/training/adapters/${id}/promote`, { force }), onSuccess: onChange, onError: (e) => setErr(e.message) })
+  const promote = useMutation({ mutationFn: ({ id, force }: { id: string; force: boolean }) => api.post(`/api/training/adapters/${id}/promote`, { force, task_class: taskClass || undefined }), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const unpromote = useMutation({ mutationFn: (id: string) => api.del(`/api/training/adapters/${id}/promote`), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const remove = useMutation({ mutationFn: (id: string) => api.del(`/api/training/adapters/${id}`), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const pct = (x: number | null) => (x === null ? '–' : `${Math.round(x * 100)}%`)
   return (
     <section className="space-y-3">
       <SectionHead aside={adapters.length ? `${adapters.length}` : undefined}>adapters</SectionHead>
+      {adapters.length > 0 && (
+        <label className="flex items-center gap-2 text-xs text-fg-2">
+          promote into
+          <select value={taskClass} onChange={(e) => setTaskClass(e.target.value)} className={clsx(inputSm, 'w-auto')} aria-label="Task class to promote into" title="Promoting also sends this task class to the adapter first (the routes below); pick none to only enable its endpoint">
+            <option value="">no class (enable only)</option>
+            {TASK_CLASSES.map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </label>
+      )}
       <ListGroup empty="No adapters yet: a finished fine-tune job makes one.">
         {adapters.map((a) => (
           <Row
@@ -296,5 +401,100 @@ function Adapters({ adapters, onChange }: { adapters: Adapter[]; onChange: () =>
       </ListGroup>
       {err && <Callout kind="error">{err}</Callout>}
     </section>
+  )
+}
+
+/** Formats a parameter count the way model names do: 494M, 1.5B, 7.6B. */
+function paramsLabel(n?: number) {
+  if (!n) return ''
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 10e9 ? 0 : 1)}B`
+  return `${Math.round(n / 1e6)}M`
+}
+
+function countLabel(n: number) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`
+  return String(n)
+}
+
+/**
+ * The base model field: a Hugging Face id, typed or picked. Typing searches
+ * the hub through the server (debounced); an empty box lists the suggested
+ * small bases. Arrow keys move, Enter picks, Escape closes; the typed text
+ * is always accepted as is, so an id the hub does not list still works.
+ */
+function BaseModelPicker({ value, onChange }: { value: string; onChange: (id: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState(value)
+  const [active, setActive] = useState(0)
+  const [debounced, setDebounced] = useState('')
+  const listId = useId()
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(q.trim()), 250)
+    return () => clearTimeout(t)
+  }, [q])
+  const hits = useQuery({
+    queryKey: ['training', 'hub', debounced],
+    queryFn: () => api.get<{ models: HubModel[] }>(`/api/training/models?q=${encodeURIComponent(debounced)}`),
+    enabled: open,
+    staleTime: 10 * 60 * 1000,
+    retry: false,
+  })
+  const models = hits.data?.models ?? []
+  useEffect(() => setActive(0), [debounced, open])
+  const pick = (id: string) => {
+    onChange(id)
+    setQ(id)
+    setOpen(false)
+  }
+  return (
+    <div className="relative flex-1 min-w-64">
+      <input
+        value={q}
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-label="Base model"
+        onChange={(e) => { setQ(e.target.value); onChange(e.target.value); setOpen(true) }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onKeyDown={(e) => {
+          if (!open && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { setOpen(true); return }
+          if (e.key === 'ArrowDown') { e.preventDefault(); setActive((a) => Math.min(a + 1, models.length - 1)) }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((a) => Math.max(a - 1, 0)) }
+          else if (e.key === 'Enter' && open && models[active]) { e.preventDefault(); pick(models[active].id) }
+          else if (e.key === 'Escape') setOpen(false)
+        }}
+        placeholder="base model: a Hugging Face id, e.g. Qwen/Qwen2.5-0.5B-Instruct"
+        title="What the trainer downloads and trains on. Type to search the hub; required unless the endpoint's model name is already a Hugging Face id (org/name)"
+        className={clsx(inputSm, 'font-mono')}
+      />
+      {open && (
+        <ul id={listId} role="listbox" className="absolute z-20 mt-1 max-h-72 w-full overflow-y-auto rounded-lg border border-line bg-bg-2 py-1 font-sans text-sm">
+          {hits.isError && <li className="px-3 py-1.5 meta">The model hub did not answer; type the id by hand.</li>}
+          {!hits.isError && hits.isFetching && models.length === 0 && <li className="px-3 py-1.5 meta">Searching…</li>}
+          {!hits.isError && !hits.isFetching && models.length === 0 && debounced && <li className="px-3 py-1.5 meta">No text-generation model matches; the id typed above is used as is.</li>}
+          {!debounced && models.length > 0 && <li className="px-3 py-1 meta">suggested small bases</li>}
+          {models.map((m, i) => (
+            <li
+              key={m.id}
+              role="option"
+              aria-selected={i === active}
+              onMouseDown={(e) => { e.preventDefault(); pick(m.id) }}
+              onMouseEnter={() => setActive(i)}
+              className={clsx('flex cursor-pointer items-baseline gap-2 px-3 py-1.5', i === active ? 'bg-bg-3' : 'hover:bg-bg-3')}
+            >
+              <span className="font-mono text-xs truncate">{m.id}</span>
+              <span className="meta ml-auto shrink-0 tnum">
+                {paramsLabel(m.params)}
+                {m.downloads ? ` · ${countLabel(m.downloads)} downloads` : ''}
+                {m.gated ? ' · gated' : ''}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   )
 }

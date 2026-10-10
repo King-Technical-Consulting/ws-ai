@@ -42,6 +42,7 @@ type Config struct {
 	MemoryMB int64         // memory limit per sandbox
 	CPUs     float64       // CPU limit per sandbox
 	Pids     int64         // pids limit
+	Jail     bool          // run bash tool commands inside bubblewrap (needs bwrap in the image and user namespaces in the container)
 	IdleStop time.Duration // stop containers idle this long
 	Remove   time.Duration // remove stopped containers idle this long (volume kept)
 	Labels   map[string]string
@@ -334,7 +335,11 @@ func (m *Manager) Exec(ctx context.Context, sb *Sandbox, o ExecOptions) (ExecRes
 	var argv []string
 	switch {
 	case o.Shell != "":
-		argv = []string{"timeout", "-s", "KILL", secs, "bash", "-c", o.Shell}
+		if m.cfg.Jail {
+			argv = append([]string{"timeout", "-s", "KILL", secs}, jailArgv(jailBinds, o.Dir, o.Shell)...)
+		} else {
+			argv = []string{"timeout", "-s", "KILL", secs, "bash", "-c", o.Shell}
+		}
 	case len(o.Cmd) > 0:
 		argv = append([]string{"timeout", "-s", "KILL", secs}, o.Cmd...)
 	default:

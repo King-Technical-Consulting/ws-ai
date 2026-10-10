@@ -36,10 +36,12 @@ WORKDIR /app
 COPY --from=build /out/ws /app/ws
 COPY --from=build --chown=65532:65532 /out/data /data
 COPY config /app/config
+COPY infra/comfyui/workflows /app/infra/comfyui/workflows
 COPY LICENSE THIRD_PARTY_NOTICES.txt /licenses/
 ENV WS_ENDPOINTS_FILE=/app/config/endpoints.yaml \
     WS_POLICIES_DIR=/app/config/policies \
     WS_PRESETS_DIR=/app/config/presets \
+    WS_COMFY_WORKFLOWS=/app/infra/comfyui/workflows \
     WS_BLOB_DIR=/data/blobs \
     HOME=/home/nonroot \
     XDG_CACHE_HOME=/tmp/ws-cache

@@ -48,4 +48,12 @@ MCP servers that need a filesystem or a shell can be listed with a `command:` in
 
 If you use Claude Code or another MCP client, point it at ws: `claude mcp add --transport http ws https://<your-host>/mcp --header "Authorization: Bearer ws_..."` (the Settings page prints the line for a key you mint with **MCP access** ticked; a key without it, including every key made before this setting existed, gets a `403`). The tools let the client list your projects, conversations and models, read a conversation, ask a model a one-off question, start a run in a project and follow it, and hand a task to the task router. It needs an API key with the `mcp` scope, not a browser session, and every call acts as the key's user. `WS_MCP_SERVER=false` turns it off.
 
+## Your own provider keys
+
+Settings has a section where you can save your own API key for a hosted provider (one that takes a key). The key is sealed on the server with `WS_SECRETS_KEY` before it is stored and is never shown again, only its last four characters; without that variable set, saving is refused and Settings says so.
+
+Saved keys are used (#160). A hosted model serves a **member** only with their own key for that provider. The **owner**, and any member the owner ticks in the **people** section of Admin ("may use shared keys"), keep using the server's shared keys. Local models are not affected, and the server's own housekeeping calls are not either. If the only models that could answer are hosted and the person has no key, the chat says: "This model needs your own API key. Add one under Settings, provider keys, or pick a model that runs on this server." Spend on a person's own key is left out of the budget sums (the ledger row carries `own_key`); spend on a shared key still counts against the person's budget.
+
+A provider the server has no key for (its key variable in `config/endpoints.yaml` is unset) still shows up, and a member's own saved key makes it usable (#169); the owner's shared-key grant does not reach it. The change applies to every member at once: an existing member loses access to hosted models until they save a key or the owner ticks them. Read from the code and its unit tests (`internal/gateway/keys.go`); no real provider call with a member's key is on record.
+
 *Checked against the code and configuration at master `13a673a`.*

@@ -48,7 +48,7 @@ func (f *fakeStore) GetCCLaunchCount(_ context.Context, week time.Time) (int32, 
 	return n, nil
 }
 
-func (f *fakeStore) UpsertCCJob(_ context.Context, p store.UpsertCCJobParams) (store.CcJob, error) {
+func (f *fakeStore) UpsertCCJob(_ context.Context, p store.UpsertCCJobParams) (store.UpsertCCJobRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := time.Now()
@@ -69,7 +69,7 @@ func (f *fakeStore) UpsertCCJob(_ context.Context, p store.UpsertCCJobParams) (s
 		j.EndedAt = nil
 	}
 	f.rows[p.ID] = j
-	return j, nil
+	return store.UpsertCCJobRow{CcJob: j, Inserted: !ok}, nil
 }
 
 func (f *fakeStore) GetCCJob(_ context.Context, id string) (store.CcJob, error) {
@@ -461,5 +461,33 @@ func TestLaunchCounter(t *testing.T) {
 	rep("eeeeeeeeee", now, SourceWSJ)
 	if b, _ = r.Budget(ctx); b.Level() != ccjobs.BudgetFull {
 		t.Errorf("budget at the cap = %+v level %s", b, b.Level())
+	}
+}
+
+// TestLaunchCounterRace: concurrent reports of the same new job (wsj and
+// the refresh adopting the window at once) count it exactly once; the
+// upsert decides who inserted, not a lookup that both can miss.
+func TestLaunchCounterRace(t *testing.T) {
+	db := newFake()
+	r := &Registry{DB: db, Cap: 4}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		src := SourceWSJ
+		if i%2 == 1 {
+			src = SourceTmux
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.Report(ctx, uuid.NullUUID{}, src, ccjobs.Report{ID: "raceraceab", Target: "mac", Window: "@1", Started: now}); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := db.counts[ccjobs.WeekStart(now)]; got != 1 {
+		t.Errorf("32 reports of one new job counted %d launches, want 1", got)
 	}
 }

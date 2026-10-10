@@ -218,6 +218,26 @@ func (s *Server) handleDownloadDataset(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
+// handleDatasetPreview is GET /api/training/datasets/{id}/preview?split=train|eval&n=5:
+// the first examples, parsed.
+func (s *Server) handleDatasetPreview(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+	exs, err := s.Training.Preview(r.Context(), id, r.URL.Query().Get("split") == "eval", n)
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"examples": exs})
+}
+
 // handleDeleteDataset is DELETE /api/training/datasets/{id}.
 func (s *Server) handleDeleteDataset(w http.ResponseWriter, r *http.Request) {
 	id, err := uuidParam(r, "id")
@@ -369,7 +389,8 @@ func (s *Server) handleEvaluateAdapter(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePromoteAdapter is POST /api/training/adapters/{id}/promote
-// {force}; DELETE unpromotes.
+// {force, task_class?}; DELETE unpromotes. With a task class the adapter
+// goes first for that class in the training-adapters policy.
 func (s *Server) handlePromoteAdapter(w http.ResponseWriter, r *http.Request) {
 	if !s.needTraining(w) {
 		return
@@ -380,10 +401,11 @@ func (s *Server) handlePromoteAdapter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Force bool `json:"force"`
+		Force     bool   `json:"force"`
+		TaskClass string `json:"task_class"`
 	}
 	_ = decode(r, &in)
-	if err := s.Training.Promote(r.Context(), id, in.Force); err != nil {
+	if err := s.Training.Promote(r.Context(), id, in.Force, in.TaskClass); err != nil {
 		writeTrainingErr(w, err)
 		return
 	}
@@ -423,13 +445,99 @@ func (s *Server) handleDeleteAdapter(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// handleListRoutes is GET /api/training/routes: the task-class routes
+// the training-adapters policy holds, newest first.
+func (s *Server) handleListRoutes(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	routes, err := s.Training.Routes(r.Context())
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	if routes == nil {
+		routes = []training.Route{}
+	}
+	writeJSON(w, 200, map[string]any{"routes": routes, "policy": training.AdapterPolicy})
+}
+
+// handleAddRoute is PUT /api/training/routes {task_class, endpoint_id}:
+// send a task class to an endpoint first (an adapter, or a frontier
+// model to distil from), ahead of what the other policies prefer.
+func (s *Server) handleAddRoute(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	var in struct {
+		TaskClass  string `json:"task_class"`
+		EndpointID string `json:"endpoint_id"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	if err := s.Training.AddRoute(r.Context(), in.TaskClass, in.EndpointID); err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleRemoveRoute is POST /api/training/routes/remove {task_class, endpoint_id}.
+func (s *Server) handleRemoveRoute(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	var in struct {
+		TaskClass  string `json:"task_class"`
+		EndpointID string `json:"endpoint_id"`
+	}
+	if err := decode(r, &in); err != nil || in.EndpointID == "" {
+		writeErr(w, 400, "endpoint_id required")
+		return
+	}
+	if err := s.Training.RemoveRoute(r.Context(), in.TaskClass, in.EndpointID); err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleSearchBaseModels is GET /api/training/models?q=: base models the
+// trainer can load, from the Hugging Face hub through the server (the
+// suggested small bases when q is empty). 502 when the hub is unreachable.
+func (s *Server) handleSearchBaseModels(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	hub := s.Training.Hub
+	if hub == nil {
+		hub = &training.Hub{}
+		if strings.TrimSpace(q) != "" {
+			writeJSON(w, 200, map[string]any{"models": []training.HubModel{}, "source": "none"})
+			return
+		}
+	}
+	models, err := hub.Search(r.Context(), q)
+	if err != nil {
+		s.Log.Warn("hub search", "err", err)
+		writeErr(w, 502, "the model hub did not answer; type the id by hand")
+		return
+	}
+	if models == nil {
+		models = []training.HubModel{}
+	}
+	writeJSON(w, 200, map[string]any{"models": models})
+}
+
 // trainingRoutes mounts the owner-only training routes.
 func (s *Server) trainingRoutes(r chi.Router) {
 	r.Get("/datasets", s.handleListDatasets)
 	r.Post("/datasets", s.handleCreateDataset)
 	r.Get("/datasets/{id}", s.handleGetDataset)
 	r.Get("/datasets/{id}/download", s.handleDownloadDataset)
+	r.Get("/datasets/{id}/preview", s.handleDatasetPreview)
 	r.Delete("/datasets/{id}", s.handleDeleteDataset)
+	r.Get("/models", s.handleSearchBaseModels)
 	r.Get("/jobs", s.handleListFinetuneJobs)
 	r.Post("/jobs", s.handleStartFinetune)
 	r.Get("/jobs/{id}", s.handleGetFinetuneJob)
@@ -440,4 +548,7 @@ func (s *Server) trainingRoutes(r chi.Router) {
 	r.Post("/adapters/{id}/promote", s.handlePromoteAdapter)
 	r.Delete("/adapters/{id}/promote", s.handleUnpromoteAdapter)
 	r.Delete("/adapters/{id}", s.handleDeleteAdapter)
+	r.Get("/routes", s.handleListRoutes)
+	r.Put("/routes", s.handleAddRoute)
+	r.Post("/routes/remove", s.handleRemoveRoute)
 }

@@ -42,6 +42,14 @@ providers:
     name: llama-server (local)
     base_url_env: LLAMA_SERVER_URL
 
+  # The embedding server runs apart from the chat server (llama-server
+  # answers /v1/embeddings with 501 unless started with --embedding), so
+  # it has its own URL; unset, the endpoint below is skipped.
+  - id: local-llama-embed
+    kind: openai_compat
+    name: llama-server embeddings (local)
+    base_url_env: LLAMA_EMBED_URL
+
   - id: local-vllm
     kind: openai_compat
     name: vLLM (Spark)
@@ -285,12 +293,14 @@ endpoints:
     latency_class: fast
 
   # ---- Local: W7700 16 GB / Orin via llama-server ----
+  # max_concurrency matches --parallel in override.orin-cuda.yaml; override.amd-rocm.yaml
+  # runs 2, so lower it in Admin on that box.
   - id: local-llama/gpt-oss-20b
     provider: local-llama
     model: gpt-oss-20b
     display_name: gpt-oss-20b (local)
     local: true
-    capabilities: { context_window: 131072, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true }
+    capabilities: { context_window: 32768, max_output: 32768, tools: true, vision: false, json_mode: true, reasoning: true , max_concurrency: 4 }
     throughput_class: low
     latency_class: normal
 
@@ -299,12 +309,26 @@ endpoints:
     model: qwen3-14b
     display_name: Qwen3 14B (local)
     local: true
+    enabled: false # no compose override serves it; enable it after pointing one at its GGUF
     capabilities: { context_window: 40960, max_output: 8192, tools: true, vision: false, json_mode: true, reasoning: true }
     throughput_class: low
     latency_class: normal
 
-  - id: local-llama/nomic-embed-text
+  # What override.cpu.yaml serves. Off by default so a GPU box, which serves
+  # a different model on the same provider, never routes here; turn it on in
+  # Admin on a CPU-only box.
+  - id: local-llama/qwen3-4b
     provider: local-llama
+    model: qwen3-4b
+    display_name: Qwen3 4B (CPU test box)
+    local: true
+    enabled: false
+    capabilities: { context_window: 8192, max_output: 4096, tools: true, vision: false, json_mode: true, reasoning: true }
+    throughput_class: low
+    latency_class: slow
+
+  - id: local-llama/nomic-embed-text
+    provider: local-llama-embed
     model: nomic-embed-text-v1.5
     display_name: nomic-embed (local)
     local: true

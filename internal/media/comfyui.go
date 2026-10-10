@@ -280,6 +280,18 @@ func fill(tmpl string, ep *gateway.Endpoint, req *Request, source, mask string, 
 	if err := json.Unmarshal([]byte(r.Replace(tmpl)), &wf); err != nil {
 		return nil, fmt.Errorf("comfyui: the filled workflow is not valid JSON: %w", err)
 	}
+	// ComfyUI's validator treats every top-level entry as a node and calls
+	// .get on it, so a "_comment" string in a hand-edited template makes it
+	// refuse the whole workflow (board e5ff). Notes belong in the README;
+	// one that slipped in is dropped rather than failing every render.
+	for k, v := range wf {
+		if _, isNode := v.(map[string]any); !isNode {
+			delete(wf, k)
+		}
+	}
+	if len(wf) == 0 {
+		return nil, fmt.Errorf("comfyui: the filled workflow has no nodes")
+	}
 	return wf, nil
 }
 

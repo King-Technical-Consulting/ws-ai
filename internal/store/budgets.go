@@ -59,9 +59,7 @@ func (d *DB) RefreshHealth(ctx context.Context, reg *gateway.Registry) error {
 			errText = *r.HealthError
 		}
 		reg.SetHealth(r.ID, r.HealthStatus, p50, rate, errText)
-		if ep, ok := reg.Endpoint(r.ID); ok {
-			ep.Enabled = r.Enabled
-		}
+		reg.SetEnabled(r.ID, r.Enabled)
 	}
 	return nil
 }

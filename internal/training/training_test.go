@@ -123,10 +123,11 @@ type fakeStore struct {
 	jobs     map[uuid.UUID]store.FinetuneJob
 	adapters map[uuid.UUID]store.Adapter
 	eps      map[string]bool // enabled
+	policies map[string]store.RoutingPolicy
 }
 
 func newFake() *fakeStore {
-	return &fakeStore{users: map[uuid.UUID]bool{}, msgs: map[uuid.UUID][]store.Message{}, ratings: map[uuid.UUID][]store.MessageRating{}, datasets: map[uuid.UUID]store.Dataset{}, jobs: map[uuid.UUID]store.FinetuneJob{}, adapters: map[uuid.UUID]store.Adapter{}, eps: map[string]bool{}}
+	return &fakeStore{users: map[uuid.UUID]bool{}, msgs: map[uuid.UUID][]store.Message{}, ratings: map[uuid.UUID][]store.MessageRating{}, datasets: map[uuid.UUID]store.Dataset{}, jobs: map[uuid.UUID]store.FinetuneJob{}, adapters: map[uuid.UUID]store.Adapter{}, eps: map[string]bool{}, policies: map[string]store.RoutingPolicy{}}
 }
 
 func (f *fakeStore) ListTrainingConversations(_ context.Context, p store.ListTrainingConversationsParams) ([]store.Conversation, error) {
@@ -296,6 +297,28 @@ func (f *fakeStore) SetEndpointEnabled(_ context.Context, p store.SetEndpointEna
 	return nil
 }
 func (f *fakeStore) DeleteEndpoint(_ context.Context, id string) error { delete(f.eps, id); return nil }
+func (f *fakeStore) GetRoutingPolicyByName(_ context.Context, name string) (store.RoutingPolicy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.policies[name]
+	if !ok {
+		return p, pgx.ErrNoRows
+	}
+	return p, nil
+}
+func (f *fakeStore) UpsertRoutingPolicy(_ context.Context, p store.UpsertRoutingPolicyParams) (store.RoutingPolicy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := store.RoutingPolicy{Name: p.Name, Yaml: p.Yaml, Priority: p.Priority, Enabled: p.Enabled}
+	f.policies[p.Name] = row
+	return row, nil
+}
+func (f *fakeStore) DeleteRoutingPolicyByName(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.policies, name)
+	return nil
+}
 
 type fakeRunner struct {
 	err  error
@@ -413,6 +436,22 @@ func TestDatasetBuildFinetuneEvalPromote(t *testing.T) {
 	if _, err := svc.StartFinetune(ctx, owner, FinetuneSpec{DatasetID: ds.ID, AdapterName: "chat-v1", BaseEndpointID: "local/none"}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("unknown base: %v", err)
 	}
+	// An endpoint whose model name is not a Hugging Face id (a llama-server
+	// name) cannot stand in for the base model id.
+	gguf := &gateway.Endpoint{ID: "local/gguf", ProviderID: "local-llama", ModelName: "gpt-oss-20b", DisplayName: "gpt-oss", Local: true}
+	prevEP := svc.Endpoint
+	svc.Endpoint = func(id string) (*gateway.Endpoint, bool) {
+		if id == gguf.ID {
+			return gguf, true
+		}
+		return prevEP(id)
+	}
+	if _, err := svc.StartFinetune(ctx, owner, FinetuneSpec{DatasetID: ds.ID, AdapterName: "chat-v1", BaseEndpointID: "local/gguf"}); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "gpt-oss-20b") {
+		t.Errorf("gguf-named base without an id: %v", err)
+	}
+	if _, err := svc.StartFinetune(ctx, owner, FinetuneSpec{DatasetID: ds.ID, AdapterName: "chat-v2", BaseEndpointID: "local/gguf", BaseModel: "openai/gpt-oss-20b"}); err != nil {
+		t.Errorf("gguf-named base with an id: %v", err)
+	}
 	job, err := svc.StartFinetune(ctx, owner, FinetuneSpec{DatasetID: ds.ID, AdapterName: "Chat-v1", BaseEndpointID: "local/qwen", Config: FinetuneConfig{Epochs: 3}})
 	if err != nil {
 		t.Fatal(err)
@@ -436,7 +475,7 @@ func TestDatasetBuildFinetuneEvalPromote(t *testing.T) {
 		t.Errorf("adapter file: %s %v", tarball, err)
 	}
 	// Promote needs the eval gate.
-	if err := svc.Promote(ctx, ad.ID, false); !errors.Is(err, ErrNotReady) {
+	if err := svc.Promote(ctx, ad.ID, false, ""); !errors.Is(err, ErrNotReady) {
 		t.Errorf("promote before eval: %v", err)
 	}
 	svc.GW = &fakeGW{refs: refs}
@@ -453,7 +492,7 @@ func TestDatasetBuildFinetuneEvalPromote(t *testing.T) {
 	if res.Examples != min(5, int(got.EvalExamples)) || res.AdapterWins != res.Examples {
 		t.Errorf("eval result = %+v", res)
 	}
-	if err := svc.Promote(ctx, ad.ID, false); err != nil {
+	if err := svc.Promote(ctx, ad.ID, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	ad, _ = db.GetAdapter(ctx, ad.ID)

@@ -33,7 +33,7 @@ services:
     volumes:
       - ../../data/hf:/root/.cache/huggingface
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${LLAMA_BIND_ADDR:-127.0.0.1}:8000:8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 15s

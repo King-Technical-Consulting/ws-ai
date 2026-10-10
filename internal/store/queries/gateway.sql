@@ -54,21 +54,21 @@ DELETE FROM routing_policies WHERE id = $1;
 INSERT INTO usage_ledger (
   user_id, conversation_id, agent_id, agent_run_id, api_key_id, endpoint_id, model, task_class, policy_name, decision,
   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, finish_reason, error,
-  session_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+  session_id, own_key
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 RETURNING id;
 
 -- name: SumUsageForUserSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE user_id = $1 AND created_at >= $2;
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE user_id = $1 AND created_at >= $2 AND NOT own_key;
 
 -- name: SumUsageForAgentSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE agent_id = $1 AND created_at >= $2;
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE agent_id = $1 AND created_at >= $2 AND NOT own_key;
 
 -- name: SumUsageForAPIKeySince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE api_key_id = $1 AND created_at >= $2;
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE api_key_id = $1 AND created_at >= $2 AND NOT own_key;
 
 -- name: SumUsageSince :one
-SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE created_at >= $1;
+SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE created_at >= $1 AND NOT own_key;
 
 -- name: ListUsageForUser :many
 SELECT * FROM usage_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3;
@@ -108,3 +108,13 @@ SELECT * FROM routing_policies WHERE name = $1;
 
 -- name: DeleteRoutingPolicyByName :exec
 DELETE FROM routing_policies WHERE name = $1;
+
+-- name: UpsertEndpointThroughput :exec
+INSERT INTO endpoint_throughput (endpoint_id, tokens_per_sec, ttft_ms, samples, updated_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (endpoint_id) DO UPDATE SET
+    tokens_per_sec = EXCLUDED.tokens_per_sec, ttft_ms = EXCLUDED.ttft_ms,
+    samples = EXCLUDED.samples, updated_at = EXCLUDED.updated_at;
+
+-- name: ListEndpointThroughput :many
+SELECT * FROM endpoint_throughput;

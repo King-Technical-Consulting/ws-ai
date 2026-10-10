@@ -1,7 +1,10 @@
 # Web host only, no local inference: Postgres, app, worker. Models come from
 # hosted providers whose keys are set in .env (ANTHROPIC_API_KEY,
 # OPENROUTER_API_KEY, OPENAI_API_KEY). Add a GPU override later or point
-# LLAMA_SERVER_URL / VLLM_URL / MAC_STUDIO_URL at another box over Tailscale.
+# LLAMA_SERVER_URL / VLLM_URL / MAC_STUDIO_URL at another box over Tailscale
+# (on that box, LLAMA_BIND_ADDR=<its tailnet address> in .env publishes
+# llama-server there instead of on loopback; llama-server has no auth of
+# its own, so the tailnet is the boundary).
 #
 #   make up HW=cloud INGRESS=cloudflare
 #

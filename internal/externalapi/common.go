@@ -69,7 +69,7 @@ func (s *Server) resolveSelector(model string, p *Principal) (string, gateway.Ta
 		return model, tc
 	}
 	for _, pol := range s.GW.Router.Policies() {
-		if _, ok := pol.Aliases[model]; ok {
+		if _, ok := pol.Selectors()[model]; ok {
 			return model, tc
 		}
 	}

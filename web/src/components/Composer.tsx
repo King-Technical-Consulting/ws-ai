@@ -8,6 +8,7 @@ export function Composer({
   onSend,
   onStop,
   initialFiles,
+  imageNote,
 }: {
   disabled: boolean
   onSend: (text: string, files?: FilePart[]) => void
@@ -15,6 +16,9 @@ export function Composer({
   // Files to start with (a gallery image sent to chat); applied when the
   // array changes.
   initialFiles?: FilePart[]
+  // Shown next to the attachments while an image is among them: the model
+  // picked cannot read images (Chat works it out from the picker's value).
+  imageNote?: string
 }) {
   const [text, setText] = useState('')
   const [files, setFiles] = useState<FilePart[]>([])
@@ -61,6 +65,9 @@ export function Composer({
                 </button>
               </span>
             ))}
+            {imageNote && files.some((f) => f.mediaType.startsWith('image/')) && (
+              <span role="note" className="meta self-center">{imageNote}</span>
+            )}
           </div>
         )}
         <div className="flex items-end gap-2 rounded-2xl border border-line bg-bg-2 px-3 py-2 focus-within:border-accent">

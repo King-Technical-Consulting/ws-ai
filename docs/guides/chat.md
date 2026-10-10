@@ -24,11 +24,11 @@ The brain icon next to the picker asks for extended thinking. It has an effect o
 
 ## Tools in chat
 
-A chat turn can call these built-in tools: `create_artifact` and `update_artifact` (see [Artifacts](artifacts.md)), `web_fetch` (public URLs only; private, loopback and tailnet addresses are refused), `read_blob` (to page through a long tool result that was stored outside the conversation) and `ask_user`. When an image model is configured it can also call `generate_image` (the results appear in the chat; the Media page uses the same models), and when the operator turns task dispatch on it can call `spawn_job`. Tools from MCP servers listed in `config/mcp.yaml` appear as `mcp__<server>__<tool>`. Code projects are offered every tool the worker has, including these and the sandbox tools. Each tool has a policy that decides whether it runs on its own or asks you first; see [Approvals](approvals.md).
+A chat turn can call these built-in tools: `create_artifact` and `update_artifact` (see [Artifacts](artifacts.md)), `web_fetch` (public URLs only; private, loopback and tailnet addresses are refused), `read_blob` (to page through a long tool result that was stored outside the conversation) and `ask_user`. When the model calls `ask_user` it stops there: the chat shows the question in a card headed "A question for you", the turn is over, and you answer in the message box like any other message. When an image model is configured it can also call `generate_image` (the results appear in the chat; the Media page uses the same models), and when the operator turns task dispatch on it can call `spawn_job`. Tools from MCP servers listed in `config/mcp.yaml` appear as `mcp__<server>__<tool>`. Code projects are offered every tool the worker has, including these and the sandbox tools. Each tool has a policy that decides whether it runs on its own or asks you first; see [Approvals](approvals.md).
 
 ## Long conversations
 
-ws never edits what is stored. When a request would be larger than the compaction budget (`WS_COMPACTION_BUDGET_TOKENS`, 60,000 tokens by default), it sends a stored summary of the older turns plus the recent turns instead, and drops the oldest turns for that one request if it is still too long. A background job writes a fresh summary with a cheap model. Your full history stays as it was.
+ws never edits what is stored. When a request would be larger than the compaction budget (`WS_COMPACTION_BUDGET_TOKENS`, 60,000 tokens by default, lowered per request to the largest context window among the models your choice could route to, less room for the reply), it sends a stored summary of the older turns plus the recent turns instead, and drops the oldest turns for that one request if it is still too long. A background job writes a fresh summary with a cheap model. Your full history stays as it was. If a conversation still does not fit the model you picked (or, with `auto` or a routing alias, any model that choice could use), the chat says "This conversation is too long for the model. Start a new conversation, shorten the message, or pick a model with a larger context." and nothing else. The size is estimated before the call, so very number-heavy or non-English text counts for more than plain English.
 
 ## Rating answers
 
@@ -37,5 +37,13 @@ Each answer has a thumbs up and thumbs down; clicking the same one again clears 
 ## Cost and limits
 
 Every model call is written to a usage ledger with its tokens, cost and the routing decision. The owner can set budgets that block a call or switch it to local endpoints once a limit is reached; see [Admin](admin.md).
+
+## Your name
+
+Settings has a **profile** section with a display name field and a **Save name** button. The name is the one thing about your account you edit yourself, 1 to 80 characters; your address and role are fixed.
+
+## On a phone
+
+Below 768 px wide the sidebar becomes a drawer that opens from a top bar, the artifact, code and design panels open over the page instead of beside it, and the agent monitor and Jobs panes stack. The page should never scroll sideways. This is read from the layout code (#158) and its browser tests; it has not been tried on a real phone.
 
 *Checked against the code at master `13a673a`.*

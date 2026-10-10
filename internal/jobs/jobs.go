@@ -31,9 +31,29 @@ type RunArgs struct {
 // Kind implements river.JobArgs.
 func (RunArgs) Kind() string { return "agent.run" }
 
-// InsertOpts: one job per run at a time.
+// InsertOpts: one job per run at a time. River requires the running state
+// in the set, so a job inserted while the run's job is still being
+// completed is dropped; an approval decision therefore uses ResumeArgs.
 func (RunArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{Queue: "agents", MaxAttempts: 3, UniqueOpts: river.UniqueOpts{ByArgs: true, ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}}}
+}
+
+// ResumeArgs continues a run parked for approval once its decisions are
+// in. It is not unique: the decision can land while River still holds the
+// pausing agent.run job as running (the completion is written after Work
+// returns), and a unique insert would be dropped then, leaving the run
+// queued until the reaper. ClaimRun takes the run atomically, so a second
+// job finds it not claimable and is cancelled; a run is never driven twice.
+type ResumeArgs struct {
+	RunID uuid.UUID `json:"run_id"`
+}
+
+// Kind implements river.JobArgs.
+func (ResumeArgs) Kind() string { return "agent.resume" }
+
+// InsertOpts: same queue and attempts as agent.run, no uniqueness.
+func (ResumeArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "agents", MaxAttempts: 3}
 }
 
 // CompactArgs summarizes a conversation.
@@ -264,6 +284,40 @@ func (w *sandboxReapWorker) Work(ctx context.Context, job *river.Job[SandboxReap
 	return w.deps.Sandbox.Reap(ctx)
 }
 
+// AuthPurgeArgs is the hourly deletion of expired sign-in rows.
+type AuthPurgeArgs struct{}
+
+// Kind implements river.JobArgs.
+func (AuthPurgeArgs) Kind() string { return "auth.purge" }
+
+type authPurgeWorker struct {
+	river.WorkerDefaults[AuthPurgeArgs]
+	deps *Deps
+}
+
+// Work deletes expired magic links, invites, sessions and passkey
+// ceremonies. The sign-in routes that create these rows take no session,
+// so without this the tables only grow.
+func (w *authPurgeWorker) Work(ctx context.Context, job *river.Job[AuthPurgeArgs]) error {
+	q := w.deps.DB
+	var total int64
+	var first error
+	// Every purge runs even if an earlier one fails, so one broken query
+	// does not stop the others; the first error is returned at the end so
+	// the job is retried.
+	for _, purge := range []func(context.Context) (int64, error){q.PurgeMagicLinks, q.PurgeInvites, q.PurgeSessions, q.PurgeExpiredWebAuthnSessions} {
+		n, err := purge(ctx)
+		if err != nil && first == nil {
+			first = err
+		}
+		total += n
+	}
+	if total > 0 {
+		w.deps.Log.Info("auth purge", "rows", total)
+	}
+	return first
+}
+
 // Migrate applies River's own schema. Idempotent.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	m, err := rivermigrate.New(riverpgxv5.New(pool), nil)
@@ -291,8 +345,10 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 	}
 	if startWorkers {
 		river.AddWorker(workers, &runWorker{deps: deps})
+		river.AddWorker(workers, &resumeWorker{deps: deps})
 		river.AddWorker(workers, &compactWorker{deps: deps})
 		river.AddWorker(workers, &reapWorker{deps: deps})
+		river.AddWorker(workers, &authPurgeWorker{deps: deps})
 		cfg.Workers = workers
 		cfg.Queues = map[string]river.QueueConfig{
 			"agents":       {MaxWorkers: 8},
@@ -307,6 +363,9 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 				return ReapArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Minute}}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
+		cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(time.Hour), func() (river.JobArgs, *river.InsertOpts) {
+			return AuthPurgeArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Hour}}
+		}, &river.PeriodicJobOpts{RunOnStart: true}))
 		if deps.Memory != nil {
 			river.AddWorker(workers, &reflectWorker{deps: deps})
 		}
@@ -357,6 +416,12 @@ func (cl *Client) EnqueueRun(ctx context.Context, runID uuid.UUID) error {
 	return err
 }
 
+// EnqueueResume continues a run parked for approval (see ResumeArgs).
+func (cl *Client) EnqueueResume(ctx context.Context, runID uuid.UUID) error {
+	_, err := cl.c.Insert(ctx, ResumeArgs{RunID: runID}, nil)
+	return err
+}
+
 // EnqueueTrainingBuild, EnqueueFinetune and EnqueueEval schedule the
 // training flywheel's jobs.
 func (cl *Client) EnqueueTrainingBuild(ctx context.Context, datasetID uuid.UUID) error {
@@ -396,19 +461,37 @@ type runWorker struct {
 func (w *runWorker) Timeout(*river.Job[RunArgs]) time.Duration { return 25 * time.Minute }
 
 func (w *runWorker) Work(ctx context.Context, job *river.Job[RunArgs]) error {
-	sink := &agent.NotifySink{Pool: w.deps.DB.Pool, Channel: agent.NotifyChannel(job.Args.RunID.String()), Log: w.deps.Log}
-	err := w.deps.Runtime.Drive(ctx, job.Args.RunID, sink)
+	return w.drive(ctx, job.Args.RunID)
+}
+
+// drive is the body shared with resumeWorker: a pause is a clean end, a run
+// someone else holds (or that finished) cancels the job, anything else
+// retries.
+func (w *runWorker) drive(ctx context.Context, runID uuid.UUID) error {
+	sink := &agent.NotifySink{Pool: w.deps.DB.Pool, Channel: agent.NotifyChannel(runID.String()), Log: w.deps.Log}
+	err := w.deps.Runtime.Drive(ctx, runID, sink)
 	switch {
 	case err == nil:
-		w.reflect(ctx, job.Args.RunID)
+		w.reflect(ctx, runID)
 		return nil
 	case errors.Is(err, agent.ErrPaused):
 		return nil
 	case errors.Is(err, agent.ErrRunNotClaimable):
 		return river.JobCancel(err) // someone else has it, or it's finished
 	}
-	w.reflect(ctx, job.Args.RunID) // a failed run is still an episode worth keeping
+	w.reflect(ctx, runID) // a failed run is still an episode worth keeping
 	return err
+}
+
+type resumeWorker struct {
+	river.WorkerDefaults[ResumeArgs]
+	deps *Deps
+}
+
+func (w *resumeWorker) Timeout(*river.Job[ResumeArgs]) time.Duration { return 25 * time.Minute }
+
+func (w *resumeWorker) Work(ctx context.Context, job *river.Job[ResumeArgs]) error {
+	return (&runWorker{deps: w.deps}).drive(ctx, job.Args.RunID)
 }
 
 // reflect queues agent.reflect for a run that belongs to an agent.

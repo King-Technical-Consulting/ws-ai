@@ -2,6 +2,9 @@ package agents
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -140,6 +143,17 @@ func (f *fakeStore) ListDueCronTriggers(_ context.Context) ([]store.AgentTrigger
 	var out []store.AgentTrigger
 	for _, t := range f.triggers {
 		if t.Enabled && t.Kind == KindCron && t.NextRunAt != nil && !t.NextRunAt.After(time.Now()) && f.agents[t.AgentID].Enabled {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) ListRepoPushTriggers(_ context.Context) ([]store.AgentTrigger, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.AgentTrigger
+	for _, t := range f.triggers {
+		if t.Enabled && t.Kind == KindRepoPush && f.agents[t.AgentID].Enabled {
 			out = append(out, t)
 		}
 	}
@@ -323,6 +337,65 @@ func TestWebhookFire(t *testing.T) {
 	db.triggers[trig.ID] = tr
 	if _, err := svc.Fire(ctx, trig.ID, secret, ""); !errors.Is(err, ErrSecret) {
 		t.Errorf("disabled trigger: %v", err)
+	}
+}
+
+func signed(secret, body string) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte(body))
+	return "sha256=" + hex.EncodeToString(m.Sum(nil))
+}
+
+const pushBody = `{"ref":"refs/heads/main","repository":{"full_name":"acme/app"},"pusher":{"name":"ann"},"commits":[{"id":"abc1234","message":"fix","author":{"name":"ann"}}]}`
+
+func TestRepoPushNeedsTheSignature(t *testing.T) {
+	svc, _, _, ag := newService(t)
+	ctx := context.Background()
+	spec, _ := json.Marshal(RepoPushSpec{Repo: "acme/app"})
+	trig, secret, err := svc.NewTrigger(ctx, ag.ID, KindRepoPush, "pushes", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The URL secret alone is not enough for a GitHub delivery.
+	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, Body: pushBody, GitHubEvent: "push"}); !errors.Is(err, ErrNoSignature) {
+		t.Errorf("no signature: %v", err)
+	}
+	if _, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, Body: pushBody, GitHubEvent: "push", Signature: signed("other", pushBody)}); !errors.Is(err, ErrSecret) {
+		t.Errorf("bad signature: %v", err)
+	}
+	run, err := svc.FireHook(ctx, FireParams{TriggerID: trig.ID, Secret: secret, Body: pushBody, GitHubEvent: "push", Signature: signed(secret, pushBody)})
+	if err != nil || run.TriggerID.UUID != trig.ID {
+		t.Fatalf("signed delivery: %v %+v", err, run)
+	}
+}
+
+func TestAppDeliveryFansOutByRepository(t *testing.T) {
+	svc, db, _, ag := newService(t)
+	ctx := context.Background()
+	mk := func(repo string, branches []string) store.AgentTrigger {
+		spec, _ := json.Marshal(RepoPushSpec{Repo: repo, Branches: branches})
+		trig, _, err := svc.NewTrigger(ctx, ag.ID, KindRepoPush, repo, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return *trig
+	}
+	match := mk("ACME/app", nil)      // case does not matter
+	mk("acme/other", nil)             // another repository
+	mk("acme/app", []string{"rel/*"}) // this repository, another branch
+	mk("", nil)                       // no repo: never on the App hook
+	runs, err := svc.AppDelivery(ctx, "push", pushBody)
+	if err != nil || len(runs) != 1 || runs[0].TriggerID.UUID != match.ID {
+		t.Fatalf("runs = %+v err = %v", runs, err)
+	}
+	if !strings.Contains(string(db.msgs[runs[0].ConversationID][0].Parts), "GitHub push to acme/app") {
+		t.Errorf("input = %s", db.msgs[runs[0].ConversationID][0].Parts)
+	}
+	if _, err := svc.AppDelivery(ctx, "push", `{"zen":"ping"}`); !errors.Is(err, ErrIgnored) {
+		t.Errorf("ping: %v", err)
+	}
+	if _, err := svc.AppDelivery(ctx, "push", strings.Replace(pushBody, "acme/app", "nobody/here", 1)); !errors.Is(err, ErrIgnored) {
+		t.Errorf("unknown repository: %v", err)
 	}
 }
 
