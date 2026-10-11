@@ -4,7 +4,7 @@ One base file, one hardware override, one ingress profile.
 
 | File | Purpose |
 |---|---|
-| `compose.yaml` | Postgres, `app` (API + web + artifact origin), `worker`, the two ingress sidecars behind profiles (`cloudflare`, `tailscale`), and the `mcp-infisical` sidecar behind the `infisical` profile (`WS_DEPLOY_PROFILES=infisical`) |
+| `compose.yaml` | Postgres, `app` (API + web + artifact origin), `worker`, the two ingress sidecars behind profiles (`cloudflare`, `tailscale`), the `mcp-infisical` sidecar behind the `infisical` profile (`WS_DEPLOY_PROFILES=infisical`), and the `ocr` service behind the `ocr` profile (document reading of scans; set `OCR_URL=http://ocr:8000`, see `infra/ocr`) |
 | `override.orin-cuda.yaml` | Jetson AGX Orin: llama-server with CUDA, optional embedding server |
 | `override.amd-rocm.yaml` | AMD W7700 box: llama-server with Vulkan |
 | `override.spark-cuda.yaml` | DGX Spark: vLLM, optional ComfyUI |
@@ -20,6 +20,7 @@ From the repo root, `make up HW=orin-cuda INGRESS=cloudflare` expands to the rig
 
 1. **Host prerequisites.** Docker Engine 24+ with the compose plugin. For NVIDIA: `nvidia-container-toolkit` (often preinstalled on DGX OS; on a Jetson check that `docker info` lists the `nvidia` runtime, see `infra/inference/README.md`). For AMD: `amdgpu` driver and your user in `video` and `render`. Check JetPack is 6.x on the Orin: `cat /etc/nv_tegra_release`.
    The app and worker images are on `ghcr.io/king-technical-consulting/ws`, which is a private package: on a host that has never pulled it, `docker pull` answers `unauthorized`. Log in first with `docker login ghcr.io` and a token that has `read:packages` (a short-lived one is enough for a first pull).
+   The sandbox image, `ghcr.io/king-technical-consulting/ws-sandbox`, is private in the same way. The deploy script pulls it with that login; on a host without the script set `GHCR_TOKEN` (a token with `read:packages`, in Infisical) so the worker can pull it on first use. Without either, the code panel shows `image pull denied: the package is private and GHCR_TOKEN is not set`.
 2. **Clone and configure.**
    ```bash
    git clone https://github.com/King-Technical-Consulting/ws-ai && cd ws-ai
@@ -31,6 +32,10 @@ From the repo root, `make up HW=orin-cuda INGRESS=cloudflare` expands to the rig
    - **Existing Traefik** (homelab): `INGRESS=traefik`. Set `WS_HOST` and `WS_ART_HOST` (two hostnames under your wildcard cert's domain, e.g. `ws.home.arpa` and `ws-art.home.arpa`), `WS_PUBLIC_URL`/`WS_ARTIFACT_URL` to their `https://` forms, `WS_ENV=prod`, `WS_RP_ID=<WS_HOST>`, and point both names at the box in DNS. Passkeys work because the cert is trusted on your devices. For sandbox previews also set `WS_PREVIEW_HOST=ws-p-{port}-{id}.<domain>` and `WS_PREVIEW_PARENT=<domain>`.
    - **Cloudflare Tunnel**: create a remote-managed tunnel in Zero Trust, copy its token to `CLOUDFLARE_TUNNEL_TOKEN`, and add public hostnames `app.<domain>` → `http://app:8080`, `art.<domain>` → `http://app:8081`, `*.preview.<domain>` → `http://app:8080`. Set `WS_PUBLIC_URL=https://app.<domain>` and `WS_ARTIFACT_URL=https://art.<domain>`, and `WS_PREVIEW_DOMAIN=preview.<domain>` so sandbox previews use the `*.preview.<domain>` route (the default, `preview.localhost`, does not).
    - **Tailscale**: create a tagged auth key (`tag:ws`) with HTTPS enabled on the tailnet, set `TS_AUTHKEY`. The sidecar serves `https://ws.<tailnet>.ts.net` and `:8443` for artifacts. Set the two URLs accordingly. Friends must join your tailnet.
+   **Home and away through the tunnel (optional, M5).** To have ws tell a request from home from one from outside, add a tunnel listener and point only the app route at it. Set in `.env`: `WS_TUNNEL_LISTEN=:8083`, `WS_TUNNEL_PEERS` (required with the listener: the host the connector connects from; startup fails without it) and `WS_HOME_NETWORKS` (your home IPv4 and IPv6 networks). The listener believes `CF-Connecting-IP` and nothing else, so it answers 403 to any peer not in `WS_TUNNEL_PEERS` before the app sees the request (logged once a minute). Two shapes:
+   - *Connector on the same host* (a `cloudflared` on the host, or the compose `cloudflare` sidecar with its route at `http://app:8083`): with a host connector, `override.cloud.yaml` publishes the tunnel port on `WS_TUNNEL_BIND_ADDR:WS_TUNNEL_PORT` (loopback and 8083 by default); set `WS_TUNNEL_PEERS=127.0.0.1/32`. With the compose sidecar, publish nothing and set `WS_TUNNEL_PEERS` to the compose network's subnet the sidecar sits in (see `docker network inspect`).
+   - *Connector elsewhere on the tailnet*: set `WS_TUNNEL_BIND_ADDR` to this box's tailnet address, `WS_TUNNEL_PEERS=<the connector's tailnet address>/32`, and the tunnel route to `http://<this box's tailnet address>:8083`; add a tailnet ACL that lets only the connector reach that port if you can. Keep `WS_BIND_ADDR` for the main port separate.
+   Change only the `app.<domain>` hostname's service to the tunnel listener (the `art.` and `*.preview.` routes stay as they are). A tunnel route left on the main listener still fails safe: Cloudflare's headers make those requests away. Settings → Profile → "where ws sees you" shows the address ws judges you by, from the place you open it: copy it into `WS_HOME_NETWORKS` (for IPv6, its /64). **Direct tailnet access counts as home only if you say so:** add the tailnet range (`100.64.0.0/10`, or just your own devices) to `WS_HOME_NETWORKS`; otherwise a request over the tailnet is judged by its tailnet address and counts as away. With `WS_HOME_NETWORKS` unset nothing changes: every request counts as home.
 5. **Start.**
    ```bash
    make up HW=orin-cuda INGRESS=cloudflare
@@ -58,13 +63,19 @@ Run once end to end, as reported by the `agx-orin` session (board `228c`, `18f8`
 make install-cd HW=cloud INGRESS=traefik
 ```
 
-installs a user systemd timer that runs `infra/compose/ws-deploy.sh` every two minutes: `git pull --ff-only`, `compose pull`, `compose up -d`. Compose only recreates containers whose image or config changed, so the run is a no-op most of the time, and when CI publishes a new image after a merge the app and worker are replaced within a couple of minutes with the full Compose config (networks, labels, env). Because the repo is pulled too, changes to the Compose files roll out the same way; only `.env` edits remain manual, since `.env` is not in git.
+installs a user systemd timer that runs `infra/compose/ws-deploy.sh` every two minutes: `git pull --ff-only`, `compose pull`, a pull of the sandbox image (`WS_SANDBOX_IMAGE`; the worker cannot pull a private package itself), `compose up -d`. Compose only recreates containers whose image or config changed, so the run is a no-op most of the time, and when CI publishes a new image after a merge the app and worker are replaced within a couple of minutes with the full Compose config (networks, labels, env). Because the repo is pulled too, changes to the Compose files roll out the same way; only `.env` edits remain manual, since `.env` is not in git.
+
+**Only master is deployed.** The script refuses (exit 1, naming the branch, before it pulls or applies anything) when its checkout is on any other branch or a detached HEAD, because that checkout supplies the compose files and config the running stack is built from: a feature branch left checked out there would reach the live stack. Keep the deploy checkout on master and develop in a separate `git worktree`. `bash infra/compose/ws-deploy.test.sh` checks the guard with stubbed `docker` and `make`.
 
 `install-cd` records `WS_DEPLOY_HW` and `WS_DEPLOY_INGRESS` in `.env`, and every `make` target that runs Compose (`up`, `down`, `logs`, `ps`, `pull`, `config`, `backup`, `db-up`, `db-down`) defaults to them when `HW`/`INGRESS` aren't passed. So on a deployed box a bare `make up` applies the same files the timer does. `make deploy` runs the timer's script once, which is the better way to force a rollout: the script takes a lock (`$XDG_RUNTIME_DIR/ws-deploy.lock`), so a run by hand and the timer never recreate the same containers at once; the second one waits, up to ten minutes, and then applies again. A bare `make up` takes no lock, so avoid it in the same minute the timer fires; Compose would report the container the timer is recreating as "exited (0)".
 
 Run `sudo loginctl enable-linger $USER` once so the timer keeps running after you log out. `make cd-logs` shows recent runs, `make deploy` runs one now, `make uninstall-cd` removes the timer. Pinning `WS_IMAGE` to a SHA in `.env` turns image updates off while keeping config updates.
 
 Watchtower was tried first and dropped: it recreates containers with only their first network, which detached `app` from `traefik-net` and took the site down.
+
+## Secrets in Infisical
+
+A deployment can keep its secrets and most configuration in Infisical (the M5 loader reads them at boot and every five minutes) and leave only the bootstrap in `.env`. The split, checked against `compose.yaml`, the `Makefile` and `ws-deploy.sh`, is in [Configuration](../../docs/CONFIGURATION.md) under Infisical: `.env` keeps the `INFISICAL_*` bootstrap values, `POSTGRES_PASSWORD`, `WS_IMAGE`, the `WS_DEPLOY_*`, bind and port names that Compose and the deploy script read themselves, the sidecar tokens, and `HF_TOKEN` on a box that runs the vLLM override. Everything the app and worker read through ws (provider keys, `RESEND_API_KEY`, URLs of local models) can move. swarm-1 has run this way since 2026-10-10 (board `556b`); the machine identity's *Client ID* (the Universal Auth credential) goes in `INFISICAL_CLIENT_ID`, not the identity's own ID.
 
 ## Day two
 

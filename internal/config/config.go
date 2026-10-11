@@ -43,6 +43,8 @@ type Config struct {
 	SandboxRuntime     string  `env:"WS_SANDBOX_RUNTIME" envDefault:"auto"` // auto | runc | runsc
 	SandboxJail        bool    `env:"WS_SANDBOX_JAIL" envDefault:"false"`
 	SandboxMemoryMB    int64   `env:"WS_SANDBOX_MEMORY_MB" envDefault:"4096"`
+	SandboxPids        int64   `env:"WS_SANDBOX_PIDS" envDefault:"512"`
+	SandboxHardening   string  `env:"WS_SANDBOX_HARDENING" envDefault:"on"` // on | off
 	SandboxCPUs        float64 `env:"WS_SANDBOX_CPUS" envDefault:"2"`
 	SandboxIdleStop    string  `env:"WS_SANDBOX_IDLE_STOP" envDefault:"15m"`
 	SandboxRemoveAfter string  `env:"WS_SANDBOX_REMOVE_AFTER" envDefault:"168h"`
@@ -68,6 +70,9 @@ type Config struct {
 	// and fans them out to every repo_push trigger that names the repository.
 	GitHubWebhookSecret string `env:"GITHUB_WEBHOOK_SECRET"`
 	GitHubToken         string `env:"GITHUB_TOKEN"`
+	// GHCRToken lets the worker pull the private sandbox image from ghcr.io
+	// (a token with read:packages). A secret; unset means an anonymous pull.
+	GHCRToken string `env:"GHCR_TOKEN"`
 
 	// EndpointsFile seeds providers/endpoints on boot (idempotent upsert).
 	EndpointsFile string `env:"WS_ENDPOINTS_FILE" envDefault:"config/endpoints.yaml"`
@@ -111,6 +116,33 @@ type Config struct {
 	// client address is the TCP peer. Name only the ingress, never a range
 	// that holds the sandbox network.
 	TrustedProxies string `env:"WS_TRUSTED_PROXIES"`
+	// HomeNetworks lists the client networks (CIDRs or addresses, IPv4 and
+	// IPv6) counted as home. Empty, the default, counts every request as
+	// home: the feature is off. A value that holds no readable network
+	// fails startup (internal/httpx/locality.go).
+	HomeNetworks string `env:"WS_HOME_NETWORKS"`
+	// AwayHeaders names headers that make a request on the main listener
+	// away whatever its address (Cloudflare adds these to tunnelled
+	// requests): a tunnel route pointed at the wrong listener then fails
+	// safe.
+	AwayHeaders string `env:"WS_AWAY_HEADERS" envDefault:"CF-Connecting-IP,CF-Ray,Cf-Access-Jwt-Assertion"`
+	// TunnelListen is a second listener for the Cloudflare tunnel, serving the
+	// same app. Every request on it is believed to come from the tunnel, so
+	// its client address is CF-Connecting-IP and nothing else may reach it:
+	// bind it to loopback or firewall it to the connector. Empty: off.
+	TunnelListen string `env:"WS_TUNNEL_LISTEN"`
+	// TunnelPeers lists the peer addresses (CIDRs or addresses) allowed to
+	// connect to the tunnel listener: the tunnel connector's host. Required
+	// when TunnelListen is set (startup fails without it); a connection from
+	// any other peer is answered 403, because that listener believes
+	// CF-Connecting-IP and so lets its peer claim any client address.
+	TunnelPeers string `env:"WS_TUNNEL_PEERS"`
+	// StepUpWindow is how long one passkey assertion counts (a Go duration,
+	// 1m to 24h). StepUpActions lists the action classes that need an
+	// assertion when away, each optionally ":always" (also at home); "none"
+	// turns step-up off. Both are inert until HomeNetworks is set.
+	StepUpWindow  string `env:"WS_STEPUP_WINDOW" envDefault:"10m"`
+	StepUpActions string `env:"WS_STEPUP_ACTIONS" envDefault:"admin,budget,provider_key,api_key,export,passkey,training,conversation_delete,project_delete:always"`
 	// SecretsKey is the base64 of 32 random bytes that seals people's own
 	// provider API keys at rest (AES-256-GCM). Unset, saving a key is
 	// refused: the feature stays off rather than storing keys unsealed.
@@ -126,9 +158,26 @@ type Config struct {
 	CCWeeklyCap  int `env:"WS_CC_WEEKLY_CAP" envDefault:"0"`
 	CCWeeklySoft int `env:"WS_CC_WEEKLY_SOFT" envDefault:"75"`
 
+	// LLM-verdict routing (docs/design/llm-routing.md). RouteClassifier is
+	// "off" (the default: routing is unchanged) or "auto": for the selector
+	// auto a small model reads each chat turn first. The daily ceiling
+	// is edited in Admin; RouteClassifierMaxUSDDay is its default.
+	RouteClassifier           string  `env:"WS_ROUTE_CLASSIFIER" envDefault:"off"`
+	RouteClassifierDeadlineMS int     `env:"WS_ROUTE_CLASSIFIER_DEADLINE_MS" envDefault:"2000"`
+	RouteClassifierMaxUSDDay  float64 `env:"WS_ROUTE_CLASSIFIER_MAX_USD_DAY" envDefault:"1.00"`
+	RouteClassifierReuseTurns int     `env:"WS_ROUTE_CLASSIFIER_REUSE_TURNS" envDefault:"4"`
+
 	// Media (PLAN M6, internal/media). ComfyWorkflows is the directory a
 	// ComfyUI endpoint's extra_body.workflow names a template in.
 	ComfyWorkflows string `env:"WS_COMFY_WORKFLOWS" envDefault:"infra/comfyui/workflows"`
+
+	// Document reading (PLAN M13 cut 4). OCRURL is the OCR container
+	// (infra/ocr); empty reads text layers only. The limits bound an upload
+	// and what goes inline into a message.
+	OCRURL         string `env:"OCR_URL"`
+	DocMaxBytes    int64  `env:"WS_DOC_MAX_BYTES" envDefault:"26214400"`
+	DocMaxPages    int    `env:"WS_DOC_MAX_PAGES" envDefault:"200"`
+	DocInlineChars int    `env:"WS_DOC_INLINE_CHARS" envDefault:"12000"`
 
 	// Rented GPUs (PLAN M9, internal/fleet/rental). Templates come from
 	// RentalTemplates; RUNPOD_API_KEY enables the RunPod provider;
@@ -161,6 +210,9 @@ type Config struct {
 	FinetuneKey   string `env:"WS_FINETUNE_KEY"`
 	TrainingDir   string `env:"WS_TRAINING_DIR" envDefault:"data/training"`
 	TrainingJudge string `env:"WS_TRAINING_JUDGE" envDefault:"auto"`
+	// TrainingUploadMaxBytes caps one dataset upload (an archive may unpack
+	// to 8 times that); the JSON body limit does not apply to it.
+	TrainingUploadMaxBytes int64 `env:"WS_TRAINING_UPLOAD_MAX_BYTES" envDefault:"4294967296"`
 
 	// WebAuthn relying party. Derived from PublicURL when empty.
 	RPID          string   `env:"WS_RP_ID"`

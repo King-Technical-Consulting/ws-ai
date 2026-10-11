@@ -56,7 +56,9 @@ Hosted providers are declared in `config/endpoints.yaml` and read their key from
 | `WS_FINETUNE_KEY` | The bearer key that box requires (its `TRAINER_API_KEY`); worker only |
 | `WS_FINETUNE_TEMPLATE` | Name of a `kind: trainer` rental template (`infra/rental/templates`, `trainer-a100` ships) a fine-tune job can run on instead of the worker's Docker; needs the template's provider key (`RUNPOD_API_KEY`) and `WS_RENTAL_API_KEY`. Set it on both processes, like `WS_FINETUNE_IMAGE` (serve declares the `rental` target, the worker rents and drives the machine). With several set, the job's `config.target` (`local`, `remote` or `rental`) picks; the default is the first that exists in that order |
 | `WS_TRAINING_DIR` | Directory a fine-tune job's files sit in while it runs, bind-mounted into the trainer (default `data/training`) |
+| `WS_TRAINING_UPLOAD_MAX_BYTES` | Largest dataset upload accepted by `POST /api/training/datasets/upload`, in bytes (default `4294967296`, 4 GiB); an archive may unpack to 8 times that. Uploads are streamed to the blob store, so this is a disk limit, not a memory one |
 | `WS_TRAINING_JUDGE` | Model selector that scores eval answers in the eval gate, under task class `classify` (default `auto`) |
+| (not configurable) | The smoke-eval threshold: an eval on fewer than 30 held-out examples is a smoke result (`training.SmokeEvalExamples`). It is a constant of the server, reported to the Training page as `smoke_eval_examples` by `GET /api/training/adapters`; the gate's rule is unchanged by it |
 | `HF_TOKEN` | Passed to the trainer container for gated base models, and sent by the serve process to the Hugging Face hub when the fine-tune form searches for a base (so gated and private models show); never stored |
 | `OPENROUTER_API_KEY` | `openrouter` provider |
 | `CEREBRAS_API_KEY` | `cerebras` provider |
@@ -79,13 +81,16 @@ The worker is the only process with the Docker socket. `serve` relays sandbox fi
 | Variable | Default | Purpose |
 |---|---|---|
 | `WS_SANDBOX_ENABLED` | `true` | Turn sandboxes off entirely. Read by the worker only |
-| `WS_SANDBOX_IMAGE` | `ghcr.io/king-technical-consulting/ws-sandbox:latest` | Image for sandbox containers |
+| `WS_SANDBOX_IMAGE` | `ghcr.io/king-technical-consulting/ws-sandbox:latest` | Image for sandbox containers. The worker pulls it only when it is missing. The package is private, so the pull needs `GHCR_TOKEN` (below); `ws-deploy.sh` also pulls it on every deploy with the host's `docker login`, which makes the worker's pull unnecessary. A pull that fails writes an `error` event on the sandbox (`image pull denied: the package is private and GHCR_TOKEN is not set`, a timeout after 10 minutes, or the registry's refusal) that the code panel shows. Bootstrap (`.env`) if set, since the deploy script reads it |
 | `WS_SANDBOX_NETWORK` | `ws_sandbox-net` | Internal Docker network; the Compose-created name. `none` disables |
 | `WS_SANDBOX_PROXY_URL` | `http://worker:3128` | Egress proxy address as seen from inside a sandbox. `none` disables |
 | `WS_SANDBOX_RUNTIME` | `auto` | `auto`, `runc`, or `runsc` (gVisor, used by `auto` when installed) |
 | `WS_SANDBOX_JAIL` | `false` | Run the `bash` tool's commands inside bubblewrap (read-only container filesystem; writable only `/workspace`, `/home/dev`, `/tmp`; private PID, IPC and UTS namespaces). Needs user namespaces in the container, which Docker's default seccomp profile blocks, so turn it on only after checking that `bwrap` runs in a sandbox container; with it on and `bwrap` failing, every `bash` call fails. On an Ubuntu host `kernel.apparmor_restrict_unprivileged_userns=1` also blocks `bwrap` in the sandbox image: one test run (board `f8b2`) needed both seccomp and AppArmor relaxed, and relaxing seccomp alone was not enough. Read by the worker only |
 | `WS_SANDBOX_MEMORY_MB` | `4096` | Memory limit per sandbox |
+| `GHCR_TOKEN` | unset | Secret. A token with `read:packages` that the worker uses to pull the sandbox image from `ghcr.io`; sent only to `ghcr.io`, never to another registry and never into a sandbox. Keep it in Infisical. With it unset the pull is anonymous and fails for a private package |
 | `WS_SANDBOX_CPUS` | `2` | CPU limit per sandbox |
+| `WS_SANDBOX_PIDS` | `512` | Process limit per sandbox container (Docker's pids limit); stops a fork bomb at the container |
+| `WS_SANDBOX_HARDENING` | `on` | `on` runs every sandbox with a read-only root filesystem (writable: `/workspace`, `/tmp`, `/home/dev`, `/run`), all Linux capabilities dropped and none added back, `no-new-privileges`, no privileged mode and no host devices. `off` drops the read-only root, the capability drop and `no-new-privileges` for a box where an image breaks under them (the worker logs a warning at start); the memory, CPU and pids limits and the bubblewrap jail (`WS_SANDBOX_JAIL`, the inner layer) are separate and stay. Any other value is treated as `on` with a warning. Read by the worker only |
 | `WS_SANDBOX_IDLE_STOP` | `15m` | Stop a container after this long idle. Go duration syntax; an invalid value becomes 0 |
 | `WS_SANDBOX_REMOVE_AFTER` | `168h` | Remove a container after this long idle; the volume stays. Go duration syntax; an invalid value becomes 0 |
 | `WS_WORKER_URL` | `http://worker:8082` | Where `serve` reaches the worker's internal API. `none` or empty disables the sandbox relay and previews |
@@ -107,6 +112,8 @@ Both `serve` and `worker` read these (`serve` for the Admin install view), but o
 | `GITHUB_WEBHOOK_SECRET` | The App's webhook secret (set the same value on the App's webhook, payload URL `<public url>/hooks/github`). With it, one webhook on the App serves every agent's `repo_push` trigger that names a repository, no per-repository webhook needed; without it the route answers 404 |
 | `GITHUB_TOKEN` | Fallback personal token when no App is configured. `open_pr` is unavailable in this mode |
 
+**Private repositories.** A project's repository is cloned inside the sandbox, whose only way to GitHub is the egress proxy, and the proxy adds a credential only when the App or `GITHUB_TOKEN` is configured (the worker's `sandbox egress proxy` start line says which). Without either, cloning a private repository fails; the clone event, and the code panel, then say `private repository and no GitHub credential is configured; set up the GitHub App or GITHUB_TOKEN`. With one configured but unable to read the repository, the message says so instead. No token is ever passed into the sandbox.
+
 ## Secrets from Infisical
 
 Read by `internal/secrets`. With the first three set, both processes log in with the machine identity at boot, load every secret in the project environment into their environment before configuration is parsed, and refresh every five minutes.
@@ -123,6 +130,8 @@ Read by `internal/secrets`. With the first three set, both processes log in with
 
 If Infisical is unreachable at boot, ws logs it and continues on `.env`.
 
+**What stays in `.env` on a deployment that uses Infisical** (the layout the coordinator recorded from Jeremy's decision, board `4905`; checked against `infra/compose/compose.yaml`, `Makefile` and `infra/compose/ws-deploy.sh`). ws loads every secret and most configuration from Infisical, so `.env` keeps only what something other than ws reads before ws starts: the three `INFISICAL_*` bootstrap values (`INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET`, `INFISICAL_PROJECT_ID`, plus `INFISICAL_ENV`, `INFISICAL_PATH` and `INFISICAL_SITE_URL` when they differ from the defaults); the names Compose interpolates into the file itself (`POSTGRES_PASSWORD`, `WS_IMAGE`, the bind, host and port names `WS_BIND_ADDR`, `WS_HTTP_PORT`, `WS_ART_PORT`, `WS_HOST`, `WS_ART_HOST`, `TRAEFIK_NETWORK`, `LLAMA_BIND_ADDR`, `LLAMA_EXTRA_ARGS`, `DOCKER_GID`, `WS_OCR_IMAGE`, `WS_PREVIEW_PARENT`); the names `make` and `ws-deploy.sh` read with `grep` (`WS_DEPLOY_HW`, `WS_DEPLOY_INGRESS`, `WS_DEPLOY_PROFILES`, and `WS_SANDBOX_IMAGE` when it is set); the sidecar tokens (`CLOUDFLARE_TUNNEL_TOKEN`, `TS_AUTHKEY`, and the `INFISICAL_MCP_*` pair for the Infisical MCP sidecar); and `HF_TOKEN` (and `VLLM_API_KEY`) on a box that runs the vLLM override. Everything else, including provider keys, `WS_SECRETS_KEY`, `RESEND_API_KEY` and per-box URLs such as `LLAMA_SERVER_URL`, can live in Infisical; keep each name in one place, because the five-minute refresh replaces a `.env` value that Infisical also holds. A development box keeps a plain `.env`. When a change adds an environment variable, say in this file whether it is a secret (Infisical) or bootstrap (`.env`).
+
 ## Deployment (Compose)
 
 These are read by Compose and the Makefile rather than by the Go binary. See [../infra/compose/README.md](../infra/compose/README.md).
@@ -133,6 +142,7 @@ These are read by Compose and the Makefile rather than by the Go binary. See [..
 | `WS_IMAGE` | `ghcr.io/king-technical-consulting/ws:latest` | App and worker image. Pin to a commit SHA to stop image updates |
 | `WS_BIND_ADDR` | loopback | Host binding for `override.cloud.yaml` or LAN testing |
 | `WS_HTTP_PORT`, `WS_ART_PORT` | `8080`, `8081` | Host ports for the same |
+| `WS_TUNNEL_PORT`, `WS_TUNNEL_BIND_ADDR` | `8083`, loopback | Host port and bind address of the tunnel listener in `override.cloud.yaml`. A separate bind address on purpose, so widening `WS_BIND_ADDR` never exposes it: set it to the box's tailnet address only for a connector elsewhere on the tailnet, with `WS_TUNNEL_PEERS` naming that connector. Needs `WS_TUNNEL_LISTEN=:8083` and `WS_TUNNEL_PEERS` in `.env` to listen at all |
 | `WS_HOST`, `WS_ART_HOST` | `ws.home.arpa`, `ws-art.home.arpa` | Hostnames for `override.traefik.yaml` |
 | `WS_PREVIEW_PARENT` | `home.arpa` | Parent domain for the Traefik preview router |
 | `WS_DEPLOY_HW`, `WS_DEPLOY_INGRESS` | none | Written by `make install-cd`; default `HW` and `INGRESS` for `make` targets |
@@ -156,6 +166,17 @@ For the `infisical` Compose profile (`WS_DEPLOY_PROFILES=infisical`). These conf
 | `INFISICAL_MCP_MASK` | `true` | Mask secret values in tool output |
 | `INFISICAL_MCP_TOOLS` | `list-projects,list-secrets,get-secret,create-secret,update-secret` | Tools the sidecar exposes |
 
+## Document reading (`internal/docread`, `internal/documents`)
+
+PDF text layers, Word, Excel, PowerPoint and text files are read in Go with no setting. Scans and images need the OCR container (infra/ocr). Read by `app` and `worker`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OCR_URL` | unset | Base URL of the OCR container, for example `http://ocr:8000`. Unset: a PDF with no text layer is refused with a message saying why, and images are not read as text (a model that sees images still gets them). The container has no authentication; keep it where only ws reaches it |
+| `WS_DOC_MAX_BYTES` | `26214400` (25 MiB) | Largest upload read; a bigger file becomes a note saying so. Also bounds the uncompressed size of one part of an Office file (64 MiB, fixed) |
+| `WS_DOC_MAX_PAGES` | `200` | Pages, sheets or slides read per document; the rest are dropped and the document is marked truncated |
+| `WS_DOC_INLINE_CHARS` | `12000` | How much extracted text goes straight into the message; the rest is left for `read_document` |
+
 ## Rented GPUs (`internal/fleet/rental`)
 
 An owner can start a rented GPU machine from Admin; it appears as a model endpoint while it runs. Only RunPod exists so far. See ../infra/rental/README.md for the templates.
@@ -170,6 +191,19 @@ An owner can start a rented GPU machine from Admin; it appears as a model endpoi
 
 A template names the provider, GPU, image, model, port and disk, the endpoint ws registers (its `id` and capabilities), and its limits: `idle_timeout` (default 20m, measured from the last ledger row for the endpoint, or the last touch by a fine-tune job driving a trainer), `max_hours` (default 6), `warmup_timeout` (default 25m) and `hourly_usd`. Three ship: `h100-gpt-oss-120b` and `h100-qwen3-coder-next`, each one H100 with vLLM, and `trainer-a100`, a `kind: trainer` template that registers no endpoint and is started only by a fine-tune job (`WS_FINETUNE_TEMPLATE`). A machine stops on idle, `max_hours`, the daily cap, the kill switch, a failed warmup, Admin, or the provider reporting it gone. Each whole instance-hour is written to the usage ledger (task class `rental`) at the template's hourly price, and the remainder when it stops. Not verified here: a real RunPod start, and Lambda, Vast.ai and the tailnet sidecar are not built.
 
+## LLM-verdict routing (`internal/gateway/verdict.go`)
+
+Off unless `WS_ROUTE_CLASSIFIER=auto`. Read by `app` and `worker` (the gateway runs in both). Design and the guards: design/llm-routing.md.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WS_ROUTE_CLASSIFIER` | `off` | `auto`: for the selector `auto`, a small model reads each chat turn and its verdict moves the task class and the tier floor; `off` leaves routing exactly as it was |
+| `WS_ROUTE_CLASSIFIER_DEADLINE_MS` | `2000` | Per-call deadline; a slower answer is dropped and the turn routes without a verdict |
+| `WS_ROUTE_CLASSIFIER_MAX_USD_DAY` | `1.00` | The default for the daily ceiling on what verdict calls may cost (summed from the ledger under task class `route`, UTC day). The owner edits the ceiling in Admin, Models, verdict routing; the Admin value wins, 0 means none |
+| `WS_ROUTE_CLASSIFIER_REUSE_TURNS` | `4` | How many further turns of a conversation reuse its verdict |
+
+What the verdict sends: the last user message of the turn, clipped to 1,500 characters (head and tail), the message count, whether tools are attached and the image count; never the system prompt, earlier turns or tool results. The call goes to the `route` rule in `config/policies/default.yaml` (the same endpoints as `classify`, with a per-call cost ceiling), so on a box with an OpenRouter key it may reach a hosted model; turns the sensitive patterns flag are never sent. A policy rule may match a verdict with `match: { verdict: [simple-chat] }`; such a rule never matches a turn that has no verdict. The shipped policy has one, for `simple-chat`, listing the cheap models first.
+
 ## Claude Code task router (`spawn_job`)
 
 Read by `internal/config`; both `serve` and `worker` read them. The router decides which lane a task should run on and, when dispatch is on, starts it. See CLAUDE_CODE_JOBS.md for the design.
@@ -178,6 +212,12 @@ Read by `internal/config`; both `serve` and `worker` read them. The router decid
 |---|---|---|
 | `WS_SECRETS_KEY` | _(empty)_ | Base64 of 32 random bytes (`openssl rand -base64 32`). Seals people's own provider API keys at rest (AES-256-GCM). Unset, saving a key is refused (`503`) and Settings says so; a key that cannot be read is logged at boot and treated as unset. Losing or changing it makes every saved key unreadable (people save theirs again); it is not a password and is never shown. A member's own keys only work for providers this server has a key for in its env (a provider with no key is not loaded). |
 | `WS_TRUSTED_PROXIES` | _(empty)_ | Networks (comma-separated CIDRs or single addresses) whose `X-Forwarded-For` and `X-Real-IP` headers are believed. Empty believes none: the client address is the TCP peer, which is what the request log, the session's recorded address and the `WS_CC_WEB_ALLOW` gate see. Name only the ingress in front of `app` (for the Compose `traefik-net` network, its subnet), never a broad range that also holds the sandbox network: a sandbox could then forge its address. For a trusted peer the client is the rightmost forwarded address that is not itself trusted. Before this variable existed ws believed those headers from any caller, so a deployment that relies on a proxy's forwarded address (for example `wsj` reporting through Traefik) must set it, or the gate sees the proxy's address |
+| `WS_HOME_NETWORKS` | _(empty)_ | Home and away (M5): the client networks counted as home, comma-separated CIDRs or single addresses, IPv4 and IPv6 (for example `203.0.113.7,2001:db8:abcd::/48,192.168.1.0/24`). Empty, the default, counts every request as home and judges nothing; the sidebar mark stays hidden. A value with an entry that cannot be read, or that holds no network, **stops the server at start**: a typo must not silently turn the feature off or make everything away. On the main listener the client is the TCP peer, or the address a trusted proxy forwarded (`WS_TRUSTED_PROXIES`); on the tunnel listener it is `CF-Connecting-IP`. **To count direct tailnet access as home, put the tailnet range in the list** (the CGNAT range `100.64.0.0/10`, or just your own devices' addresses): a request that reaches the main listener over the tailnet is judged by its tailnet address, and without that entry it counts as away. Settings, under Profile, shows the address ws sees from where you are: open it from each place you want counted as home and copy what it shows. This only decides and reports; nothing is refused because of it yet |
+| `WS_AWAY_HEADERS` | `CF-Connecting-IP,CF-Ray,Cf-Access-Jwt-Assertion` | Headers that make a request on the **main** listener away whatever its address. Cloudflare adds them to tunnelled requests, so a tunnel route pointed at the main listener instead of the tunnel listener fails safe; a caller who adds one to its own request only makes itself look more away. Not used on the tunnel listener |
+| `WS_TUNNEL_LISTEN` | _(empty)_ | A second listener (for example `:8083`) serving the same app for the Cloudflare tunnel. Every request on it is believed to come from the tunnel, so its client address is `CF-Connecting-IP` and only that (missing, unreadable or repeated: away); the request log, the recorded session address and the `WS_CC_WEB_ALLOW` gate then see that address too. **Whatever can reach this port could claim any client address**, so a connection from a peer that is not in `WS_TUNNEL_PEERS` is refused with 403 before the app sees the request (and logged, once a minute), and `WS_TUNNEL_LISTEN` **requires `WS_TUNNEL_PEERS`**: startup fails without it. Empty: off |
+| `WS_TUNNEL_PEERS` | _(empty; required with `WS_TUNNEL_LISTEN`)_ | The peer addresses (CIDRs or single addresses, IPv4 and IPv6, comma separated) allowed to connect to the tunnel listener: the host the Cloudflare connector connects from, as the app sees it (the TCP peer, never a forwarded header). Two shapes: a connector on the same host (bind the tunnel port to `127.0.0.1` and set `WS_TUNNEL_PEERS=127.0.0.1/32`), or a connector elsewhere on the tailnet (bind to the box's tailnet address and set `WS_TUNNEL_PEERS=<the connector's tailnet address>/32`, with a tailnet ACL as a second lock). An entry that cannot be read stops the server at start |
+| `WS_STEPUP_WINDOW` | `10m` | Step-up (M5): how long one passkey assertion counts on a browser session, a Go duration from `1m` to `24h`. One assertion unlocks every gated action class until it runs out. Inert until `WS_HOME_NETWORKS` is set |
+| `WS_STEPUP_ACTIONS` | `admin,budget,provider_key,api_key,export,passkey,training,conversation_delete,project_delete:always` | The action classes that need a passkey assertion **when away**; a class with `:always` (the default for `project_delete`) needs it at home too, for anyone who has a passkey. `none` turns step-up off. An unknown class or mode stops the server at start. Classes: `admin` (writes under `/api/admin`, except budgets), `budget` (writes under `/api/admin/budgets`), `provider_key` (saving or removing a person's own provider key), `api_key` (minting an API key), `export` (the artifact export), `passkey` (adding or removing a passkey: without this a stolen session cookie used from away could register its own passkey and step up with it, so the first passkey has to be added from home), `training` (the Training page's destructive and live-changing actions: promote, force promote, unpromote, delete an adapter, and add or remove a training route; reads and Evaluate are not gated), `conversation_delete` (`DELETE /api/conversations/{id}/permanent` and `POST /api/archive/delete-all`) and `project_delete` (`POST /api/projects/{id}/delete-permanently`; `always` by default, so it asks at home too for anyone with a passkey). Only browser sessions are judged; API keys never reach these routes. Someone with **no passkey** is refused (`step_up_unavailable`) when away and unaffected at home. Inert until `WS_HOME_NETWORKS` is set |
 | `WS_CC_WEB_ALLOW` | `100.64.0.0/10,127.0.0.0/8,::1/128` | Which client networks may use the job tab routes (`/api/jobs/cc`): comma-separated CIDRs or single addresses; `*` turns the check off; a list that cannot be parsed refuses everyone. The address is the TCP peer, or, when the peer is inside `WS_TRUSTED_PROXIES`, the client that proxy forwarded (see that variable). The routes also need the owner role |
 | `WS_CC_WEEKLY_CAP` | `0` | A soft cap on subscription launches per calendar week (Monday 00:00 UTC), counted locally in `cc_launch_counter`; Claude's own usage is never read, so it is a count of the launches ws knows of, not of tokens or hours. `0` counts without ever changing a route. A launch is counted once, when ws first learns of the job, in the week the job started, whoever reported it (`wsj run`, the router, or a refresh that finds a window nobody reported). `wsj` launches are counted but never refused: the cap only steers the router |
 | `WS_CC_WEEKLY_SOFT` | `75` | The percent of the cap from which the router keeps low-value work off the subscription lane (see the notes below). A value outside 1 to 100 is read as 75 |
@@ -234,6 +274,8 @@ endpoints:
     throughput_class: high            # low | medium | high
     latency_class: fast               # fast | normal | slow
     local: true                       # optional; marks free local endpoints (budget downgrade targets these)
+    tier: medium                      # optional: small | medium | large. Empty reads it off the model name (see below)
+    routable: true                    # optional; false: only reached when picked by name or named by a rule or alias
     extra_body: { provider: { order: [cerebras], allow_fallbacks: false } }   # optional; merged into every request
 ```
 
@@ -269,12 +311,14 @@ Notes:
 
 Routing policy. Each file is one policy; a lower `priority` number wins (default 100 when omitted or 0), and `name` defaults to the filename without `.yaml`. Policies are re-upserted from these files on every boot, so Admin edits to a file-backed policy are overwritten.
 
+The shipped `default.yaml` has a rule for task class `training`, the class a recipe's flesh out runs under (M12): `min_tier: medium`, local models first (`local-vllm/qwen3.6-35b-a3b`, `local-llama/gpt-oss-20b`, `local-llama/qwen3-14b`), then Sonnet and DeepSeek behind them. A hosted model sees the owner's instructions and a few sample records only when no local model is usable; remove the hosted entries to forbid that. The model needs to follow a JSON schema.
+
 ```yaml
 name: default
 priority: 100
 rules:                           # evaluated top-down; first match supplies the preference list
   - match:
-      task_class: [code]         # chat | code | summarize | title | embed | vision | classify | reflect | image | video
+      task_class: [code]         # chat | code | summarize | title | embed | vision | classify | reflect | training | image | video
       # users: [...]  agents: [...]  selector: [...]  external: true|false
     require: { tools: true }     # capability filter (same fields as endpoint capabilities)
     prefer:                      # ordered endpoint ids; the gateway fails over down this list
@@ -285,6 +329,7 @@ rules:                           # evaluated top-down; first match supplies the 
     local_only: false            # restrict to local endpoints
     rank: ""                     # "throughput": fastest first, by measured decode speed
     min_tokens_per_sec: 0        # drop candidates measured slower than this
+    min_tier: medium             # the fallback never drops below this tier (small | medium | large)
   - match: {}                    # empty match catches everything else
 
 aliases:                         # names usable as a model name by clients
@@ -292,7 +337,9 @@ aliases:                         # names usable as a model name by clients
   cheap: [local-llama/gpt-oss-20b, anthropic/claude-haiku-4-5]
 ```
 
-Empty match lists match everything. Endpoints whose provider isn't configured on this box are skipped automatically. Failover only happens on retryable errors before the first token is streamed.
+Empty match lists match everything. Endpoints whose provider isn't configured on this box are skipped automatically.
+
+**Quality floor and routable.** When none of the endpoints a rule prefers is usable, the router falls back to any enabled endpoint, local first, then cheapest. Two settings bound that fallback. `min_tier` on the rule: the fallback never picks an endpoint ranked below it (`small` < `medium` < `large`); the shipped policy sets `medium` on the catch-all, `code` and `vision` rules and `small` on `summarize`, `title` and `reflect`. An endpoint's tier is its `tier`, or when that is empty read off the largest `<n>b` in its model name or id (a figure after an `a`, as in `a3b`, is an active-parameter count and is ignored): under 4 billion is `small`, under 30 `medium`, otherwise `large`, and `medium` when the name has no count. `routable: false` (Admin: "Only when picked by name or named by a policy") keeps an endpoint out of every fallback, including the any-endpoint list used when no rule matches; it is still reached when selected by id, or when a rule's `prefer` or an alias names it, and then no tier floor applies, because naming an endpoint is a decision. Training adapters are registered not routable. When the floor leaves nothing, the request fails with the usual reasons plus `no model of the <tier> tier or better is available`. Failover only happens on retryable errors before the first token is streamed.
 
 A rule whose `match` names a `selector` (the shipped `fast` rule: `match: { selector: [fast] }`, `rank: throughput`) makes that name usable wherever an alias is: as a model on `/v1`, as a key's default policy in Settings, in the MCP server's model list. Unlike an alias it carries the rule's rank, filters and requirements; an alias of the same name wins. `rank: throughput` reorders the rule's candidates by the speed a new request is expected to get: the average decode speed (output tokens per second, scaled for how busy the endpoint is, see `max_concurrency` under endpoints) the gateway has seen for that endpoint (replies of at least 16 tokens with a decode phase of at least 200 ms count; a reply whose billed output is far more than the stream carried, a reasoning model thinking silently, is not counted), or the endpoint's `throughput_class` as a prior (`low` 15, `medium` 40, `high` 100 tokens/s; anything else ranks as medium) until it has three observations, and again once its last observation is more than 15 minutes old, so an endpoint measured slow is tried again later instead of staying last. Equal speeds keep the `prefer` order. `min_tokens_per_sec` drops candidates whose speed has been measured below the value; endpoints without a recent measurement are kept and the filter never empties the list. An unknown `rank` or a negative `min_tokens_per_sec` is refused when the policy is loaded or saved. Measurements are written to `endpoint_throughput` after every counted reply and loaded at boot, so a restart ranks by the last measurement rather than the declared class; a loaded or stale measurement is a prior that stands in for the declared class only when it is higher (an endpoint measured slow is still tried again at its class), until three fresh replies replace it. The decision's `reason` gets `+throughput` when a rank was applied and `+min-speed` when the filter dropped a candidate.
 

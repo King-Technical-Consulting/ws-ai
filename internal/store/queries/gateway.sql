@@ -20,6 +20,11 @@ ON CONFLICT (id) DO UPDATE SET
   throughput_class = EXCLUDED.throughput_class, latency_class = EXCLUDED.latency_class,
   is_local = EXCLUDED.is_local, extra_body = EXCLUDED.extra_body;
 
+-- Tier and routable are not part of the upsert's update: a reseed must not
+-- undo what the owner set in Admin. The seed and Admin set them here.
+-- name: SetEndpointRouting :exec
+UPDATE endpoints SET tier = $2, routable = $3 WHERE id = $1;
+
 -- name: ListEndpoints :many
 SELECT * FROM endpoints ORDER BY id;
 
@@ -102,6 +107,22 @@ DELETE FROM budgets WHERE id = $1;
 
 -- name: ListAllBudgets :many
 SELECT * FROM budgets ORDER BY scope, period;
+
+-- name: BudgetUsageByUserSince :many
+SELECT user_id, count(*) AS calls, SUM(cost_usd)::numeric AS cost_usd
+FROM usage_ledger WHERE created_at >= $1 AND user_id IS NOT NULL AND NOT own_key GROUP BY user_id ORDER BY cost_usd DESC;
+
+-- name: UsageByAgentSince :many
+SELECT agent_id, count(*) AS calls, SUM(cost_usd)::numeric AS cost_usd
+FROM usage_ledger WHERE created_at >= $1 AND agent_id IS NOT NULL AND NOT own_key GROUP BY agent_id ORDER BY cost_usd DESC;
+
+-- name: GetBudgetWarning :one
+SELECT * FROM budget_warnings WHERE scope = $1 AND scope_id IS NOT DISTINCT FROM $2 AND period = $3 AND pct = $4;
+
+-- name: UpsertBudgetWarning :exec
+INSERT INTO budget_warnings (scope, scope_id, period, pct, spent_usd, limit_usd, sent_at)
+VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (scope, scope_id, period, pct) DO UPDATE SET spent_usd = EXCLUDED.spent_usd, limit_usd = EXCLUDED.limit_usd, sent_at = now();
 
 -- name: GetRoutingPolicyByName :one
 SELECT * FROM routing_policies WHERE name = $1;

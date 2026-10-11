@@ -1,6 +1,6 @@
 -- name: CreateRun :one
-INSERT INTO agent_runs (agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, first_message_id, owner_pid, started_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $5 = 'running' THEN now() ELSE NULL END)
+INSERT INTO agent_runs (agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, first_message_id, owner_pid, started_at, max_run_usd)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $5 = 'running' THEN now() ELSE NULL END, $11)
 RETURNING *;
 
 -- name: GetRun :one
@@ -104,21 +104,24 @@ UPDATE approvals SET status = $2, decided_by = $3, decided_at = now(), note = $4
 WHERE id = $1 AND status = 'pending' RETURNING *;
 
 -- name: DecideApprovalByCall :one
-UPDATE approvals SET status = $3, decided_by = $4, decided_at = now()
+UPDATE approvals SET status = $3, decided_by = $4, note = $5, decided_at = now()
 WHERE run_id = $1 AND tool_call_id = $2 AND status = 'pending' RETURNING *;
 
 -- name: CreateAgent :one
-INSERT INTO agents (owner_id, project_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, max_steps)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *;
+INSERT INTO agents (owner_id, project_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, max_steps, max_run_usd)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *;
 
 -- name: GetAgent :one
 SELECT * FROM agents WHERE id = $1;
+
+-- name: ListAllAgents :many
+SELECT * FROM agents ORDER BY created_at;
 
 -- name: ListAgentsForUser :many
 SELECT * FROM agents WHERE owner_id = $1 ORDER BY created_at DESC;
 
 -- name: UpdateAgent :one
-UPDATE agents SET name = $2, goal = $3, system_prompt = $4, model_policy = $5, tool_allowlist = $6, tool_policies = $7, max_steps = $8, enabled = $9, project_id = $10
+UPDATE agents SET name = $2, goal = $3, system_prompt = $4, model_policy = $5, tool_allowlist = $6, tool_policies = $7, max_steps = $8, enabled = $9, project_id = $10, max_run_usd = $11
 WHERE id = $1 RETURNING *;
 
 -- name: SetAgentEnabled :exec

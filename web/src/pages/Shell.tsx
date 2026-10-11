@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Outlet, NavLink, useNavigate, useLocation, Link } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type Project, type Conversation } from '../api'
 import { useMe } from '../App'
-import { WsMark, btn, inputSm } from '../components/ui'
-import { Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive, Palette, FlaskConical, Menu, X } from 'lucide-react'
+import { WsMark, btn, inputSm, useConfirm, usePrompt } from '../components/ui'
+import { LocalityBadge } from '../components/LocalityBadge'
+import { BookOpen, CalendarClock, Star, Plus, Settings as SettingsIcon, Shield, LogOut, MessageSquare, Code2, SquareTerminal, Image as ImageIcon, Bot, Pencil, Archive, Palette, FlaskConical, Menu, X } from 'lucide-react'
 import clsx from 'clsx'
 
 /** "https://github.com/a/repo.git" -> "repo" */
@@ -16,6 +17,105 @@ function repoName(url: string): string {
 const navItem = ({ isActive }: { isActive: boolean }) =>
   clsx('flex items-center gap-2 rounded-md px-2 py-2.5 md:py-1.5 text-sm truncate w-full text-left', isActive ? 'bg-bg-3 text-fg' : 'text-fg-2 hover:bg-bg-3 hover:text-fg')
 
+// An inline title editor: Enter saves, Escape cancels, leaving the field saves. An empty title
+// is not a title, so it saves nothing.
+function RenameField({ value, onChange, onSave, onCancel }: { value: string; onChange: (v: string) => void; onSave: (v: string) => void; onCancel: () => void }) {
+  const done = useRef(false)
+  const finish = (save: boolean) => {
+    if (done.current) return
+    done.current = true
+    if (save) onSave(value.trim())
+    else onCancel()
+  }
+  return (
+    <input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); finish(true) }
+        else if (e.key === 'Escape') { e.preventDefault(); finish(false) }
+      }}
+      onBlur={() => finish(true)}
+      onFocus={(e) => e.currentTarget.select()}
+      aria-label="Conversation name"
+      maxLength={200}
+      className={`${inputSm} min-h-9 md:min-h-0`}
+      autoFocus
+    />
+  )
+}
+
+// The less used pages and Sign out, in one popover above a button at the bottom of the sidebar.
+// Opens on click, closes on Escape (focus goes back to the button), on a click outside, on
+// leaving it with Tab, and on navigation.
+function SidebarMenu({ owner, who, email, onSignOut }: { owner: boolean; who?: string; email?: string; onSignOut: () => void }) {
+  const [open, setOpen] = useState(false)
+  const box = useRef<HTMLDivElement>(null)
+  const button = useRef<HTMLButtonElement>(null)
+  const loc = useLocation()
+  useEffect(() => setOpen(false), [loc.pathname])
+  useEffect(() => {
+    if (!open) return
+    box.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus()
+    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false) }
+    // Tabbing out of the menu closes it. focusin, not blur: Safari gives a clicked button no focus,
+    // so a blur handler would close the menu before the click lands.
+    const left = (e: FocusEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', away)
+    document.addEventListener('focusin', left)
+    return () => { document.removeEventListener('mousedown', away); document.removeEventListener('focusin', left) }
+  }, [open])
+  const item = (isActive: boolean) => clsx(navItem({ isActive }), 'min-h-9')
+  return (
+    <div
+      ref={box}
+      className="relative"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && open) {
+          e.stopPropagation()
+          setOpen(false)
+          button.current?.focus()
+        }
+      }}
+    >
+      {open && (
+        // Picking an item closes the menu in the same click that starts the navigation. The effect on
+        // the path below is the backstop (a link followed some other way), but it runs a render after
+        // the URL changes, and until then the menu would still read as open.
+        <div role="menu" aria-label="More pages" onClick={() => setOpen(false)} className="absolute bottom-full left-0 right-0 mb-1 z-50 rounded-lg border border-line bg-bg p-1 space-y-0.5">
+          <NavLink role="menuitem" to="/media" className={({ isActive }) => item(isActive)}><ImageIcon size={14} /> Media</NavLink>
+          <NavLink role="menuitem" to="/settings" className={({ isActive }) => item(isActive)}><SettingsIcon size={14} /> Settings</NavLink>
+          <NavLink role="menuitem" to="/agents" className={({ isActive }) => item(isActive)}><Bot size={14} /> Agents</NavLink>
+          <NavLink role="menuitem" to="/favorites" className={({ isActive }) => item(isActive)}><Star size={14} /> Favorites</NavLink>
+          <NavLink role="menuitem" to="/notebooks" className={({ isActive }) => item(isActive)}><BookOpen size={14} /> Notebooks</NavLink>
+          <NavLink role="menuitem" to="/scheduled" className={({ isActive }) => item(isActive)}><CalendarClock size={14} /> Scheduled</NavLink>
+          {owner && (
+            <>
+              <NavLink role="menuitem" to="/jobs" className={({ isActive }) => item(isActive)}><SquareTerminal size={14} /> Jobs</NavLink>
+              <NavLink role="menuitem" to="/training" className={({ isActive }) => item(isActive)}><FlaskConical size={14} /> Training</NavLink>
+              <NavLink role="menuitem" to="/admin" className={({ isActive }) => item(isActive)}><Shield size={14} /> Admin</NavLink>
+            </>
+          )}
+          <button role="menuitem" onClick={onSignOut} className={item(false)}><LogOut size={14} /> Sign out</button>
+        </div>
+      )}
+      {/* The whole row is the button: the icon, the name and the empty space to the right of it. */}
+      <button
+        ref={button}
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={who ? `More, ${who}` : 'More'}
+        title={email}
+        className={clsx('w-full min-h-9 flex items-center gap-2 rounded-md px-2 text-left text-xs hover:bg-bg-3 hover:text-fg', open ? 'bg-bg-3 text-fg' : 'text-fg-3')}
+      >
+        <Menu size={16} className="shrink-0 text-fg-2" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate">{who}</span>
+      </button>
+    </div>
+  )
+}
+
 export default function Shell() {
   const me = useMe()
   const nav = useNavigate()
@@ -25,7 +125,11 @@ export default function Shell() {
 
   const newChat = useMutation({
     mutationFn: async () => {
-      let p = projects.data?.[0]
+      // A conversation takes its mode from its project (a code project's conversations are code
+      // conversations, with the code panel), so a plain chat goes in a chat project, never in
+      // whichever project was touched last. Ask the server if the list has not arrived yet.
+      const list: Project[] = projects.data ?? (await qc.fetchQuery<Project[]>({ queryKey: ['projects'], queryFn: () => api.get<Project[]>('/api/projects') })) ?? []
+      let p = list.find((x) => x.kind === 'chat')
       if (!p) {
         p = await api.post<Project>('/api/projects', { name: 'General', kind: 'chat' })
         await qc.invalidateQueries({ queryKey: ['projects'] })
@@ -67,11 +171,11 @@ export default function Shell() {
 
   // A design project: conversations in design mode, where the assistant
   // makes design artifacts under the conversation's design system.
+  const confirmDialog = useConfirm()
+  const promptDialog = usePrompt()
   const newDesign = useMutation({
-    mutationFn: async () => {
-      const name = prompt('Design project name', 'Design')
-      if (name === null) throw new Error('cancelled')
-      const p = await api.post<Project>('/api/projects', { name: name.trim() || 'Design', kind: 'design' })
+    mutationFn: async (name: string) => {
+      const p = await api.post<Project>('/api/projects', { name, kind: 'design' })
       await qc.invalidateQueries({ queryKey: ['projects'] })
       return api.post<Conversation>(`/api/projects/${p.id}/conversations`, {})
     },
@@ -80,6 +184,9 @@ export default function Shell() {
       nav(`/c/${c.id}`)
     },
   })
+
+  // Renaming a conversation edits its title in place in the list.
+  const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null)
 
   const rename = useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => api.patch(`/api/conversations/${id}`, { title }),
@@ -92,6 +199,7 @@ export default function Shell() {
     mutationFn: (id: string) => api.del(`/api/conversations/${id}`),
     onSuccess: (_r, id) => {
       qc.invalidateQueries({ queryKey: ['convs'] })
+      qc.invalidateQueries({ queryKey: ['archive'] })
       if (location.pathname === `/c/${id}`) nav('/')
     },
   })
@@ -117,6 +225,7 @@ export default function Shell() {
           <WsMark size={22} className="text-fg" />
           ws
         </Link>
+        <LocalityBadge info={me.data?.locality} stepUp={{ until: me.data?.step_up_until, hasPasskey: me.data?.has_passkey }} className="ml-auto" />
       </header>
       {drawer && <div className="md:hidden fixed inset-0 z-30 bg-bg/80" onClick={() => setDrawer(false)} aria-hidden="true" />}
       <aside
@@ -132,9 +241,10 @@ export default function Shell() {
             <WsMark size={22} className="text-fg" />
             ws
           </Link>
+          <LocalityBadge info={me.data?.locality} stepUp={{ until: me.data?.step_up_until, hasPasskey: me.data?.has_passkey }} className="ml-auto" />
           <button
             onClick={() => setDrawer(false)}
-            className="md:hidden ml-auto mr-1 p-2.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg"
+            className="md:hidden mr-1 p-2.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg"
             aria-label="Close menu"
           >
             <X size={18} />
@@ -169,7 +279,14 @@ export default function Shell() {
               <Code2 size={14} /> New code project
             </button>
           )}
-          <button onClick={() => newDesign.mutate()} disabled={newDesign.isPending} className={clsx(navItem({ isActive: false }), 'text-xs')}>
+          <button
+            onClick={async () => {
+              const name = await promptDialog({ title: 'New design project', body: 'Conversations in it make designs under its design system.', label: 'Project name', initial: 'Design', confirm: 'Create project' })
+              if (name) newDesign.mutate(name)
+            }}
+            disabled={newDesign.isPending}
+            className={clsx(navItem({ isActive: false }), 'text-xs')}
+          >
             <Palette size={14} /> New design project
           </button>
         </div>
@@ -179,66 +296,50 @@ export default function Shell() {
         <nav className="flex-1 overflow-y-auto px-2 pt-2 space-y-0.5">
           {convs.data?.map((c) => (
             <div key={c.id} className="group relative">
-              <NavLink to={`/c/${c.id}`} className={navItem}>
-                <MessageSquare size={14} className="shrink-0" />
-                <span className="truncate pr-10">{c.title || 'New conversation'}</span>
-              </NavLink>
-              <span className="absolute right-1 top-1/2 -translate-y-1/2 flex md:hidden md:group-hover:flex items-center gap-0.5">
-                <button
-                  onClick={() => {
-                    const t = prompt('Rename conversation', c.title || '')
-                    if (t !== null && t.trim()) rename.mutate({ id: c.id, title: t.trim() })
+              {editing?.id === c.id ? (
+                <RenameField
+                  value={editing.draft}
+                  onChange={(draft) => setEditing({ id: c.id, draft })}
+                  onSave={(title) => {
+                    setEditing(null)
+                    if (title && title !== (c.title || '')) rename.mutate({ id: c.id, title })
                   }}
-                  className="p-2 md:p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
-                  title="Rename"
-                  aria-label="Rename conversation"
-                >
-                  <Pencil size={12} />
-                </button>
-                <button
-                  onClick={() => {
-                    if (confirm(`Archive "${c.title || 'New conversation'}"?`)) archive.mutate(c.id)
-                  }}
-                  className="p-2 md:p-1 rounded text-fg-3 hover:text-fg hover:bg-bg"
-                  title="Archive"
-                  aria-label="Archive conversation"
-                >
-                  <Archive size={12} />
-                </button>
-              </span>
+                  onCancel={() => setEditing(null)}
+                />
+              ) : (
+                <>
+                  <NavLink to={`/c/${c.id}`} className={navItem} onDoubleClick={() => setEditing({ id: c.id, draft: c.title || '' })}>
+                    <MessageSquare size={14} className="shrink-0" />
+                    <span className="truncate pr-10">{c.title || 'New conversation'}</span>
+                  </NavLink>
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-0.5 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
+                    <button
+                      onClick={() => setEditing({ id: c.id, draft: c.title || '' })}
+                      className="p-2 md:p-1 min-h-9 min-w-9 md:min-h-0 md:min-w-0 inline-flex items-center justify-center rounded text-fg-3 hover:text-fg hover:bg-bg"
+                      title="Rename"
+                      aria-label="Rename conversation"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (await confirmDialog({ title: 'Archive this conversation?', body: `"${c.title || 'New conversation'}" leaves your list.`, confirm: 'Archive conversation' })) archive.mutate(c.id)
+                      }}
+                      className="p-2 md:p-1 min-h-9 min-w-9 md:min-h-0 md:min-w-0 inline-flex items-center justify-center rounded text-fg-3 hover:text-fg hover:bg-bg"
+                      title="Archive"
+                      aria-label="Archive conversation"
+                    >
+                      <Archive size={12} />
+                    </button>
+                  </span>
+                </>
+              )}
             </div>
           ))}
           {convs.data?.length === 0 && <p className="meta px-2 py-4">No conversations yet.</p>}
         </nav>
         <div className="p-2 border-t border-line text-sm space-y-0.5">
-          <NavLink to="/media" className={navItem}>
-            <ImageIcon size={14} /> Media
-          </NavLink>
-          <NavLink to="/agents" className={navItem}>
-            <Bot size={14} /> Agents
-          </NavLink>
-          <NavLink to="/settings" className={navItem}>
-            <SettingsIcon size={14} /> Settings
-          </NavLink>
-          {me.data?.role === 'owner' && (
-            <>
-              <NavLink to="/jobs" className={navItem}>
-                <SquareTerminal size={14} /> Jobs
-              </NavLink>
-              <NavLink to="/training" className={navItem}>
-                <FlaskConical size={14} /> Training
-              </NavLink>
-              <NavLink to="/admin" className={navItem}>
-                <Shield size={14} /> Admin
-              </NavLink>
-            </>
-          )}
-          <button onClick={logout} className={navItem({ isActive: false })}>
-            <LogOut size={14} /> Sign out
-          </button>
-          <p className="px-2 pt-1 text-xs text-fg-4 truncate" title={me.data?.email}>
-            {me.data?.display_name || me.data?.email}
-          </p>
+          <SidebarMenu owner={me.data?.role === 'owner'} who={me.data?.display_name || me.data?.email} email={me.data?.email} onSignOut={logout} />
         </div>
       </aside>
       <main className="flex-1 min-w-0 min-h-0 flex flex-col">

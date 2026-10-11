@@ -150,6 +150,11 @@ type SeedEndpoint struct {
 	LatencyClass    string       `yaml:"latency_class"`
 	Local           bool         `yaml:"local"`
 	Enabled         *bool        `yaml:"enabled"`
+	// Tier is small, medium or large; empty derives it from the model name.
+	Tier string `yaml:"tier"`
+	// Routable false keeps general routing and the policy fallback off the
+	// endpoint (see Endpoint.NotRoutable); omitted means routable.
+	Routable *bool `yaml:"routable"`
 	// ExtraBody is merged into every request to this endpoint; see
 	// Endpoint.ExtraBody.
 	ExtraBody map[string]any `yaml:"extra_body"`
@@ -228,6 +233,8 @@ func (sf *SeedFile) Resolve(getenv func(string) string) ([]*Provider, []*Endpoin
 			LatencyClass:    se.LatencyClass,
 			Local:           se.Local,
 			Enabled:         enabled,
+			Tier:            se.Tier,
+			NotRoutable:     se.Routable != nil && !*se.Routable,
 		})
 	}
 	return provs, eps

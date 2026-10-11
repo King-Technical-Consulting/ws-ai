@@ -19,6 +19,8 @@ A `design` artifact is an HTML mockup made in a design project: the conversation
 
 ## Versions
 
+The chat header has an **Artifacts** button (the panel icon, shown when the conversation has at least one artifact): it opens a list of the conversation's artifacts, newest first, with their kind and newest version, and a tap on one opens it; the back arrow in the artifact's header returns to the list. A code conversation also has a **Sandbox** button (the terminal icon) for its files, terminal and preview. Only one right-hand panel is open at a time: opening one closes the other. The artifact panel is closed when you open a conversation, even one that holds artifacts; click an artifact's card in the message to open it. An artifact that arrives while you are in the conversation opens the panel by itself on a screen wide enough to show it beside the chat (768 px and up); on a phone it does not, because the panel would cover the chat, so tap the card.
+
 Every change makes a new version, and the earlier ones stay. The panel shows the artifact with its version number, and you can open an earlier version. The API returns the full list; see [HTTP API](../API.md).
 
 ## Where it runs

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
@@ -133,7 +134,7 @@ func (w writeCloser) Close() error                { return w.close() }
 // the sandbox's env, limits and network but no project volume. The caller
 // removes it.
 func (m *Manager) probeContainer(ctx context.Context) (string, error) {
-	if err := m.ensureImage(ctx); err != nil {
+	if err := m.ensureImage(ctx, uuid.Nil); err != nil {
 		return "", err
 	}
 	cfg, hc, nc := m.containerSpec(nil)
@@ -181,11 +182,12 @@ func (m *Manager) containerSpec(mounts []mount.Mount) (*container.Config, *conta
 	pids := m.cfg.Pids
 	hc := &container.HostConfig{
 		Mounts: mounts,
-		// Root is the image; everything writable is a tmpfs or the volume.
-		ReadonlyRootfs: true,
-		Tmpfs:          map[string]string{"/tmp": "rw,size=2g", "/home/dev": "rw,size=1g", "/run": "rw,size=16m"},
-		CapDrop:        []string{"ALL"},
-		SecurityOpt:    []string{"no-new-privileges:true"},
+		// Everything writable is a tmpfs or the volume. /home/dev is owned by
+		// the dev user: a tmpfs over the image's root-owned 755 directory
+		// would otherwise be unwritable to the user commands run as, so git
+		// config, caches and the skills a run places under ~/.ws-skills would
+		// all fail.
+		Tmpfs: map[string]string{"/tmp": "rw,size=2g", "/home/dev": "rw,size=1g,uid=1000,gid=1000,mode=0755", "/run": "rw,size=16m"},
 		Resources: container.Resources{
 			Memory:    m.cfg.MemoryMB << 20,
 			NanoCPUs:  int64(m.cfg.CPUs * 1e9),
@@ -193,6 +195,15 @@ func (m *Manager) containerSpec(mounts []mount.Mount) (*container.Config, *conta
 		},
 		Init:        ptr(true),
 		NetworkMode: container.NetworkMode(m.cfg.Network),
+	}
+	if !m.cfg.HardeningOff {
+		// Root is the image, read-only; no capability is added back because
+		// nothing in the image needs one; no host device is ever mapped.
+		hc.ReadonlyRootfs = true
+		hc.CapDrop = []string{"ALL"}
+		hc.SecurityOpt = []string{"no-new-privileges:true"}
+		hc.Privileged = false
+		hc.Devices = nil
 	}
 	if m.runtime == "runsc" {
 		hc.Runtime = "runsc"

@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -81,6 +82,61 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		out["preview_pattern"] = strings.Replace(s.Preview.Pattern, "{id}", shortID(info.ID), 1)
 	}
 	writeJSON(w, 200, out)
+}
+
+// sandboxStatus is what the code panel shows when a sandbox is not up: the row's status
+// and error, and the failure that is still current (see lastSandboxError).
+type sandboxStatus struct {
+	Status    string            `json:"status"`
+	Error     *string           `json:"error"`
+	LastError *sandboxLastError `json:"last_error"`
+}
+
+type sandboxLastError struct {
+	Stage string    `json:"stage"`
+	Error string    `json:"error"`
+	At    time.Time `json:"at"`
+}
+
+// lastSandboxError reads the events newest first and returns the newest error unless a
+// start or a successful clone came after it, which means a later attempt got past it.
+// Other kinds (exec, stopped, removed) say nothing about whether setup worked.
+func lastSandboxError(events []store.SandboxEvent) *sandboxLastError {
+	for _, e := range events {
+		switch e.Kind {
+		case "started", "clone":
+			return nil
+		case "error":
+			var d struct {
+				Stage string `json:"stage"`
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(e.Detail, &d)
+			return &sandboxLastError{Stage: d.Stage, Error: d.Error, At: e.CreatedAt}
+		}
+	}
+	return nil
+}
+
+// handleSandboxStatus reports the state of the caller's sandbox without starting it: a
+// read of the database, so it answers at once while GET .../sandbox is still blocked on
+// the worker's image pull. status is "none" until a sandbox row exists.
+func (s *Server) handleSandboxStatus(w http.ResponseWriter, r *http.Request) {
+	proj, ok := s.loadCodeProject(w, r)
+	if !ok {
+		return
+	}
+	row, err := s.DB.GetSandbox(r.Context(), store.GetSandboxParams{ProjectID: proj.ID, UserID: Principal(r.Context()).UserID})
+	if err != nil {
+		writeJSON(w, 200, sandboxStatus{Status: "none"})
+		return
+	}
+	events, err := s.DB.ListSandboxEvents(r.Context(), store.ListSandboxEventsParams{SandboxID: row.ID, Limit: 10})
+	if err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, sandboxStatus{Status: row.Status, Error: row.Error, LastError: lastSandboxError(events)})
 }
 
 func short(s string) string {

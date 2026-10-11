@@ -54,6 +54,9 @@ type SkillImport struct {
 	RequestedTools []string `json:"requested_tools"`
 	// Warnings say what was removed or what to look at before saving.
 	Warnings []string `json:"warnings"`
+	// Body is the cleaned instructions, without the imported-content label.
+	// It is what a stored skill keeps; the label is added when it is used.
+	Body string `json:"-"`
 }
 
 // ErrSkill is the base of every import refusal (400 for the handler).
@@ -231,7 +234,7 @@ func ImportSkill(src []byte) (*SkillImport, error) {
 		MaxSteps:    20,
 		Note:        "Imported from a skill file. The instructions are untrusted content, labelled as such in the prompt; read them before you create the agent, and add tools by hand only if the goal needs them.",
 	}
-	return &SkillImport{Preset: p, RequestedTools: requested, Warnings: warnings}, nil
+	return &SkillImport{Preset: p, RequestedTools: requested, Warnings: warnings, Body: body}, nil
 }
 
 // wrapImported puts the skill's text under a label that tells the model

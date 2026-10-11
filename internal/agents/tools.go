@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/jking323/ws/internal/agent"
 	"github.com/jking323/ws/internal/gateway"
 	"github.com/jking323/ws/internal/store"
@@ -18,12 +20,22 @@ const (
 	ToolRecall   = "recall"
 )
 
-// MemoryTool is remember or recall on the agent runtime. Both work only in
-// an agent's run (the run names the agent whose memory it is); a chat
-// turn gets an error result. remember writes one memory through the same
-// path reflection uses; recall searches by meaning.
+// PersonalMemory is a member's own memory (internal/memory). In a chat turn,
+// which has no agent, remember and recall use it instead of an agent's.
+type PersonalMemory interface {
+	RememberFor(ctx context.Context, userID uuid.UUID, kind, content string, importance float32, conversation uuid.UUID) error
+	// SearchFor returns rendered "[kind] content" lines, nearest first.
+	SearchFor(ctx context.Context, userID uuid.UUID, query string, k int) ([]string, error)
+}
+
+// MemoryTool is remember or recall on the agent runtime. In an agent's run
+// the run names the agent whose memory it is; in a chat turn they use the
+// person's own memory when Personal is set. remember writes one memory
+// through the same path reflection uses; recall searches by meaning.
 type MemoryTool struct {
 	Mem *Memory
+	// Personal serves chat turns; nil means a chat turn gets an error.
+	Personal PersonalMemory
 	// Recall makes this the recall tool; otherwise it is remember.
 	Recall bool
 }
@@ -39,13 +51,13 @@ func (t *MemoryTool) Def() gateway.ToolDef {
 	if t.Recall {
 		return gateway.ToolDef{
 			Name:        ToolRecall,
-			Description: "Search this agent's long-term memory: facts, preferences and episodes kept by earlier runs and by remember. Use it when the task mentions something you may have seen before (a name, a repository, a decision), before asking the user. Returns the nearest memories with their kind and importance.",
+			Description: "Search long-term memory: in an agent run, the facts, preferences and episodes kept by earlier runs and by remember; in a chat, what the person has told you or asked you to keep. Use it when the task mentions something you may have seen before (a name, a project, a decision), before asking the user. Returns the nearest memories with their kind.",
 			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"What to look for, as a sentence or a few keywords."},"k":{"type":"integer","minimum":1,"maximum":50,"description":"How many memories to return (default 8)."}},"required":["query"],"additionalProperties":false}`),
 		}
 	}
 	return gateway.ToolDef{
 		Name:        ToolRemember,
-		Description: "Keep something for this agent's future runs: a stable fact about the environment or the task (an id, a URL, a number, what exists where), a preference about how the owner wants things done, or a short episode. One statement per call, specific and self-contained; do not store secrets, transient detail, or what the goal already says. A summary of each run is kept automatically, so use this for what a summary would miss.",
+		Description: "Keep something for later: in an agent run, a stable fact about the environment or the task, a preference about how the owner wants things done, or a short episode; in a chat, something the person tells you that is worth keeping (a preference, a fact about them or their work, a decision) or asks you to remember. One statement per call, specific and self-contained; do not store secrets, passwords or transient detail, and do not store what is already known.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"content":{"type":"string","description":"The statement to keep, at most 1000 characters."},"kind":{"type":"string","enum":["fact","preference","episode"],"description":"fact (default), preference or episode."},"importance":{"type":"number","minimum":0,"maximum":1,"description":"How much future runs should weigh it (default 0.7)."}},"required":["content"],"additionalProperties":false}`),
 	}
 }
@@ -63,6 +75,9 @@ func (t *MemoryTool) Call(ctx context.Context, tc agent.ToolCtx, args json.RawMe
 		return agent.ErrorResult(errors.New("memory is not configured")), nil
 	}
 	run, err := t.Mem.DB.GetRun(ctx, tc.RunID)
+	if err == nil && !run.AgentID.Valid && t.Personal != nil && tc.UserID != uuid.Nil {
+		return t.callPersonal(ctx, tc, args)
+	}
 	if err != nil || !run.AgentID.Valid {
 		return agent.ErrorResult(errors.New("only an agent's run has long-term memory; this is a chat turn")), nil
 	}
@@ -125,4 +140,37 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// callPersonal is remember or recall in a chat turn: the person's memory.
+func (t *MemoryTool) callPersonal(ctx context.Context, tc agent.ToolCtx, args json.RawMessage) (agent.Result, error) {
+	if t.Recall {
+		var in struct {
+			Query string `json:"query"`
+			K     int    `json:"k"`
+		}
+		if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Query) == "" {
+			return agent.ErrorResult(errors.New("query is required")), nil
+		}
+		lines, err := t.Personal.SearchFor(ctx, tc.UserID, in.Query, in.K)
+		if err != nil {
+			return agent.ErrorResult(err), nil
+		}
+		if len(lines) == 0 {
+			return agent.Result{Text: "Nothing remembered matches that."}, nil
+		}
+		return agent.Result{Text: strings.Join(lines, "\n"), Data: map[string]any{"memories": lines}}, nil
+	}
+	var in struct {
+		Content    string  `json:"content"`
+		Kind       string  `json:"kind"`
+		Importance float32 `json:"importance"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return agent.ErrorResult(err), nil
+	}
+	if err := t.Personal.RememberFor(ctx, tc.UserID, in.Kind, in.Content, in.Importance, tc.ConversationID); err != nil {
+		return agent.ErrorResult(err), nil
+	}
+	return agent.Result{Text: "Remembered.", Data: map[string]any{"remembered": strings.TrimSpace(in.Content)}}, nil
 }

@@ -258,6 +258,31 @@ endpoints:
     throughput_class: high
     latency_class: normal
 
+  # The Anthropic models through OpenRouter, so a box whose only hosted key
+  # is OPENROUTER_API_KEY reaches the same tiers the policy names. The
+  # slugs follow OpenRouter's "anthropic/<family>-<version>" with a dot;
+  # they were not checked against its live catalog, so verify them in
+  # Admin (a wrong slug fails the request and the router moves on).
+  - id: openrouter/anthropic/claude-sonnet-5-5
+    provider: openrouter
+    model: anthropic/claude-sonnet-5.5
+    display_name: Claude Sonnet 5.5 (OpenRouter)
+    capabilities: { context_window: 1000000, max_output: 128000, tools: true, vision: true, json_mode: true, reasoning: true }
+    pricing: { input_per_m: 2.00, output_per_m: 10.00 }
+    tier: large
+    throughput_class: high
+    latency_class: fast
+
+  - id: openrouter/anthropic/claude-haiku-4-5
+    provider: openrouter
+    model: anthropic/claude-haiku-4.5
+    display_name: Claude Haiku 4.5 (OpenRouter)
+    capabilities: { context_window: 200000, max_output: 64000, tools: true, vision: true, json_mode: true, reasoning: true }
+    pricing: { input_per_m: 1.00, output_per_m: 5.00 }
+    tier: medium
+    throughput_class: high
+    latency_class: fast
+
   - id: openrouter/deepseek/deepseek-chat-v3
     provider: openrouter
     model: deepseek/deepseek-chat-v3-0324

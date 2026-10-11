@@ -11,6 +11,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -63,6 +65,12 @@ type Part struct {
 	// Reasoning. Signature is provider-opaque (Anthropic thinking signature)
 	// and must be echoed back on the next turn when present.
 	Signature string `json:"signature,omitempty"`
+
+	// Alt marks a text part that stands in for the PDF file part just before
+	// it, for models that cannot take the file: the extracted text of an
+	// uploaded document (PLAN M13). An adapter that sends the PDF natively
+	// drops it; one that cannot drops the file instead. See ResolveAlt.
+	Alt bool `json:"alt,omitempty"`
 
 	// CacheHint marks this part as the end of a stable prefix. Adapters that
 	// support prompt caching place a cache breakpoint here.
@@ -132,7 +140,11 @@ const (
 	TaskEmbed     TaskClass = "embed"
 	TaskVision    TaskClass = "vision"
 	TaskClassify  TaskClass = "classify"
-	TaskReflect   TaskClass = "reflect" // agent memory extraction
+	// TaskRoute is the verdict call that reads a chat turn and says what it
+	// needs (verdict.go); its spend is summed on its own for the daily cap.
+	TaskRoute    TaskClass = "route"
+	TaskReflect  TaskClass = "reflect"  // agent memory extraction
+	TaskTraining TaskClass = "training" // fleshing out a training recipe (internal/training)
 	// Media task classes route to endpoints with Capabilities.Media
 	// (internal/media), never to a text model.
 	TaskImage TaskClass = "image"
@@ -157,6 +169,10 @@ type Metadata struct {
 	// External is true when the request came through /v1 from an outside
 	// client that owns its own context; compaction is skipped.
 	External bool `json:"external,omitempty"`
+	// NoVerdict keeps the gateway from asking for a routing verdict on this
+	// request; the verdict call sets it on its own request so it cannot
+	// recurse.
+	NoVerdict bool `json:"no_verdict,omitempty"`
 }
 
 // Request is a canonical chat completion request.
@@ -514,13 +530,42 @@ type Endpoint struct {
 	Enabled         bool         `json:"enabled"`
 	// Local marks on-prem endpoints; the router treats them as free.
 	Local bool `json:"local"`
+	// Tier is the quality tier, "small", "medium" or "large"; "" means the
+	// tier is read off the model name (EffectiveTier). A rule's min_tier
+	// keeps the fallback from going below it.
+	Tier string `json:"tier"`
+	// NotRoutable keeps general routing off this endpoint: it is never a
+	// fallback and never an "any model" candidate, only reached when picked
+	// by name or named by a policy rule or alias. The zero value is
+	// routable, so existing records and tests are unchanged.
+	NotRoutable bool `json:"not_routable"`
 	// ExtraBody is merged into every request body sent to this endpoint
 	// (OpenAI-compatible adapters only). It is how one model gets several
 	// routes: an OpenRouter endpoint pinned to one upstream provider carries
 	// {"provider": {"order": ["cerebras"], "allow_fallbacks": false}}.
 	ExtraBody map[string]any `json:"extra_body,omitempty"`
+	// DefaultSystem is the system prompt a request gets when it brings none:
+	// an adapter trained from a recipe serves under the prompt it was
+	// trained with. It travels in the stored extra_body under
+	// DefaultSystemKey and is lifted out when the registry loads, so it is
+	// never sent to a provider.
+	DefaultSystem string `json:"default_system,omitempty"`
 	// Health is runtime state maintained by the health checker.
 	Health Health `json:"health"`
+}
+
+// DefaultSystemKey is the extra_body key an endpoint's default system
+// prompt is stored under (see Endpoint.DefaultSystem).
+const DefaultSystemKey = "ws_default_system"
+
+// LiftDefaultSystem moves the default system prompt out of ExtraBody (where
+// it is stored) into DefaultSystem, so it is the endpoint's and never part
+// of what is sent to a provider.
+func (e *Endpoint) LiftDefaultSystem() {
+	if sys, ok := e.ExtraBody[DefaultSystemKey].(string); ok {
+		e.DefaultSystem = sys
+		delete(e.ExtraBody, DefaultSystemKey)
+	}
 }
 
 // Route returns a short label for the upstream route pinned in ExtraBody
@@ -552,4 +597,80 @@ type Adapter interface {
 	// CountTokens estimates input tokens. Adapters may call a remote
 	// counting API or return an estimate; the bool reports which.
 	CountTokens(ctx context.Context, p *Provider, ep *Endpoint, req *Request) (n int, exact bool, err error)
+}
+
+// ResolveAlt applies Part.Alt for an adapter. With pdfNative true (the
+// adapter sends PDFs as documents) Alt text parts are dropped; otherwise a
+// PDF file part immediately followed by an Alt text part is dropped and the
+// text kept. Parts without Alt are untouched.
+func ResolveAlt(parts []Part, pdfNative bool) []Part {
+	hasAlt := false
+	for _, p := range parts {
+		if p.Alt {
+			hasAlt = true
+			break
+		}
+	}
+	if !hasAlt {
+		return parts
+	}
+	out := make([]Part, 0, len(parts))
+	for i, p := range parts {
+		switch {
+		case p.Alt && p.Kind == PartText:
+			if pdfNative {
+				continue
+			}
+			p.Alt = false
+		case !pdfNative && p.Kind == PartFile && i+1 < len(parts) && parts[i+1].Alt && parts[i+1].Kind == PartText:
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// Quality tiers, lowest first.
+const (
+	TierSmall  = "small"
+	TierMedium = "medium"
+	TierLarge  = "large"
+)
+
+// TierRank orders tiers; an unknown or empty tier ranks as medium.
+func TierRank(t string) int {
+	switch t {
+	case TierSmall:
+		return 0
+	case TierLarge:
+		return 2
+	}
+	return 1
+}
+
+var paramCount = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(\d+(?:\.\d+)?)b(?:[^a-z]|$)`)
+
+// EffectiveTier is the declared tier, or one read off the parameter count
+// the model's name carries (the largest "<n>b" that is not an active-
+// parameter figure like "a3b"): under 4 billion small, under 30 medium,
+// else large; medium when the name carries none.
+func (e *Endpoint) EffectiveTier() string {
+	if e.Tier != "" {
+		return e.Tier
+	}
+	best := -1.0
+	for _, m := range paramCount.FindAllStringSubmatch(e.ModelName+" "+e.ID, -1) {
+		if n, err := strconv.ParseFloat(m[1], 64); err == nil && n > best {
+			best = n
+		}
+	}
+	switch {
+	case best < 0:
+		return TierMedium
+	case best < 4:
+		return TierSmall
+	case best < 30:
+		return TierMedium
+	}
+	return TierLarge
 }

@@ -39,7 +39,7 @@ func (q *Queries) CancelRun(ctx context.Context, id uuid.UUID) error {
 const claimRun = `-- name: ClaimRun :one
 UPDATE agent_runs SET status = 'running', owner_pid = $2, heartbeat_at = now(), started_at = COALESCE(started_at, now())
 WHERE id = $1 AND (status IN ('queued','paused_steer') OR (status = 'running' AND heartbeat_at < now() - interval '90 seconds'))
-RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at
+RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd
 `
 
 type ClaimRunParams struct {
@@ -71,6 +71,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (AgentRun, e
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -87,8 +88,8 @@ func (q *Queries) CountOpenRunsForAgent(ctx context.Context, agentID uuid.NullUU
 }
 
 const createAgent = `-- name: CreateAgent :one
-INSERT INTO agents (owner_id, project_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, max_steps)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at
+INSERT INTO agents (owner_id, project_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, max_steps, max_run_usd)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at, max_run_usd
 `
 
 type CreateAgentParams struct {
@@ -101,6 +102,7 @@ type CreateAgentParams struct {
 	ToolAllowlist []string        `json:"tool_allowlist"`
 	ToolPolicies  json.RawMessage `json:"tool_policies"`
 	MaxSteps      int32           `json:"max_steps"`
+	MaxRunUsd     float64         `json:"max_run_usd"`
 }
 
 func (q *Queries) CreateAgent(ctx context.Context, arg CreateAgentParams) (Agent, error) {
@@ -114,6 +116,7 @@ func (q *Queries) CreateAgent(ctx context.Context, arg CreateAgentParams) (Agent
 		arg.ToolAllowlist,
 		arg.ToolPolicies,
 		arg.MaxSteps,
+		arg.MaxRunUsd,
 	)
 	var i Agent
 	err := row.Scan(
@@ -133,6 +136,7 @@ func (q *Queries) CreateAgent(ctx context.Context, arg CreateAgentParams) (Agent
 		&i.UpdatedAt,
 		&i.ProjectID,
 		&i.LastRunAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -175,9 +179,9 @@ func (q *Queries) CreateApproval(ctx context.Context, arg CreateApprovalParams) 
 }
 
 const createRun = `-- name: CreateRun :one
-INSERT INTO agent_runs (agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, first_message_id, owner_pid, started_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $5 = 'running' THEN now() ELSE NULL END)
-RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at
+INSERT INTO agent_runs (agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, first_message_id, owner_pid, started_at, max_run_usd)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $5 = 'running' THEN now() ELSE NULL END, $11)
+RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd
 `
 
 type CreateRunParams struct {
@@ -191,6 +195,7 @@ type CreateRunParams struct {
 	MaxSteps       int32           `json:"max_steps"`
 	FirstMessageID uuid.NullUUID   `json:"first_message_id"`
 	OwnerPid       *string         `json:"owner_pid"`
+	MaxRunUsd      float64         `json:"max_run_usd"`
 }
 
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (AgentRun, error) {
@@ -205,6 +210,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (AgentRun,
 		arg.MaxSteps,
 		arg.FirstMessageID,
 		arg.OwnerPid,
+		arg.MaxRunUsd,
 	)
 	var i AgentRun
 	err := row.Scan(
@@ -227,6 +233,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (AgentRun,
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -308,7 +315,7 @@ func (q *Queries) DecideApproval(ctx context.Context, arg DecideApprovalParams) 
 }
 
 const decideApprovalByCall = `-- name: DecideApprovalByCall :one
-UPDATE approvals SET status = $3, decided_by = $4, decided_at = now()
+UPDATE approvals SET status = $3, decided_by = $4, note = $5, decided_at = now()
 WHERE run_id = $1 AND tool_call_id = $2 AND status = 'pending' RETURNING id, run_id, step_seq, tool_call_id, tool_name, args, status, decided_by, decided_at, note, created_at
 `
 
@@ -317,6 +324,7 @@ type DecideApprovalByCallParams struct {
 	ToolCallID string        `json:"tool_call_id"`
 	Status     string        `json:"status"`
 	DecidedBy  uuid.NullUUID `json:"decided_by"`
+	Note       *string       `json:"note"`
 }
 
 func (q *Queries) DecideApprovalByCall(ctx context.Context, arg DecideApprovalByCallParams) (Approval, error) {
@@ -325,6 +333,7 @@ func (q *Queries) DecideApprovalByCall(ctx context.Context, arg DecideApprovalBy
 		arg.ToolCallID,
 		arg.Status,
 		arg.DecidedBy,
+		arg.Note,
 	)
 	var i Approval
 	err := row.Scan(
@@ -429,7 +438,7 @@ func (q *Queries) FinishStep(ctx context.Context, arg FinishStepParams) error {
 }
 
 const getAgent = `-- name: GetAgent :one
-SELECT id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at FROM agents WHERE id = $1
+SELECT id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at, max_run_usd FROM agents WHERE id = $1
 `
 
 func (q *Queries) GetAgent(ctx context.Context, id uuid.UUID) (Agent, error) {
@@ -452,6 +461,7 @@ func (q *Queries) GetAgent(ctx context.Context, id uuid.UUID) (Agent, error) {
 		&i.UpdatedAt,
 		&i.ProjectID,
 		&i.LastRunAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -480,7 +490,7 @@ func (q *Queries) GetApproval(ctx context.Context, id uuid.UUID) (Approval, erro
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE id = $1
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (AgentRun, error) {
@@ -506,6 +516,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (AgentRun, error) {
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -608,7 +619,7 @@ func (q *Queries) LastStep(ctx context.Context, runID uuid.UUID) (AgentStep, err
 }
 
 const latestRunForConversation = `-- name: LatestRunForConversation :one
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1
 `
 
 func (q *Queries) LatestRunForConversation(ctx context.Context, conversationID uuid.UUID) (AgentRun, error) {
@@ -634,12 +645,13 @@ func (q *Queries) LatestRunForConversation(ctx context.Context, conversationID u
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
 
 const listAgentsForUser = `-- name: ListAgentsForUser :many
-SELECT id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at FROM agents WHERE owner_id = $1 ORDER BY created_at DESC
+SELECT id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at, max_run_usd FROM agents WHERE owner_id = $1 ORDER BY created_at DESC
 `
 
 func (q *Queries) ListAgentsForUser(ctx context.Context, ownerID uuid.UUID) ([]Agent, error) {
@@ -668,6 +680,49 @@ func (q *Queries) ListAgentsForUser(ctx context.Context, ownerID uuid.UUID) ([]A
 			&i.UpdatedAt,
 			&i.ProjectID,
 			&i.LastRunAt,
+			&i.MaxRunUsd,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllAgents = `-- name: ListAllAgents :many
+SELECT id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at, max_run_usd FROM agents ORDER BY created_at
+`
+
+func (q *Queries) ListAllAgents(ctx context.Context) ([]Agent, error) {
+	rows, err := q.db.Query(ctx, listAllAgents)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Agent{}
+	for rows.Next() {
+		var i Agent
+		if err := rows.Scan(
+			&i.ID,
+			&i.OwnerID,
+			&i.Name,
+			&i.Goal,
+			&i.SystemPrompt,
+			&i.ModelPolicy,
+			&i.ToolAllowlist,
+			&i.ToolPolicies,
+			&i.McpServers,
+			&i.MemoryConfig,
+			&i.MaxSteps,
+			&i.Enabled,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ProjectID,
+			&i.LastRunAt,
+			&i.MaxRunUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -906,7 +961,7 @@ func (q *Queries) ListPendingApprovalsForUser(ctx context.Context, userID uuid.N
 }
 
 const listQueuedRuns = `-- name: ListQueuedRuns :many
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE status = 'queued' ORDER BY created_at LIMIT 20
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE status = 'queued' ORDER BY created_at LIMIT 20
 `
 
 func (q *Queries) ListQueuedRuns(ctx context.Context) ([]AgentRun, error) {
@@ -938,6 +993,7 @@ func (q *Queries) ListQueuedRuns(ctx context.Context) ([]AgentRun, error) {
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxRunUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -988,7 +1044,7 @@ func (q *Queries) ListRepoPushTriggers(ctx context.Context) ([]AgentTrigger, err
 }
 
 const listRunsForAgent = `-- name: ListRunsForAgent :many
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2
 `
 
 type ListRunsForAgentParams struct {
@@ -1025,6 +1081,7 @@ func (q *Queries) ListRunsForAgent(ctx context.Context, arg ListRunsForAgentPara
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxRunUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -1037,7 +1094,7 @@ func (q *Queries) ListRunsForAgent(ctx context.Context, arg ListRunsForAgentPara
 }
 
 const listRunsForConversation = `-- name: ListRunsForConversation :many
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
 `
 
 type ListRunsForConversationParams struct {
@@ -1074,6 +1131,7 @@ func (q *Queries) ListRunsForConversation(ctx context.Context, arg ListRunsForCo
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxRunUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -1086,7 +1144,7 @@ func (q *Queries) ListRunsForConversation(ctx context.Context, arg ListRunsForCo
 }
 
 const listStaleRuns = `-- name: ListStaleRuns :many
-SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at FROM agent_runs WHERE status = 'running' AND heartbeat_at < now() - interval '90 seconds' ORDER BY heartbeat_at LIMIT 20
+SELECT id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd FROM agent_runs WHERE status = 'running' AND heartbeat_at < now() - interval '90 seconds' ORDER BY heartbeat_at LIMIT 20
 `
 
 func (q *Queries) ListStaleRuns(ctx context.Context) ([]AgentRun, error) {
@@ -1118,6 +1176,7 @@ func (q *Queries) ListStaleRuns(ctx context.Context) ([]AgentRun, error) {
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxRunUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -1250,7 +1309,7 @@ func (q *Queries) RequeueRunAfterApproval(ctx context.Context, id uuid.UUID) (uu
 const resumeRunAfterApproval = `-- name: ResumeRunAfterApproval :one
 UPDATE agent_runs SET status = 'running', owner_pid = $2, heartbeat_at = now()
 WHERE agent_runs.id = $1 AND agent_runs.status = 'paused_approval'
-RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at
+RETURNING id, agent_id, conversation_id, user_id, trigger_id, status, request, tool_policies, max_steps, step_count, first_message_id, cost_usd, error, heartbeat_at, owner_pid, started_at, ended_at, created_at, updated_at, max_run_usd
 `
 
 type ResumeRunAfterApprovalParams struct {
@@ -1281,6 +1340,7 @@ func (q *Queries) ResumeRunAfterApproval(ctx context.Context, arg ResumeRunAfter
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }
@@ -1385,8 +1445,8 @@ func (q *Queries) TouchAgentRun(ctx context.Context, id uuid.UUID) error {
 }
 
 const updateAgent = `-- name: UpdateAgent :one
-UPDATE agents SET name = $2, goal = $3, system_prompt = $4, model_policy = $5, tool_allowlist = $6, tool_policies = $7, max_steps = $8, enabled = $9, project_id = $10
-WHERE id = $1 RETURNING id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at
+UPDATE agents SET name = $2, goal = $3, system_prompt = $4, model_policy = $5, tool_allowlist = $6, tool_policies = $7, max_steps = $8, enabled = $9, project_id = $10, max_run_usd = $11
+WHERE id = $1 RETURNING id, owner_id, name, goal, system_prompt, model_policy, tool_allowlist, tool_policies, mcp_servers, memory_config, max_steps, enabled, created_at, updated_at, project_id, last_run_at, max_run_usd
 `
 
 type UpdateAgentParams struct {
@@ -1400,6 +1460,7 @@ type UpdateAgentParams struct {
 	MaxSteps      int32           `json:"max_steps"`
 	Enabled       bool            `json:"enabled"`
 	ProjectID     uuid.NullUUID   `json:"project_id"`
+	MaxRunUsd     float64         `json:"max_run_usd"`
 }
 
 func (q *Queries) UpdateAgent(ctx context.Context, arg UpdateAgentParams) (Agent, error) {
@@ -1414,6 +1475,7 @@ func (q *Queries) UpdateAgent(ctx context.Context, arg UpdateAgentParams) (Agent
 		arg.MaxSteps,
 		arg.Enabled,
 		arg.ProjectID,
+		arg.MaxRunUsd,
 	)
 	var i Agent
 	err := row.Scan(
@@ -1433,6 +1495,7 @@ func (q *Queries) UpdateAgent(ctx context.Context, arg UpdateAgentParams) (Agent
 		&i.UpdatedAt,
 		&i.ProjectID,
 		&i.LastRunAt,
+		&i.MaxRunUsd,
 	)
 	return i, err
 }

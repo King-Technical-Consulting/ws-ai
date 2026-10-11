@@ -67,7 +67,7 @@ func newTestUser(t *testing.T, s *Server, role string) store.User {
 func sessionCookie(t *testing.T, s *Server, userID uuid.UUID) *http.Cookie {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	if err := s.Auth.CreateSession(context.Background(), rec, httptest.NewRequest("GET", "/", nil), userID); err != nil {
+	if err := s.Auth.CreateSession(context.Background(), rec, httptest.NewRequest("GET", "/", nil), userID, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range rec.Result().Cookies() {

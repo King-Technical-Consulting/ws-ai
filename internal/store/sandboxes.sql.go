@@ -154,6 +154,41 @@ func (q *Queries) InsertSandboxEvent(ctx context.Context, arg InsertSandboxEvent
 	return err
 }
 
+const listSandboxEvents = `-- name: ListSandboxEvents :many
+SELECT id, sandbox_id, kind, detail, created_at FROM sandbox_events WHERE sandbox_id = $1 ORDER BY id DESC LIMIT $2
+`
+
+type ListSandboxEventsParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Limit     int32     `json:"limit"`
+}
+
+func (q *Queries) ListSandboxEvents(ctx context.Context, arg ListSandboxEventsParams) ([]SandboxEvent, error) {
+	rows, err := q.db.Query(ctx, listSandboxEvents, arg.SandboxID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SandboxEvent{}
+	for rows.Next() {
+		var i SandboxEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.Kind,
+			&i.Detail,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesForProject = `-- name: ListSandboxesForProject :many
 SELECT id, project_id, user_id, container_id, volume_name, image, runtime, status, error, last_used_at, created_at, updated_at FROM sandboxes WHERE project_id = $1 ORDER BY created_at
 `

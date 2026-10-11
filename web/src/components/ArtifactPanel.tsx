@@ -2,7 +2,8 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight, Download, ExternalLink, GitCompare, Sparkles, X, FileCode2 } from 'lucide-react'
 import { api, type DesignContext } from '../api'
-import { btn, inputSm, Callout } from './ui'
+import { btn, inputSm, Callout, StarButton } from './ui'
+import { useFavorites } from '../lib/favorites'
 import clsx from 'clsx'
 
 export type ArtifactRef = { artifact_id: string; version: number; version_id: string; kind: string; title: string; url: string }
@@ -39,7 +40,7 @@ export function ArtifactCard({ output, state }: { output?: unknown; state: strin
   return (
     <button
       onClick={() => open(ref.artifact_id, ref.version)}
-      className="my-2 w-full text-left rounded-lg border border-line bg-bg-2 hover:bg-bg-3 px-3 py-2 font-sans text-sm flex items-center gap-3"
+      className="my-2 w-full min-h-9 text-left rounded-lg border border-line bg-bg-2 hover:bg-bg-3 px-3 py-2 font-sans text-sm flex items-center gap-3"
     >
       <FileCode2 size={16} className="text-fg-3 shrink-0" />
       <span className="min-w-0 flex-1">
@@ -53,11 +54,49 @@ export function ArtifactCard({ output, state }: { output?: unknown; state: strin
 
 const TEXT_KINDS = new Set(['html', 'design', 'svg', 'markdown', 'mermaid', 'code'])
 
-export function ArtifactPanel({ id, version, onClose, onVersion }: { id: string; version?: number; onClose: () => void; onVersion: (v: number) => void }) {
+type ArtifactSummary = { id: string; kind: string; title: string; current_version: number; created_at: string }
+
+/** The right-hand list of this conversation's artifacts, newest first. A tap opens one in the ArtifactPanel. */
+export function ArtifactsList({ conversationId, onPick, onClose }: { conversationId: string; onPick: (id: string, version: number) => void; onClose: () => void }) {
+  const q = useQuery({ queryKey: ['conv-artifacts', conversationId], queryFn: () => api.get<ArtifactSummary[] | null>(`/api/conversations/${conversationId}/artifacts`) })
+  const rows = [...(q.data ?? [])].sort((a, b) => b.created_at.localeCompare(a.created_at))
+  return (
+    <aside aria-label="Artifacts" className="fixed inset-0 z-20 md:static md:z-auto md:w-[46%] md:min-w-[380px] md:max-w-[28rem] md:shrink-0 border-l border-line bg-bg-2 flex flex-col">
+      <header className="h-12 shrink-0 border-b border-line flex items-center gap-2 px-3">
+        <span className="min-w-0 flex-1 truncate reading-tight">Artifacts</span>
+        <button onClick={onClose} className="p-1.5 min-h-9 min-w-9 md:min-h-0 md:min-w-0 inline-flex items-center justify-center rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="Close" aria-label="Close the artifacts list">
+          <X size={16} />
+        </button>
+      </header>
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2">
+        {q.isLoading && <p className="meta">Loading…</p>}
+        {q.error && <p className="text-sm text-danger">Could not load the artifacts.</p>}
+        {!q.isLoading && !q.error && rows.length === 0 && <p className="meta">No artifacts in this conversation yet.</p>}
+        {rows.map((a) => (
+          <button
+            key={a.id}
+            onClick={() => onPick(a.id, a.current_version)}
+            className="w-full min-h-9 text-left rounded-lg border border-line bg-bg hover:bg-bg-3 px-3 py-2 font-sans text-sm flex items-center gap-3"
+          >
+            <FileCode2 size={16} className="text-fg-3 shrink-0" />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-fg">{a.title}</span>
+              <span className="meta">{a.kind} · v{a.current_version}</span>
+            </span>
+            <ChevronRight size={14} className="text-fg-3" />
+          </button>
+        ))}
+      </div>
+    </aside>
+  )
+}
+
+export function ArtifactPanel({ id, version, onClose, onVersion, onBack }: { id: string; version?: number; onClose: () => void; onVersion: (v: number) => void; onBack?: () => void }) {
   const q = useQuery({
     queryKey: ['artifact', id, version ?? 0],
     queryFn: () => api.get<ArtifactDetail>(`/api/artifacts/${id}${version ? `?version=${version}` : ''}`),
   })
+  const fav = useFavorites()
   const frame = useRef<HTMLIFrameElement>(null)
   const [frameErr, setFrameErr] = useState<string | null>(null)
   const [mode, setMode] = useState<'view' | 'diff' | 'variants'>('view')
@@ -86,8 +125,14 @@ export function ArtifactPanel({ id, version, onClose, onVersion }: { id: string;
 
   return (
     <aside className="fixed inset-0 z-20 md:static md:z-auto md:w-[46%] md:min-w-[380px] md:shrink-0 border-l border-line bg-bg-2 flex flex-col">
-      <header className="h-12 shrink-0 border-b border-line flex items-center gap-2 px-3">
-        <span className="min-w-0 flex-1 truncate reading-tight">{d?.title ?? 'Artifact'}</span>
+      {/* flex-wrap: on a phone the title, version stepper and tools do not fit one line, and what does not fit goes to a second line instead of off the screen (the close button was lost) */}
+      <header className="min-h-12 shrink-0 border-b border-line flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1">
+        {onBack && (
+          <button onClick={onBack} className="p-1.5 min-h-9 min-w-9 md:min-h-0 md:min-w-0 inline-flex items-center justify-center rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="All artifacts" aria-label="Back to the artifacts list">
+            <ChevronLeft size={16} />
+          </button>
+        )}
+        <span className="min-w-[6rem] flex-1 truncate reading-tight">{d?.title ?? 'Artifact'}</span>
         {d && <span className="meta">{d.kind}</span>}
         <div className="flex items-center gap-0.5 text-fg-2">
           <button disabled={cur <= 1} onClick={() => onVersion(cur - 1)} className="p-1.5 rounded-md hover:bg-bg-3 disabled:opacity-40" title="Previous version" aria-label="Previous version">
@@ -120,6 +165,7 @@ export function ArtifactPanel({ id, version, onClose, onVersion }: { id: string;
             <Sparkles size={16} />
           </button>
         )}
+        {d && <StarButton starred={fav.isStarred('artifact', id)} onToggle={() => fav.toggle('artifact', id)} label="Favorite this artifact" className="!p-1.5" />}
         {d && (
           <a href={`/api/artifacts/${id}/export?version=${cur}`} download className="p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="Download" aria-label="Download this version">
             <Download size={16} />

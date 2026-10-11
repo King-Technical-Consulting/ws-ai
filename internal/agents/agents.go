@@ -65,6 +65,10 @@ type ModelPolicy struct {
 	Selector  string            `json:"selector,omitempty" yaml:"selector"`
 	TaskClass gateway.TaskClass `json:"task_class,omitempty" yaml:"task_class"`
 	Reasoning bool              `json:"reasoning,omitempty" yaml:"reasoning"`
+	// PlanFirst makes every run start with a written plan that waits for a
+	// person's approval (agent.Request.Plan), so a cron-triggered run does
+	// nothing until someone says yes.
+	PlanFirst bool `json:"plan_first,omitempty" yaml:"plan_first"`
 }
 
 // CronSpec is agent_triggers.spec for kind cron.
@@ -123,8 +127,15 @@ type Service struct {
 	// Presets are the starting points the new-agent form offers
 	// (config/presets, LoadPresets).
 	Presets []Preset
-	Log     *slog.Logger
-	Now     func() time.Time
+	// ProjectKind reports a project's kind ("code" or other); set so a
+	// run's system prompt can say whether an approved skill's scripts have
+	// a sandbox to run in. Unset counts as not a code project.
+	ProjectKind func(ctx context.Context, id uuid.UUID) (string, error)
+	// SkillsFor lists the approved skills an agent uses (the shelf entries
+	// attached to it); unset means none.
+	SkillsFor func(ctx context.Context, agentID uuid.UUID) ([]StoredSkill, error)
+	Log       *slog.Logger
+	Now       func() time.Time
 }
 
 // StartParams describe one firing.
@@ -223,10 +234,17 @@ func (s *Service) Start(ctx context.Context, p StartParams) (*store.AgentRun, er
 			system += "\n\n" + block
 		}
 	}
+	if s.SkillsFor != nil {
+		if skills, err := s.SkillsFor(ctx, ag.ID); err != nil {
+			s.log().Warn("agents: skills lookup failed, starting without them", "agent", ag.ID, "err", err)
+		} else if len(skills) > 0 {
+			system += "\n\n" + RenderSkills(skills, s.scriptsAvailability(ctx, ag, policies))
+		}
+	}
 	run, err := s.Runtime.Create(ctx, agent.StartParams{
 		ConversationID: convID.UUID, UserID: userID, AgentID: store.NullUUID(ag.ID), TriggerID: p.TriggerID,
-		Request:  agent.Request{Selector: mp.Selector, System: system, TaskClass: mp.TaskClass, Reasoning: mp.Reasoning, ToolAllow: ag.ToolAllowlist},
-		Policies: policies, MaxSteps: maxSteps,
+		Request:  agent.Request{Selector: mp.Selector, System: system, TaskClass: mp.TaskClass, Reasoning: mp.Reasoning, ToolAllow: ag.ToolAllowlist, Plan: mp.PlanFirst},
+		Policies: policies, MaxSteps: maxSteps, MaxRunUSD: ag.MaxRunUsd,
 	})
 	if err != nil {
 		return nil, err

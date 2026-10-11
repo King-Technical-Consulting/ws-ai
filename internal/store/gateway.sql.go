@@ -13,6 +13,37 @@ import (
 	"github.com/google/uuid"
 )
 
+const budgetUsageByUserSince = `-- name: BudgetUsageByUserSince :many
+SELECT user_id, count(*) AS calls, SUM(cost_usd)::numeric AS cost_usd
+FROM usage_ledger WHERE created_at >= $1 AND user_id IS NOT NULL AND NOT own_key GROUP BY user_id ORDER BY cost_usd DESC
+`
+
+type BudgetUsageByUserSinceRow struct {
+	UserID  uuid.NullUUID `json:"user_id"`
+	Calls   int64         `json:"calls"`
+	CostUsd float64       `json:"cost_usd"`
+}
+
+func (q *Queries) BudgetUsageByUserSince(ctx context.Context, createdAt time.Time) ([]BudgetUsageByUserSinceRow, error) {
+	rows, err := q.db.Query(ctx, budgetUsageByUserSince, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BudgetUsageByUserSinceRow{}
+	for rows.Next() {
+		var i BudgetUsageByUserSinceRow
+		if err := rows.Scan(&i.UserID, &i.Calls, &i.CostUsd); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const deleteBudget = `-- name: DeleteBudget :exec
 DELETE FROM budgets WHERE id = $1
 `
@@ -83,8 +114,39 @@ func (q *Queries) GetBudget(ctx context.Context, arg GetBudgetParams) (Budget, e
 	return i, err
 }
 
+const getBudgetWarning = `-- name: GetBudgetWarning :one
+SELECT scope, scope_id, period, pct, spent_usd, limit_usd, sent_at FROM budget_warnings WHERE scope = $1 AND scope_id IS NOT DISTINCT FROM $2 AND period = $3 AND pct = $4
+`
+
+type GetBudgetWarningParams struct {
+	Scope   string        `json:"scope"`
+	ScopeID uuid.NullUUID `json:"scope_id"`
+	Period  string        `json:"period"`
+	Pct     int32         `json:"pct"`
+}
+
+func (q *Queries) GetBudgetWarning(ctx context.Context, arg GetBudgetWarningParams) (BudgetWarning, error) {
+	row := q.db.QueryRow(ctx, getBudgetWarning,
+		arg.Scope,
+		arg.ScopeID,
+		arg.Period,
+		arg.Pct,
+	)
+	var i BudgetWarning
+	err := row.Scan(
+		&i.Scope,
+		&i.ScopeID,
+		&i.Period,
+		&i.Pct,
+		&i.SpentUsd,
+		&i.LimitUsd,
+		&i.SentAt,
+	)
+	return i, err
+}
+
 const getEndpoint = `-- name: GetEndpoint :one
-SELECT id, provider_id, model_name, display_name, capabilities, pricing, throughput_class, latency_class, is_local, enabled, health_status, health_checked_at, health_error, p50_latency_ms, error_rate, created_at, updated_at, extra_body FROM endpoints WHERE id = $1
+SELECT id, provider_id, model_name, display_name, capabilities, pricing, throughput_class, latency_class, is_local, enabled, health_status, health_checked_at, health_error, p50_latency_ms, error_rate, created_at, updated_at, extra_body, tier, routable FROM endpoints WHERE id = $1
 `
 
 func (q *Queries) GetEndpoint(ctx context.Context, id string) (Endpoint, error) {
@@ -109,6 +171,8 @@ func (q *Queries) GetEndpoint(ctx context.Context, id string) (Endpoint, error) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.ExtraBody,
+		&i.Tier,
+		&i.Routable,
 	)
 	return i, err
 }
@@ -326,7 +390,7 @@ func (q *Queries) ListEndpointThroughput(ctx context.Context) ([]EndpointThrough
 }
 
 const listEndpoints = `-- name: ListEndpoints :many
-SELECT id, provider_id, model_name, display_name, capabilities, pricing, throughput_class, latency_class, is_local, enabled, health_status, health_checked_at, health_error, p50_latency_ms, error_rate, created_at, updated_at, extra_body FROM endpoints ORDER BY id
+SELECT id, provider_id, model_name, display_name, capabilities, pricing, throughput_class, latency_class, is_local, enabled, health_status, health_checked_at, health_error, p50_latency_ms, error_rate, created_at, updated_at, extra_body, tier, routable FROM endpoints ORDER BY id
 `
 
 func (q *Queries) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
@@ -357,6 +421,8 @@ func (q *Queries) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.ExtraBody,
+			&i.Tier,
+			&i.Routable,
 		); err != nil {
 			return nil, err
 		}
@@ -554,6 +620,23 @@ func (q *Queries) SetEndpointEnabled(ctx context.Context, arg SetEndpointEnabled
 	return err
 }
 
+const setEndpointRouting = `-- name: SetEndpointRouting :exec
+UPDATE endpoints SET tier = $2, routable = $3 WHERE id = $1
+`
+
+type SetEndpointRoutingParams struct {
+	ID       string `json:"id"`
+	Tier     string `json:"tier"`
+	Routable bool   `json:"routable"`
+}
+
+// Tier and routable are not part of the upsert's update: a reseed must not
+// undo what the owner set in Admin. The seed and Admin set them here.
+func (q *Queries) SetEndpointRouting(ctx context.Context, arg SetEndpointRoutingParams) error {
+	_, err := q.db.Exec(ctx, setEndpointRouting, arg.ID, arg.Tier, arg.Routable)
+	return err
+}
+
 const sumUsageForAPIKeySince = `-- name: SumUsageForAPIKeySince :one
 SELECT COALESCE(SUM(cost_usd), 0)::numeric AS cost_usd FROM usage_ledger WHERE api_key_id = $1 AND created_at >= $2 AND NOT own_key
 `
@@ -670,6 +753,33 @@ func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (Bud
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const upsertBudgetWarning = `-- name: UpsertBudgetWarning :exec
+INSERT INTO budget_warnings (scope, scope_id, period, pct, spent_usd, limit_usd, sent_at)
+VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (scope, scope_id, period, pct) DO UPDATE SET spent_usd = EXCLUDED.spent_usd, limit_usd = EXCLUDED.limit_usd, sent_at = now()
+`
+
+type UpsertBudgetWarningParams struct {
+	Scope    string        `json:"scope"`
+	ScopeID  uuid.NullUUID `json:"scope_id"`
+	Period   string        `json:"period"`
+	Pct      int32         `json:"pct"`
+	SpentUsd float64       `json:"spent_usd"`
+	LimitUsd float64       `json:"limit_usd"`
+}
+
+func (q *Queries) UpsertBudgetWarning(ctx context.Context, arg UpsertBudgetWarningParams) error {
+	_, err := q.db.Exec(ctx, upsertBudgetWarning,
+		arg.Scope,
+		arg.ScopeID,
+		arg.Period,
+		arg.Pct,
+		arg.SpentUsd,
+		arg.LimitUsd,
+	)
+	return err
 }
 
 const upsertEndpoint = `-- name: UpsertEndpoint :exec
@@ -800,6 +910,37 @@ func (q *Queries) UpsertRoutingPolicy(ctx context.Context, arg UpsertRoutingPoli
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const usageByAgentSince = `-- name: UsageByAgentSince :many
+SELECT agent_id, count(*) AS calls, SUM(cost_usd)::numeric AS cost_usd
+FROM usage_ledger WHERE created_at >= $1 AND agent_id IS NOT NULL AND NOT own_key GROUP BY agent_id ORDER BY cost_usd DESC
+`
+
+type UsageByAgentSinceRow struct {
+	AgentID uuid.NullUUID `json:"agent_id"`
+	Calls   int64         `json:"calls"`
+	CostUsd float64       `json:"cost_usd"`
+}
+
+func (q *Queries) UsageByAgentSince(ctx context.Context, createdAt time.Time) ([]UsageByAgentSinceRow, error) {
+	rows, err := q.db.Query(ctx, usageByAgentSince, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UsageByAgentSinceRow{}
+	for rows.Next() {
+		var i UsageByAgentSinceRow
+		if err := rows.Scan(&i.AgentID, &i.Calls, &i.CostUsd); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const usageByEndpointSince = `-- name: UsageByEndpointSince :many

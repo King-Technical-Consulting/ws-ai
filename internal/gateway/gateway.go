@@ -52,6 +52,9 @@ type Gateway struct {
 	// Keys says which hosted providers a user may use and with whose key
 	// (keys.go). nil leaves every provider open to every request.
 	Keys KeySource
+	// verdicts, when set, reads each auto chat turn before routing
+	// (verdict.go); nil leaves routing as it was.
+	verdicts *Verdicter
 }
 
 // New builds a gateway.
@@ -108,12 +111,43 @@ func (g *Gateway) Prepare(ctx context.Context, req *Request) ([]Candidate, Decis
 			return nil, Decision{}, err
 		}
 	}
+	// An LLM verdict for an auto turn (verdict.go). verdictClass and
+	// verdictSource go onto the decision whatever happens next.
+	orig := in
+	var verdictClass, verdictSource, chosenID string
+	if g.verdicts != nil && in.Selector == "auto" {
+		start := time.Now()
+		_, rule := PreferredBy(g.Router.Policies(), in, nil)
+		verdict, src := g.verdicts.Decide(ctx, req, in, rule)
+		verdictSource = src
+		if verdict != nil {
+			verdict.Apply(&in)
+			verdictClass = verdict.Class
+		}
+		defer func() {
+			if verdictSource != "skipped:recursion" && verdictSource != "skipped:class" {
+				logVerdict(g.Log, verdictClass, verdictSource, chosenID, time.Since(start).Milliseconds(), req.Metadata.ConversationID)
+			}
+		}()
+	}
 	cands, dec, err := g.Router.Route(in)
+	if err != nil && verdictClass != "" {
+		// The verdict's floor or needs left nothing: route as if there had
+		// been no verdict, but keep a sensitive verdict's local-only.
+		retry := orig
+		retry.ForceLocal = in.ForceLocal
+		cands, dec, err = g.Router.Route(retry)
+		verdictClass, verdictSource = "", "fallthrough:no-route"
+	}
+	dec.Verdict, dec.VerdictSource = verdictClass, verdictSource
 	if err != nil {
 		g.record(ctx, UsageRecord{Metadata: req.Metadata, Decision: dec, Err: err.Error()})
 		return nil, dec, fmt.Errorf("%w: %w", ErrNoRoute, err)
 	}
 	cands = in.Keys.credit(cands)
+	if len(cands) > 0 {
+		chosenID = cands[0].Endpoint.ID
+	}
 	if len(cands) == 0 {
 		err := fmt.Errorf("%w: %v", ErrNoRoute, ErrNeedsOwnKey)
 		g.record(ctx, UsageRecord{Metadata: req.Metadata, Decision: dec, Err: err.Error()})
@@ -163,7 +197,13 @@ func (g *Gateway) run(ctx context.Context, req *Request, cands []Candidate, dec 
 			}
 			release = r
 		}
-		ch, err := ad.Stream(ctx, c.Provider, c.Endpoint, req)
+		sreq := req
+		if c.Endpoint.DefaultSystem != "" && req.System == "" {
+			cp := *req
+			cp.System = c.Endpoint.DefaultSystem
+			sreq = &cp
+		}
+		ch, err := ad.Stream(ctx, c.Provider, c.Endpoint, sreq)
 		if err != nil {
 			release()
 			lastErr = err

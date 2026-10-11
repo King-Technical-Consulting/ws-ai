@@ -1,9 +1,13 @@
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, type ModelsResponse } from '../api'
 import { registerPasskey } from '../lib/passkey'
-import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm } from '../components/ui'
+import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm, SectionNav, useSectionHash } from '../components/ui'
 import { useMe } from '../App'
+import ArchiveSection from '../components/ArchiveSection'
+import { homeNetworkHints } from '../lib/homeNetwork'
+import { stepUpNote } from '../components/LocalityBadge'
 
 type Passkey = { id: string; name: string; created_at: string; last_used_at: string | null }
 type ProviderKey = { provider: string; name: string; has_key: boolean; last4?: string; updated_at?: string }
@@ -61,7 +65,55 @@ function loadWsjURL(fallback: string) {
   }
 }
 
+const GROUPS = [
+  { id: 'profile', label: 'Profile' },
+  { id: 'provider-keys', label: 'Provider keys' },
+  { id: 'training', label: 'Training' },
+  { id: 'archive', label: 'Archive' },
+  { id: 'api-keys', label: 'API keys' },
+] as const
+
+/** The address ws judges this request by, the listener it came in on and home or away: what to copy into WS_HOME_NETWORKS. */
+function WhereWsSeesYou() {
+  const me = useMe()
+  const loc = me.data?.locality
+  if (!loc) return null
+  const owner = me.data?.role === 'owner'
+  const hints = homeNetworkHints(loc.address)
+  return (
+    <section className="space-y-3">
+      <SectionHead>where ws sees you</SectionHead>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+        <dt className="meta">address</dt>
+        <dd className="font-mono text-xs break-all">{loc.address || 'none'}</dd>
+        <dt className="meta">came in on</dt>
+        <dd>{loc.listener === 'tunnel' ? 'the tunnel listener' : 'the main listener'}</dd>
+        <dt className="meta">counted as</dt>
+        <dd>{loc.configured ? loc.locality : 'home (WS_HOME_NETWORKS is not set)'}</dd>
+        <dt className="meta">because</dt>
+        <dd className="text-fg-2">{loc.reason}</dd>
+        {loc.configured && (
+          <>
+            <dt className="meta">sensitive actions</dt>
+            <dd className="text-fg-2">
+              {loc.locality === 'home' ? 'no passkey confirmation needed from here' : stepUpNote(loc, me.data?.step_up_until, me.data?.has_passkey)}
+              {loc.locality === 'away' && me.data?.step_up_window_seconds ? ` (a confirmation lasts ${Math.round(me.data.step_up_window_seconds / 60)} minutes)` : ''}
+            </dd>
+          </>
+        )}
+      </dl>
+      {owner && !loc.configured && hints.length > 0 && (
+        <p className="meta">
+          To have ws tell home from away, set <code className="font-mono text-xs">WS_HOME_NETWORKS</code> to the networks you use at home, for example{' '}
+          <code className="font-mono text-xs">{hints[hints.length - 1]}</code>. Open this page from each place first and use what it shows.
+        </p>
+      )}
+    </section>
+  )
+}
+
 export default function Settings() {
+  const [group, setGroup] = useSectionHash(GROUPS.map((g) => g.id))
   const qc = useQueryClient()
   const passkeys = useQuery({ queryKey: ['passkeys'], queryFn: () => api.get<Passkey[]>('/api/auth/passkeys') })
   const keys = useQuery({ queryKey: ['keys'], queryFn: () => api.get<Key[]>('/api/keys') })
@@ -169,9 +221,16 @@ export default function Settings() {
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto max-w-2xl p-6 space-y-10">
+      <div className="mx-auto max-w-4xl p-6 space-y-6">
         <PageTitle>Settings</PageTitle>
+        <div className="flex flex-col gap-6 md:flex-row md:gap-10">
+        <SectionNav label="Settings sections" items={GROUPS} value={group} onChange={(g) => { setErr(null); setGroup(g) }} />
+        <div className="min-w-0 flex-1 space-y-10">
+        {/* Above every group: a failed passkey or provider-key action (a step-up refusal, say) must show where it was tried. */}
+        {err && <Callout kind="error">{err}</Callout>}
 
+        {group === 'profile' && (
+          <>
         <section className="space-y-3">
           <SectionHead>profile</SectionHead>
           <p className="text-sm text-fg-2">
@@ -197,6 +256,8 @@ export default function Settings() {
           </form>
         </section>
 
+        <WhereWsSeesYou />
+
         <section className="space-y-3">
           <SectionHead>passkeys</SectionHead>
           <p className="text-sm text-fg-2">Sign in without email. Add one per device.</p>
@@ -210,6 +271,17 @@ export default function Settings() {
           <button onClick={() => addPasskey.mutate()} className={btn.primarySm}>Add passkey for this device</button>
         </section>
 
+        <section className="space-y-3">
+          <SectionHead>memory</SectionHead>
+          <p className="meta">What ws keeps about you between chats, and the card it reads first.</p>
+          {/* A button-sized link: the phone layout needs every target finger sized (e2e/tests/mobile.spec.ts). */}
+          <Link to="/memory" className={btn.secondarySm}>Memory</Link>
+        </section>
+          </>
+        )}
+
+        {group === 'provider-keys' && (
+          <>
         <section className="space-y-3">
           <SectionHead>provider keys</SectionHead>
           <p className="text-sm text-fg-2">
@@ -245,6 +317,11 @@ export default function Settings() {
           </ListGroup>
         </section>
 
+          </>
+        )}
+
+        {group === 'training' && (
+          <>
         <section className="space-y-3">
           <SectionHead>training</SectionHead>
           <p className="text-sm text-fg-2">
@@ -255,6 +332,17 @@ export default function Settings() {
           </label>
         </section>
 
+          </>
+        )}
+
+        {group === 'archive' && (
+          <>
+            <ArchiveSection />
+          </>
+        )}
+
+        {group === 'api-keys' && (
+          <>
         <section className="space-y-3">
           <SectionHead>api keys</SectionHead>
           <p className="text-sm text-fg-2">
@@ -329,8 +417,11 @@ export default function Settings() {
             </label>
           )}
           <p className="text-xs text-fg-3">A key reaches only what its boxes say: /v1 always, and never the rest of this app, which takes your sign-in.</p>
-          {err && <Callout kind="error">{err}</Callout>}
         </section>
+          </>
+        )}
+        </div>
+        </div>
       </div>
     </div>
   )

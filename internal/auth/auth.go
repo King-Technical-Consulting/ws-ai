@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"slices"
@@ -325,6 +326,10 @@ type Principal struct {
 	// Scopes are the API key's scopes (ScopeChat, ScopeMCP); empty for a
 	// browser session, which may do anything its user may.
 	Scopes []string
+	// SteppedUpAt is when a passkey assertion was last made on this browser
+	// session (nil: never). A sensitive action from away needs it within
+	// the step-up window (internal/httpx/stepup.go). Always nil for a key.
+	SteppedUpAt *time.Time
 }
 
 // API key scopes. A key is minted with chat by default; the others are
@@ -361,8 +366,16 @@ func (p *Principal) HasScope(scope string) bool {
 }
 
 // CreateSession issues a session and sets the cookie.
-func (s *Service) CreateSession(ctx context.Context, w http.ResponseWriter, r *http.Request, userID uuid.UUID) error {
+//
+// steppedUp says a passkey assertion has just been made (a passkey login), so the
+// session starts inside the step-up window; every other way in starts outside it.
+func (s *Service) CreateSession(ctx context.Context, w http.ResponseWriter, r *http.Request, userID uuid.UUID, steppedUp bool) error {
 	raw, hash := newToken()
+	var steppedAt *time.Time
+	if steppedUp {
+		now := time.Now()
+		steppedAt = &now
+	}
 	var ip *netip.Prefix
 	if host := clientIP(r); host != "" {
 		if addr, err := netip.ParseAddr(host); err == nil {
@@ -372,7 +385,7 @@ func (s *Service) CreateSession(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	_, err := s.db.CreateSession(ctx, store.CreateSessionParams{
 		UserID: userID, TokenHash: hash, ExpiresAt: time.Now().Add(SessionTTL),
-		UserAgent: r.UserAgent(), Ip: ip,
+		UserAgent: r.UserAgent(), Ip: ip, SteppedUpAt: steppedAt,
 	})
 	if err != nil {
 		return err
@@ -400,7 +413,7 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*Principal
 	if err != nil {
 		return nil, ErrUnauthorized
 	}
-	return &Principal{UserID: row.UserID, Email: row.Email, DisplayName: row.DisplayName, Role: row.Role, SessionID: row.ID}, nil
+	return &Principal{UserID: row.UserID, Email: row.Email, DisplayName: row.DisplayName, Role: row.Role, SessionID: row.ID, SteppedUpAt: row.SteppedUpAt}, nil
 }
 
 func (s *Service) authenticateAPIKey(ctx context.Context, raw string) (*Principal, error) {
@@ -643,16 +656,96 @@ func (s *Service) loadCeremony(ctx context.Context, id uuid.UUID, kind string) (
 	return &sd, row.UserID.UUID, nil
 }
 
+// clientIP is the address recorded on a session. It is r.RemoteAddr and
+// nothing else: the server has already replaced that with the forwarded
+// client when, and only when, the TCP peer is a trusted proxy
+// (WS_TRUSTED_PROXIES) or the tunnel listener's CF-Connecting-IP. It used to
+// believe X-Forwarded-For and CF-Connecting-IP from any caller, so anyone
+// could choose the address a session was recorded under.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.TrimSpace(strings.Split(xff, ",")[0])
-	}
-	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-		return cf
-	}
 	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i > 0 {
-		host = host[:i]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 	return strings.Trim(host, "[]")
+}
+
+// ---- step-up (PLAN M5) ----
+
+// ErrNoPasskey is returned by BeginStepUp for a user with no passkey: the
+// step-up needs one, so the caller refuses with step_up_unavailable.
+var ErrNoPasskey = errors.New("auth: no passkey to step up with")
+
+// HasPasskeys reports whether the user has at least one passkey.
+func (s *Service) HasPasskeys(ctx context.Context, userID uuid.UUID) bool {
+	if s.wa == nil {
+		return false
+	}
+	n, err := s.db.CountPasskeysByUser(ctx, userID)
+	return err == nil && n > 0
+}
+
+// BeginStepUp starts an assertion ceremony limited to the signed-in user's
+// own passkeys, with user verification required (a tap alone is not enough:
+// the authenticator must check the person).
+func (s *Service) BeginStepUp(ctx context.Context, userID uuid.UUID) (json.RawMessage, uuid.UUID, error) {
+	if s.wa == nil {
+		return nil, uuid.Nil, ErrPasskeysUnavailable
+	}
+	u, err := s.db.GetUserByID(ctx, userID)
+	if err != nil || u.DisabledAt != nil {
+		return nil, uuid.Nil, ErrUnauthorized
+	}
+	wu, err := s.loadWAUser(ctx, u)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	if len(wu.creds) == 0 {
+		return nil, uuid.Nil, ErrNoPasskey
+	}
+	opts, sd, err := s.wa.BeginLogin(wu, webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	cid, err := s.saveCeremony(ctx, &u.ID, "stepup", sd)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	b, _ := json.Marshal(opts)
+	return b, cid, nil
+}
+
+// FinishStepUp validates the assertion and marks the session. The ceremony
+// must have been started by the same user, the assertion must be made with
+// one of that user's passkeys, and a ceremony is single use.
+func (s *Service) FinishStepUp(ctx context.Context, ceremonyID, sessionID, userID uuid.UUID, r *http.Request) (time.Time, error) {
+	if s.wa == nil {
+		return time.Time{}, ErrPasskeysUnavailable
+	}
+	sd, owner, err := s.loadCeremony(ctx, ceremonyID, "stepup")
+	if err != nil {
+		return time.Time{}, err
+	}
+	if owner != userID {
+		return time.Time{}, ErrInvalidToken // another person's ceremony
+	}
+	u, err := s.db.GetUserByID(ctx, userID)
+	if err != nil || u.DisabledAt != nil {
+		return time.Time{}, ErrUnauthorized
+	}
+	wu, err := s.loadWAUser(ctx, u)
+	if err != nil {
+		return time.Time{}, err
+	}
+	cred, err := s.wa.FinishLogin(wu, *sd, r)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("auth: finish step-up: %w", err)
+	}
+	if pk, err := s.db.GetPasskeyByCredentialID(ctx, cred.ID); err == nil {
+		_ = s.db.UpdatePasskeyAfterLogin(ctx, store.UpdatePasskeyAfterLoginParams{ID: pk.ID, SignCount: int64(cred.Authenticator.SignCount), BackupState: cred.Flags.BackupState})
+	}
+	if err := s.db.MarkSessionSteppedUp(ctx, sessionID); err != nil {
+		return time.Time{}, err
+	}
+	return time.Now(), nil
 }

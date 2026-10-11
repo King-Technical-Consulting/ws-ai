@@ -15,6 +15,30 @@ import (
 	"github.com/jking323/ws/internal/store"
 )
 
+// SmokeEvalExamples is the held-out size under which an eval is a smoke
+// result, not a measurement: at N examples one example moves a score by
+// 100/N points, so a gap of ten points needs about fifty to mean anything.
+// The gate's rule does not change; its message and the Training page say so.
+const SmokeEvalExamples = 30
+
+// smokeNote is the sentence appended to a gate message or confirmation when
+// the verdict rests on fewer than SmokeEvalExamples examples; "" otherwise.
+func smokeNote(examples int) string {
+	if examples >= SmokeEvalExamples {
+		return ""
+	}
+	return fmt.Sprintf(" This is a smoke result: the eval had only %d held-out examples, and one example moves the score by %.0f points.", examples, 100/float64(max(examples, 1)))
+}
+
+// evalExamples is how many held-out examples an adapter's stored eval scored.
+func evalExamples(raw []byte) int {
+	var r struct {
+		Examples int `json:"examples"`
+	}
+	_ = json.Unmarshal(raw, &r)
+	return r.Examples
+}
+
 // EvalResult is what an eval stores on the adapter.
 type EvalResult struct {
 	Examples      int       `json:"examples"`
@@ -28,37 +52,58 @@ type EvalResult struct {
 	At            time.Time `json:"at"`
 }
 
-// Evaluate is the training.eval job: it runs the dataset's held-out
-// examples through the adapter's endpoint and through its base, has a
-// judge model score each answer against the reference, and stores both
-// means on the adapter. The adapter's endpoint must be reachable: load
-// the adapter on the server first (see the adapter's download) and
-// enable or promote-by-force its endpoint for the run.
-func (s *Service) Evaluate(ctx context.Context, adapterID uuid.UUID) error {
+// CheckEvaluate reports why an evaluation of the adapter cannot run, with the same errors
+// Evaluate returns for it (ErrNotFound, ErrInvalid, ErrNotReady), or nil when it can.
+func (s *Service) CheckEvaluate(ctx context.Context, adapterID uuid.UUID) error {
+	_, _, err := s.evalInputs(ctx, adapterID)
+	return err
+}
+
+// QueueEval is what the evaluate button calls: the checks above first, so a click that cannot
+// work fails at once with the reason, then the job. An evaluation of the adapter that is already
+// queued or running is ErrNotReady with that said, not a second 202.
+func (s *Service) QueueEval(ctx context.Context, adapterID uuid.UUID) error {
+	if err := s.CheckEvaluate(ctx, adapterID); err != nil {
+		return err
+	}
+	queued, err := s.EnqueueEval(ctx, adapterID)
+	if err != nil {
+		return err
+	}
+	if !queued {
+		return fmt.Errorf("%w: an evaluation of this adapter is already queued or running", ErrNotReady)
+	}
+	return nil
+}
+
+// evalInputs is every check Evaluate makes before it spends a model call, and the examples it
+// then judges. The HTTP handler runs it too, so a click that cannot work fails at once with the
+// message the worker would have given, instead of a discarded job nobody sees.
+func (s *Service) evalInputs(ctx context.Context, adapterID uuid.UUID) (store.Adapter, []Example, error) {
 	ad, err := s.DB.GetAdapter(ctx, adapterID)
 	if err != nil {
-		return ErrNotFound
+		return store.Adapter{}, nil, ErrNotFound
 	}
 	if ad.EndpointID == nil || ad.BaseEndpointID == nil {
-		return fmt.Errorf("%w: the adapter needs an endpoint and a base endpoint", ErrInvalid)
+		return store.Adapter{}, nil, fmt.Errorf("%w: the adapter needs an endpoint and a base endpoint", ErrInvalid)
 	}
 	if s.GW == nil {
-		return errors.New("training: no gateway")
+		return store.Adapter{}, nil, errors.New("training: no gateway")
 	}
 	if !ad.FinetuneJobID.Valid {
-		return fmt.Errorf("%w: the adapter has no job, so no held-out set", ErrInvalid)
+		return store.Adapter{}, nil, fmt.Errorf("%w: the adapter has no job, so no held-out set", ErrInvalid)
 	}
 	job, err := s.DB.GetFinetuneJob(ctx, ad.FinetuneJobID.UUID)
 	if err != nil || !job.DatasetID.Valid {
-		return fmt.Errorf("%w: the adapter's dataset is gone", ErrInvalid)
+		return store.Adapter{}, nil, fmt.Errorf("%w: the adapter's dataset is gone", ErrInvalid)
 	}
 	raw, err := s.DatasetFile(ctx, job.DatasetID.UUID, true)
 	if err != nil {
-		return fmt.Errorf("%w: the dataset has no held-out examples (holdout_pct was 0 or nothing landed there)", ErrNotReady)
+		return store.Adapter{}, nil, fmt.Errorf("%w: the dataset has no held-out examples (holdout_pct was 0 or nothing landed there)", ErrNotReady)
 	}
 	examples, err := ParseJSONL(raw)
 	if err != nil {
-		return err
+		return store.Adapter{}, nil, err
 	}
 	limit := s.EvalLimit
 	if limit <= 0 {
@@ -68,7 +113,21 @@ func (s *Service) Evaluate(ctx context.Context, adapterID uuid.UUID) error {
 		examples = examples[:limit]
 	}
 	if len(examples) == 0 {
-		return fmt.Errorf("%w: the held-out set is empty", ErrNotReady)
+		return store.Adapter{}, nil, fmt.Errorf("%w: the held-out set is empty", ErrNotReady)
+	}
+	return ad, examples, nil
+}
+
+// Evaluate is the training.eval job: it runs the dataset's held-out
+// examples through the adapter's endpoint and through its base, has a
+// judge model score each answer against the reference, and stores both
+// means on the adapter. The adapter's endpoint must be reachable: load
+// the adapter on the server first (see the adapter's download) and
+// enable or promote-by-force its endpoint for the run.
+func (s *Service) Evaluate(ctx context.Context, adapterID uuid.UUID) error {
+	ad, examples, err := s.evalInputs(ctx, adapterID)
+	if err != nil {
+		return err
 	}
 	res := EvalResult{Examples: len(examples), Judge: s.judgeSelector(), At: s.now()}
 	var aSum, bSum float64
@@ -78,8 +137,11 @@ func (s *Service) Evaluate(ctx context.Context, adapterID uuid.UUID) error {
 			res.Examples--
 			continue
 		}
-		aText, aErr := s.answer(ctx, *ad.EndpointID, prompt)
-		bText, bErr := s.answer(ctx, *ad.BaseEndpointID, prompt)
+		// A recipe adapter is judged under the prompt it was trained with, and
+		// its base gets the same prompt: the question is whether fine-tuning
+		// beats prompting the base, not whether it beats an unprompted one.
+		aText, aErr := s.answer(ctx, *ad.EndpointID, ad.SystemPrompt, prompt)
+		bText, bErr := s.answer(ctx, *ad.BaseEndpointID, ad.SystemPrompt, prompt)
 		if aErr != nil || bErr != nil {
 			res.Examples--
 			msg := fmt.Sprintf("example %d:", i)
@@ -94,11 +156,11 @@ func (s *Service) Evaluate(ctx context.Context, adapterID uuid.UUID) error {
 			}
 			continue
 		}
-		aScore, err := s.judge(ctx, prompt, reference, aText)
+		aScore, err := s.judge(ctx, ad.Rubric, prompt, reference, aText)
 		if err != nil {
 			return fmt.Errorf("judge: %w", err)
 		}
-		bScore, err := s.judge(ctx, prompt, reference, bText)
+		bScore, err := s.judge(ctx, ad.Rubric, prompt, reference, bText)
 		if err != nil {
 			return fmt.Errorf("judge: %w", err)
 		}
@@ -176,10 +238,10 @@ func split(ex Example) ([]gateway.Message, string) {
 	return msgs, ex.Messages[n-1].Content
 }
 
-func (s *Service) answer(ctx context.Context, endpoint string, prompt []gateway.Message) (string, error) {
+func (s *Service) answer(ctx context.Context, endpoint, system string, prompt []gateway.Message) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	res, err := s.GW.Complete(cctx, &gateway.Request{Model: endpoint, Messages: prompt, MaxTokens: 2048, Metadata: gateway.Metadata{TaskClass: gateway.TaskChat}})
+	res, err := s.GW.Complete(cctx, &gateway.Request{Model: endpoint, System: system, Messages: prompt, MaxTokens: 2048, Metadata: gateway.Metadata{TaskClass: gateway.TaskChat}})
 	if err != nil {
 		return "", err
 	}
@@ -189,29 +251,53 @@ func (s *Service) answer(ctx context.Context, endpoint string, prompt []gateway.
 const judgeSystem = `You grade an answer to a conversation against a reference answer a person approved. Score the candidate from 0 to 10: 10 means as good as or better than the reference in correctness, completeness and tone; 5 means half right or half done; 0 means wrong, empty or harmful. Judge the content, not the length. Reply with JSON only: {"score": <number>, "reason": "<one sentence>"}.`
 
 // judge asks the judge model for a 0..10 score and returns it as 0..1.
-func (s *Service) judge(ctx context.Context, prompt []gateway.Message, reference, candidate string) (float64, error) {
+func (s *Service) judge(ctx context.Context, rubric string, prompt []gateway.Message, reference, candidate string) (float64, error) {
 	var conv strings.Builder
 	for _, m := range prompt {
 		conv.WriteString(strings.ToUpper(string(m.Role)) + ": " + clip(m.Parts[0].Text, 4000) + "\n\n")
 	}
 	user := fmt.Sprintf("Conversation:\n%s\nReference answer:\n%s\n\nCandidate answer:\n%s\n\nScore the candidate.", conv.String(), clip(reference, 6000), clip(candidate, 6000))
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	res, err := s.GW.Complete(cctx, &gateway.Request{
-		Model: s.judgeSelector(), System: judgeSystem,
-		Messages:  []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart(user)}}},
-		MaxTokens: 200, JSON: &gateway.JSONFormat{Name: "score"},
-		Metadata: gateway.Metadata{TaskClass: gateway.TaskClassify},
-	})
-	if err != nil {
-		return 0, err
+	// A judge that thinks before it answers (gpt-oss, the default under the
+	// classify class) can spend a small budget on its reasoning and return
+	// nothing, or a reply cut off in the middle (`{"score":`), so the first
+	// try has room and a reply that ran out of tokens gets one more try with
+	// a lot.
+	var last *gateway.Response
+	for _, budget := range []int{judgeTokens, judgeTokens * 3} {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		res, err := s.GW.Complete(cctx, &gateway.Request{
+			Model: s.judgeSelector(), System: judgeSystemFor(rubric),
+			Messages:  []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart(user)}}},
+			MaxTokens: budget, JSON: &gateway.JSONFormat{Name: "score"},
+			Metadata: gateway.Metadata{TaskClass: gateway.TaskClassify},
+		})
+		cancel()
+		if err != nil {
+			return 0, err
+		}
+		last = res
+		if score, ok := ParseScore(res.Text()); ok {
+			return score / 10, nil
+		}
+		if strings.TrimSpace(res.Text()) != "" && res.FinishReason != gateway.FinishLength {
+			break // an answer that is not a score: more room will not fix it
+		}
 	}
-	score, ok := ParseScore(res.Text())
-	if !ok {
-		return 0, fmt.Errorf("the judge returned no score: %q", clip(res.Text(), 200))
-	}
-	return score / 10, nil
+	return 0, fmt.Errorf("the judge returned no score (finish: %s): %q", last.FinishReason, clip(last.Text(), 200))
 }
+
+// judgeSystemFor adds a recipe's rubric to the judge's instructions: what
+// the person said a good answer is, beyond matching the reference.
+func judgeSystemFor(rubric string) string {
+	rubric = strings.TrimSpace(rubric)
+	if rubric == "" {
+		return judgeSystem
+	}
+	return judgeSystem + "\n\nThe person who set this task wrote how to grade it. Follow it where it speaks, and use the reference answer as an example of a good one:\n" + clip(rubric, 6000)
+}
+
+// judgeTokens is the judge's first token budget, reasoning included.
+const judgeTokens = 1500
 
 // ParseScore reads {"score": n} out of a judge reply, tolerating prose
 // and fences around it; the score is clamped to 0..10.

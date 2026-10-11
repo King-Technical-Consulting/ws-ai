@@ -38,3 +38,17 @@ func TestUserFacing(t *testing.T) {
 		t.Errorf("message leaks server detail: %q", got)
 	}
 }
+
+func TestRunCapReached(t *testing.T) {
+	cases := []struct {
+		spent, capUSD float64
+		want          bool
+	}{
+		{0, 0, false}, {5, 0, false}, {0.5, 1, false}, {1, 1, true}, {1.2, 1, true}, {3, -1, false},
+	}
+	for _, c := range cases {
+		if got := runCapReached(c.spent, c.capUSD); got != c.want {
+			t.Errorf("runCapReached(%v, %v) = %v, want %v", c.spent, c.capUSD, got, c.want)
+		}
+	}
+}

@@ -1,8 +1,12 @@
 import { useRef, useState } from 'react'
 import { Link } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type Agent, type AgentInput, type AgentPreset, type ModelsResponse, type Project, type SkillImport } from '../api'
+import { api, type Agent, type AgentInput, type AgentPreset, type ModelsResponse, type Project, type SkillFolderImport, type SkillImport } from '../api'
 import { SectionHead, PageTitle, Callout, ListGroup, btn, inputSm } from '../components/ui'
+import { SkillFolderReview } from '../components/SkillFolderReview'
+import SkillShelf from '../components/SkillShelf'
+
+export { SkillFolderReview }
 
 /**
  * Agents (PLAN M7): the list of long-lived agents and the form that makes
@@ -73,6 +77,8 @@ export default function Agents() {
             ))}
           </ListGroup>
         </section>
+
+        <SkillShelf />
       </div>
     </div>
   )
@@ -129,6 +135,7 @@ export function AgentForm({
   const [allow, setAllow] = useState((initial?.tool_allowlist ?? []).join(', '))
   const [policies, setPolicies] = useState(JSON.stringify(initial?.tool_policies ?? {}, null, 0))
   const [maxSteps, setMaxSteps] = useState(initial?.max_steps ?? 50)
+  const [maxRunUsd, setMaxRunUsd] = useState(initial?.max_run_usd ?? 0)
   const [localError, setLocalError] = useState('')
   const [preset, setPreset] = useState('')
   const picked = presets.find((p) => p.name === preset)
@@ -136,6 +143,7 @@ export function AgentForm({
   const [imported, setImported] = useState<SkillImport | null>(null)
   const [importError, setImportError] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
+  const [folder, setFolder] = useState<SkillFolderImport | null>(null)
 
   // A preset is copied into the form once, when picked; nothing links the
   // agent back to it, so later edits to either never touch the other.
@@ -172,6 +180,29 @@ export function AgentForm({
     }
   }
 
+  // A skill folder (a zip): the same preview plus an inventory of every
+  // other file with its findings. Nothing in it is run, stored or granted.
+  const importFolder = async (file: File | undefined) => {
+    setImportError('')
+    setImported(null)
+    setFolder(null)
+    if (!file) return
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch('/api/agents/presets/import-folder', { method: 'POST', body: fd, credentials: 'same-origin' })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((body as { error?: string }).error ?? 'Could not read that archive.')
+      const out = body as SkillFolderImport
+      setFolder(out)
+      setImported(out.skill)
+      setPreset('')
+      copyPreset(out.skill.preset)
+    } catch (e) {
+      setImportError((e as Error).message)
+    }
+  }
+
   // A preset is copied into the form once, when picked; nothing links the
   // agent back to it, so later edits to either never touch the other.
   const applyPreset = (id: string) => {
@@ -200,6 +231,7 @@ export function AgentForm({
       tool_allowlist: parseAllow(allow),
       tool_policies: tp,
       max_steps: maxSteps,
+      max_run_usd: maxRunUsd,
       enabled: initial?.enabled,
     })
   }
@@ -221,9 +253,13 @@ export function AgentForm({
             <button type="button" onClick={() => fileRef.current?.click()} className={btn.secondarySm}>
               Import a skill file…
             </button>
+            <button type="button" onClick={() => fileRef.current?.click()} className={btn.secondarySm}>
+              Import a skill folder (.zip)…
+            </button>
           </div>
           {picked && <span className="meta block">{picked.description}{picked.note ? ` ${picked.note}` : ''}</span>}
           {importError && <Callout kind="error">{importError}</Callout>}
+          {folder && <SkillFolderReview folder={folder} />}
           {imported && (
             <Callout kind="note">
               <p>Imported "{imported.preset.title}". Read the prompt below before you save the agent.</p>
@@ -292,6 +328,10 @@ export function AgentForm({
           <span className="text-xs text-fg-2">Max steps per run</span>
           <input type="number" min={1} max={500} value={maxSteps} onChange={(e) => setMaxSteps(Number(e.target.value))} className={inputSm} />
         </label>
+        <label className="block space-y-1">
+          <span className="text-xs text-fg-2">Cap per run in dollars (0 is none)</span>
+          <input type="number" min={0} max={10000} step={0.5} value={maxRunUsd} onChange={(e) => setMaxRunUsd(Number(e.target.value))} className={inputSm} aria-label="Cap per run in dollars" />
+        </label>
       </div>
       <label className="flex items-center gap-2 text-xs text-fg-2">
         <input type="checkbox" className="accent-accent" checked={reasoning} onChange={(e) => setReasoning(e.target.checked)} /> extended reasoning
@@ -307,9 +347,11 @@ export function AgentForm({
       </label>
       {(localError || error) && <Callout kind="error">{localError || error?.message}</Callout>}
       {!initial && (
+        <>
         // Last in the form on purpose: hidden, reached through the chip above, and
         // after every field so positional selectors keep their meaning.
-        <input ref={fileRef} type="file" accept=".md,text/markdown,text/plain" aria-label="Skill file" onChange={(e) => { importSkill(e.target.files?.[0]); e.target.value = '' }} className="hidden" />
+        <input ref={fileRef} type="file" accept=".md,text/markdown,text/plain,.zip,application/zip" aria-label="Skill file" onChange={(e) => { const f = e.target.files?.[0]; if (f && /\.zip$/i.test(f.name)) void importFolder(f); else importSkill(f); e.target.value = '' }} className="hidden" />
+        </>
       )}
       <div className="flex gap-2">
         <button type="submit" disabled={pending || !name.trim() || !projectID} className={btn.primarySm}>

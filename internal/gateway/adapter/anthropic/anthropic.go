@@ -314,7 +314,7 @@ func buildMessages(in []gateway.Message) ([]sdk.MessageParam, error) {
 			role = gateway.RoleUser
 		}
 		var blocks []sdk.ContentBlockParamUnion
-		for _, p := range m.Parts {
+		for _, p := range gateway.ResolveAlt(m.Parts, true) {
 			b, err := buildBlock(p)
 			if err != nil {
 				return nil, err

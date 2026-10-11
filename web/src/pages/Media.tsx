@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import clsx from 'clsx'
 import { api, type Attachment, type Conversation, type MediaJob, type MediaModel, type ModelsResponse, type Project } from '../api'
-import { SectionHead, PageTitle, Callout, btn, inputSm } from '../components/ui'
+import { SectionHead, PageTitle, Callout, StarButton, btn, inputSm } from '../components/ui'
+import { useFavorites } from '../lib/favorites'
 
 type Kind = 'image' | 'video'
 
@@ -16,6 +17,7 @@ type Kind = 'image' | 'video'
  * mid-job is fine.
  */
 export default function Media() {
+  const fav = useFavorites()
   const qc = useQueryClient()
   const projects = useQuery({ queryKey: ['projects'], queryFn: () => api.get<Project[]>('/api/projects') })
   const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelsResponse>('/api/models') })
@@ -335,6 +337,8 @@ export default function Media() {
                 onChat={(a) => useInChat.mutate({ att: a })}
                 onDesign={(a) => useInChat.mutate({ att: a, mode: 'design' })}
                 onRemove={() => remove.mutate(j.id)}
+                starred={fav.isStarred('media', j.id)}
+                onStar={() => fav.toggle('media', j.id)}
               />
             ))}
           </div>
@@ -376,7 +380,11 @@ function JobCard({
   onChat,
   onDesign,
   onRemove,
+  starred,
+  onStar,
 }: {
+  starred: boolean
+  onStar: () => void
   job: MediaJob
   models: MediaModel[]
   canEdit: boolean
@@ -430,6 +438,7 @@ function JobCard({
             {` · ${ago(job.created_at)}`}
           </span>
           <span className="flex items-center gap-3 shrink-0">
+            {job.status === 'done' && <StarButton starred={starred} onToggle={onStar} label="Favorite this item" />}
             {!video && job.status === 'done' && job.outputs[0] && canEdit && (
               <button onClick={() => onSource(job.outputs[0], 'image')} className="text-xs text-fg-2 hover:text-fg">
                 edit

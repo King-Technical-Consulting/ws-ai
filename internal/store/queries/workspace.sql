@@ -28,15 +28,29 @@ INSERT INTO conversations (project_id, user_id, title, mode, model_selector, set
 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
 
 -- name: GetConversation :one
-SELECT * FROM conversations WHERE id = $1 AND archived_at IS NULL;
+SELECT c.* FROM conversations c JOIN projects p ON p.id = c.project_id
+WHERE c.id = $1 AND c.archived_at IS NULL AND p.archived_at IS NULL;
+
+-- name: GetConversationAny :one
+SELECT * FROM conversations WHERE id = $1;
+
+-- name: RestoreConversation :exec
+UPDATE conversations SET archived_at = NULL WHERE id = $1;
+
+-- name: GetProjectAny :one
+SELECT * FROM projects WHERE id = $1;
+
+-- name: RestoreProject :exec
+UPDATE projects SET archived_at = NULL WHERE id = $1;
 
 -- name: ListConversationsForProject :many
 SELECT * FROM conversations WHERE project_id = $1 AND archived_at IS NULL
 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
 
 -- name: ListRecentConversationsForUser :many
-SELECT * FROM conversations WHERE user_id = $1 AND archived_at IS NULL
-ORDER BY updated_at DESC LIMIT $2;
+SELECT c.* FROM conversations c JOIN projects p ON p.id = c.project_id
+WHERE c.user_id = $1 AND c.archived_at IS NULL AND p.archived_at IS NULL
+ORDER BY c.updated_at DESC LIMIT $2;
 
 -- name: UpdateConversationTitle :exec
 UPDATE conversations SET title = $2 WHERE id = $1;

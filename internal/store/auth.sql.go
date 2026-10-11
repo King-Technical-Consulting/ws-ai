@@ -34,6 +34,17 @@ func (q *Queries) ConsumeMagicLink(ctx context.Context, tokenHash []byte) (Magic
 	return i, err
 }
 
+const countPasskeysByUser = `-- name: CountPasskeysByUser :one
+SELECT count(*)::int FROM passkeys WHERE user_id = $1
+`
+
+func (q *Queries) CountPasskeysByUser(ctx context.Context, userID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, countPasskeysByUser, userID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countUsers = `-- name: CountUsers :one
 SELECT count(*) FROM users
 `
@@ -198,15 +209,16 @@ func (q *Queries) CreatePasskey(ctx context.Context, arg CreatePasskeyParams) (P
 }
 
 const createSession = `-- name: CreateSession :one
-INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip) VALUES ($1, $2, $3, $4, $5) RETURNING id, user_id, token_hash, created_at, expires_at, user_agent, ip, revoked_at
+INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip, stepped_up_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, user_id, token_hash, created_at, expires_at, user_agent, ip, revoked_at, stepped_up_at
 `
 
 type CreateSessionParams struct {
-	UserID    uuid.UUID     `json:"user_id"`
-	TokenHash []byte        `json:"token_hash"`
-	ExpiresAt time.Time     `json:"expires_at"`
-	UserAgent string        `json:"user_agent"`
-	Ip        *netip.Prefix `json:"ip"`
+	UserID      uuid.UUID     `json:"user_id"`
+	TokenHash   []byte        `json:"token_hash"`
+	ExpiresAt   time.Time     `json:"expires_at"`
+	UserAgent   string        `json:"user_agent"`
+	Ip          *netip.Prefix `json:"ip"`
+	SteppedUpAt *time.Time    `json:"stepped_up_at"`
 }
 
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
@@ -216,6 +228,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		arg.ExpiresAt,
 		arg.UserAgent,
 		arg.Ip,
+		arg.SteppedUpAt,
 	)
 	var i Session
 	err := row.Scan(
@@ -227,6 +240,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.UserAgent,
 		&i.Ip,
 		&i.RevokedAt,
+		&i.SteppedUpAt,
 	)
 	return i, err
 }
@@ -435,7 +449,7 @@ func (q *Queries) GetPasskeyByCredentialID(ctx context.Context, credentialID []b
 }
 
 const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
-SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at, s.user_agent, s.ip, s.revoked_at, u.email, u.display_name, u.role
+SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at, s.user_agent, s.ip, s.revoked_at, s.stepped_up_at, u.email, u.display_name, u.role
 FROM sessions s JOIN users u ON u.id = s.user_id
 WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND u.disabled_at IS NULL
 `
@@ -449,6 +463,7 @@ type GetSessionByTokenHashRow struct {
 	UserAgent   string        `json:"user_agent"`
 	Ip          *netip.Prefix `json:"ip"`
 	RevokedAt   *time.Time    `json:"revoked_at"`
+	SteppedUpAt *time.Time    `json:"stepped_up_at"`
 	Email       string        `json:"email"`
 	DisplayName string        `json:"display_name"`
 	Role        string        `json:"role"`
@@ -466,6 +481,7 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (
 		&i.UserAgent,
 		&i.Ip,
 		&i.RevokedAt,
+		&i.SteppedUpAt,
 		&i.Email,
 		&i.DisplayName,
 		&i.Role,
@@ -670,6 +686,16 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const markSessionSteppedUp = `-- name: MarkSessionSteppedUp :exec
+UPDATE sessions SET stepped_up_at = now() WHERE id = $1 AND revoked_at IS NULL
+`
+
+// A passkey assertion was just made on this session (M5 step-up).
+func (q *Queries) MarkSessionSteppedUp(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markSessionSteppedUp, id)
+	return err
 }
 
 const purgeExpiredWebAuthnSessions = `-- name: PurgeExpiredWebAuthnSessions :execrows

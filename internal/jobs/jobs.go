@@ -112,10 +112,26 @@ type Deps struct {
 	Memory interface {
 		Reflect(ctx context.Context, runID uuid.UUID) error
 	}
+	// Personal is each member's own memory (internal/memory): the nightly
+	// reflection job and its due-check; nil skips both.
+	Personal interface {
+		ReflectJob(ctx context.Context, userID uuid.UUID) error
+		TickDue(ctx context.Context, enqueue func(context.Context, uuid.UUID) error) error
+	}
+	// Scheduled fires due scheduled prompts every minute (schedule.tick)
+	// and settles the runs it started; nil skips it.
+	Scheduled interface {
+		Tick(ctx context.Context) error
+	}
 	// Rental reconciles rented GPUs every minute (rental.reconcile); nil
 	// skips it.
 	Rental interface {
 		Reconcile(ctx context.Context) error
+	}
+	// Budgets sends the budget warning mails (budget.warn, hourly); nil
+	// skips it.
+	Budgets interface {
+		Warn(ctx context.Context) error
 	}
 	// Training runs dataset builds, fine-tunes and evals (internal/training);
 	// nil leaves the queue without a worker.
@@ -123,6 +139,7 @@ type Deps struct {
 		Build(ctx context.Context, datasetID uuid.UUID) error
 		RunFinetune(ctx context.Context, jobID uuid.UUID) error
 		Evaluate(ctx context.Context, adapterID uuid.UUID) error
+		RunSpec(ctx context.Context, recipeID uuid.UUID, replace bool) error
 	}
 }
 
@@ -163,6 +180,35 @@ func (TrainingEvalArgs) Kind() string { return "training.eval" }
 // InsertOpts: one eval at a time per adapter.
 func (TrainingEvalArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{Queue: "training", MaxAttempts: 1, UniqueOpts: river.UniqueOpts{ByArgs: true, ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}}}
+}
+
+// TrainingSpecArgs fleshes out a training recipe's spec (M12): samples the
+// attached datasets and has a model write the draft.
+type TrainingSpecArgs struct {
+	RecipeID uuid.UUID `json:"recipe_id"`
+	// Replace drops the owner's hand edits to the spec when the draft lands.
+	Replace bool `json:"replace,omitempty"`
+}
+
+// Kind implements river.JobArgs.
+func (TrainingSpecArgs) Kind() string { return "training.spec" }
+
+// InsertOpts: one flesh out per recipe at a time; a failure is on the row.
+func (TrainingSpecArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "training", MaxAttempts: 1, UniqueOpts: river.UniqueOpts{ByArgs: true, ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}}}
+}
+
+type trainingSpecWorker struct {
+	river.WorkerDefaults[TrainingSpecArgs]
+	deps *Deps
+}
+
+func (w *trainingSpecWorker) Timeout(*river.Job[TrainingSpecArgs]) time.Duration {
+	return 15 * time.Minute
+}
+
+func (w *trainingSpecWorker) Work(ctx context.Context, job *river.Job[TrainingSpecArgs]) error {
+	return w.deps.Training.RunSpec(ctx, job.Args.RecipeID, job.Args.Replace)
 }
 
 type trainingBuildWorker struct {
@@ -245,6 +291,69 @@ func (w *reflectWorker) Work(ctx context.Context, job *river.Job[ReflectArgs]) e
 	return w.deps.Memory.Reflect(ctx, job.Args.RunID)
 }
 
+// MemoryReflectArgs tidies one member's memory (PLAN M13 cut 3).
+type MemoryReflectArgs struct {
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Kind implements river.JobArgs.
+func (MemoryReflectArgs) Kind() string { return "memory.reflect" }
+
+// InsertOpts: one at a time per member, so a double click or a tick racing
+// the button does not reflect twice.
+func (MemoryReflectArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "housekeeping", MaxAttempts: 2, UniqueOpts: river.UniqueOpts{ByArgs: true, ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}}}
+}
+
+type memoryReflectWorker struct {
+	river.WorkerDefaults[MemoryReflectArgs]
+	deps *Deps
+}
+
+func (w *memoryReflectWorker) Timeout(*river.Job[MemoryReflectArgs]) time.Duration {
+	return 10 * time.Minute
+}
+
+func (w *memoryReflectWorker) Work(ctx context.Context, job *river.Job[MemoryReflectArgs]) error {
+	return w.deps.Personal.ReflectJob(ctx, job.Args.UserID)
+}
+
+// MemoryTickArgs is the periodic check for members whose nightly
+// reflection is due.
+type MemoryTickArgs struct{}
+
+// Kind implements river.JobArgs.
+func (MemoryTickArgs) Kind() string { return "memory.tick" }
+
+type memoryTickWorker struct {
+	river.WorkerDefaults[MemoryTickArgs]
+	deps *Deps
+	cl   *Client
+}
+
+func (w *memoryTickWorker) Work(ctx context.Context, job *river.Job[MemoryTickArgs]) error {
+	return w.deps.Personal.TickDue(ctx, w.cl.EnqueueMemoryReflect)
+}
+
+// ScheduleTickArgs is the periodic check for due scheduled prompts.
+type ScheduleTickArgs struct{}
+
+// Kind implements river.JobArgs.
+func (ScheduleTickArgs) Kind() string { return "schedule.tick" }
+
+type scheduleTickWorker struct {
+	river.WorkerDefaults[ScheduleTickArgs]
+	deps *Deps
+}
+
+func (w *scheduleTickWorker) Timeout(*river.Job[ScheduleTickArgs]) time.Duration {
+	return 2 * time.Minute
+}
+
+func (w *scheduleTickWorker) Work(ctx context.Context, job *river.Job[ScheduleTickArgs]) error {
+	return w.deps.Scheduled.Tick(ctx)
+}
+
 // AgentTickArgs is the periodic cron-trigger sweep.
 type AgentTickArgs struct{}
 
@@ -282,6 +391,23 @@ func (w *sandboxReapWorker) Work(ctx context.Context, job *river.Job[SandboxReap
 		return nil
 	}
 	return w.deps.Sandbox.Reap(ctx)
+}
+
+// BudgetWarnArgs is the hourly budget warning sweep.
+type BudgetWarnArgs struct{}
+
+// Kind implements river.JobArgs.
+func (BudgetWarnArgs) Kind() string { return "budget.warn" }
+
+type budgetWarnWorker struct {
+	river.WorkerDefaults[BudgetWarnArgs]
+	deps *Deps
+}
+
+func (w *budgetWarnWorker) Timeout(*river.Job[BudgetWarnArgs]) time.Duration { return 5 * time.Minute }
+
+func (w *budgetWarnWorker) Work(ctx context.Context, job *river.Job[BudgetWarnArgs]) error {
+	return w.deps.Budgets.Warn(ctx)
 }
 
 // AuthPurgeArgs is the hourly deletion of expired sign-in rows.
@@ -337,6 +463,7 @@ type Client struct {
 // New builds a client. With startWorkers, it also runs the queues (the
 // worker process); otherwise it only inserts (serve).
 func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool) (*Client, error) {
+	memCl := &Client{log: deps.Log} // its river client is set below, before the workers start
 	workers := river.NewWorkers()
 	cfg := &river.Config{
 		Logger:               deps.Log,
@@ -369,10 +496,29 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 		if deps.Memory != nil {
 			river.AddWorker(workers, &reflectWorker{deps: deps})
 		}
+		if deps.Personal != nil {
+			river.AddWorker(workers, &memoryReflectWorker{deps: deps})
+			river.AddWorker(workers, &memoryTickWorker{deps: deps, cl: memCl})
+			cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(15*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+				return MemoryTickArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: 15 * time.Minute}}
+			}, &river.PeriodicJobOpts{RunOnStart: false}))
+		}
+		if deps.Scheduled != nil {
+			river.AddWorker(workers, &scheduleTickWorker{deps: deps})
+			cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+				return ScheduleTickArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Minute}}
+			}, &river.PeriodicJobOpts{RunOnStart: true}))
+		}
 		if deps.Agents != nil {
 			river.AddWorker(workers, &agentTickWorker{deps: deps})
 			cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(time.Minute), func() (river.JobArgs, *river.InsertOpts) {
 				return AgentTickArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Minute}}
+			}, &river.PeriodicJobOpts{RunOnStart: true}))
+		}
+		if deps.Budgets != nil {
+			river.AddWorker(workers, &budgetWarnWorker{deps: deps})
+			cfg.PeriodicJobs = append(cfg.PeriodicJobs, river.NewPeriodicJob(river.PeriodicInterval(time.Hour), func() (river.JobArgs, *river.InsertOpts) {
+				return BudgetWarnArgs{}, &river.InsertOpts{Queue: "housekeeping", UniqueOpts: river.UniqueOpts{ByPeriod: time.Hour}}
 			}, &river.PeriodicJobOpts{RunOnStart: true}))
 		}
 		if deps.Rental != nil {
@@ -385,6 +531,7 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 			river.AddWorker(workers, &trainingBuildWorker{deps: deps})
 			river.AddWorker(workers, &trainingFinetuneWorker{deps: deps})
 			river.AddWorker(workers, &trainingEvalWorker{deps: deps})
+			river.AddWorker(workers, &trainingSpecWorker{deps: deps})
 			cfg.Queues["training"] = river.QueueConfig{MaxWorkers: 1}
 		}
 		if deps.Sandbox != nil {
@@ -399,6 +546,7 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 		return nil, err
 	}
 	cl := &Client{c: c, log: deps.Log}
+	memCl.c = c
 	if startWorkers {
 		if err := c.Start(ctx); err != nil {
 			return nil, err
@@ -409,6 +557,12 @@ func New(ctx context.Context, pool *pgxpool.Pool, deps *Deps, startWorkers bool)
 
 // Stop drains workers.
 func (cl *Client) Stop(ctx context.Context) error { return cl.c.Stop(ctx) }
+
+// EnqueueMemoryReflect queues a reflection of one member's memory.
+func (cl *Client) EnqueueMemoryReflect(ctx context.Context, userID uuid.UUID) error {
+	_, err := cl.c.Insert(ctx, MemoryReflectArgs{UserID: userID}, nil)
+	return err
+}
 
 // EnqueueRun schedules a run to be driven by the worker.
 func (cl *Client) EnqueueRun(ctx context.Context, runID uuid.UUID) error {
@@ -434,9 +588,20 @@ func (cl *Client) EnqueueFinetune(ctx context.Context, jobID uuid.UUID) error {
 	return err
 }
 
-func (cl *Client) EnqueueEval(ctx context.Context, adapterID uuid.UUID) error {
-	_, err := cl.c.Insert(ctx, TrainingEvalArgs{AdapterID: adapterID}, nil)
+// EnqueueTrainingSpec schedules the flesh out of a recipe.
+func (cl *Client) EnqueueTrainingSpec(ctx context.Context, recipeID uuid.UUID, replace bool) error {
+	_, err := cl.c.Insert(ctx, TrainingSpecArgs{RecipeID: recipeID, Replace: replace}, nil)
 	return err
+}
+
+// EnqueueEval reports queued=false when an evaluation of the adapter is already queued or
+// running (the insert is unique by adapter and state), so a second click can say so.
+func (cl *Client) EnqueueEval(ctx context.Context, adapterID uuid.UUID) (queued bool, err error) {
+	res, err := cl.c.Insert(ctx, TrainingEvalArgs{AdapterID: adapterID}, nil)
+	if err != nil {
+		return false, err
+	}
+	return !res.UniqueSkippedAsDuplicate, nil
 }
 
 // EnqueueMedia schedules a media job for the worker.

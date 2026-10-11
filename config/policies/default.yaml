@@ -21,12 +21,41 @@ rules:
       - local-llama/gpt-oss-20b
       - local-llama/qwen3-14b
 
+  # Fleshing out a training recipe (internal/training, M12): the owner's
+  # instructions and a few sample records go in, a spec comes out. Local
+  # first; a hosted model is allowed behind the local ones, so the samples
+  # leave the box only when no local model can do it (Jeremy, 2026-10-10).
+  # Needs a model that follows a JSON schema, so the floor is medium.
+  - match: { task_class: [training] }
+    min_tier: medium
+    prefer:
+      - local-vllm/qwen3.6-35b-a3b
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+      - anthropic/claude-sonnet-5-5
+      - openrouter/anthropic/claude-sonnet-5-5
+      - openrouter/deepseek/deepseek-chat-v3
+
+  # The verdict call of LLM-verdict routing (WS_ROUTE_CLASSIFIER=auto): the
+  # same endpoints as classify, and a cost ceiling so the fallback can never
+  # land a one-line classification on an expensive model. Its spend is
+  # summed under task class route against the owner's daily ceiling.
+  - match: { task_class: [route] }
+    max_cost_per_call_usd: 0.01
+    prefer:
+      - openrouter/openai/gpt-oss-120b@cerebras
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+
   # Cheap housekeeping goes local first, then the cheapest hosted model.
   - match: { task_class: [summarize, title, reflect] }
+    # The fallback may use a small model for this work, not a toy one.
+    min_tier: small
     prefer:
       - local-llama/gpt-oss-20b
       - local-llama/qwen3-14b
       - anthropic/claude-haiku-4-5
+      - openrouter/anthropic/claude-haiku-4-5
       - openrouter/deepseek/deepseek-chat-v3
 
   # Embeddings (agent memory): local first, OpenAI behind it. Both are
@@ -61,15 +90,19 @@ rules:
   # Coding and agent work wants the strongest tool-caller available.
   - match: { task_class: [code] }
     require: { tools: true }
+    min_tier: medium
     prefer:
       - anthropic/claude-opus-5-5
       - local-vllm/qwen3-coder-next
       - anthropic/claude-sonnet-5-5
+      - openrouter/anthropic/claude-sonnet-5-5
 
   - match: { task_class: [vision] }
     require: { vision: true }
+    min_tier: medium
     prefer:
       - anthropic/claude-sonnet-5-5
+      - openrouter/anthropic/claude-sonnet-5-5
       - local-vllm/qwen3.6-35b-a3b
       - openrouter/google/gemini-2.5-pro
 
@@ -87,17 +120,36 @@ rules:
       - local-llama/qwen3-14b
       - local-vllm/qwen3.6-35b-a3b
       - anthropic/claude-haiku-4-5
+      - openrouter/anthropic/claude-haiku-4-5
 
-  # Everything else: good default chat model, with cheaper fallbacks.
+  # A turn the verdict called simple chat (only when verdict routing is on:
+  # the rule never matches a turn without one). The cheap lists first; the
+  # verdict's small floor replaces the catch-all's medium for this turn.
+  - match: { verdict: [simple-chat] }
+    min_tier: small
+    prefer:
+      - local-llama/gpt-oss-20b
+      - local-llama/qwen3-14b
+      - anthropic/claude-haiku-4-5
+      - openrouter/anthropic/claude-haiku-4-5
+      - openrouter/deepseek/deepseek-chat-v3
+
+  # Everything else: good default chat model, with cheaper fallbacks. A box
+  # with only an OpenRouter key reaches Sonnet through the openrouter entry
+  # (the direct one is skipped without its key). min_tier keeps the
+  # fallback, when none of these is usable, off small models: a 0.5B model
+  # added for training evals must not answer a chat.
   - match: {}
+    min_tier: medium
     prefer:
       - anthropic/claude-sonnet-5-5
+      - openrouter/anthropic/claude-sonnet-5-5
       - local-vllm/qwen3.6-35b-a3b
       - openrouter/deepseek/deepseek-chat-v3
       - local-llama/gpt-oss-20b
 
 aliases:
-  best:  [anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5]
-  cheap: [local-llama/gpt-oss-20b, local-llama/qwen3-14b, anthropic/claude-haiku-4-5]
+  best:  [anthropic/claude-opus-5-5, anthropic/claude-sonnet-5-5, openrouter/anthropic/claude-sonnet-5-5]
+  cheap: [local-llama/gpt-oss-20b, local-llama/qwen3-14b, anthropic/claude-haiku-4-5, openrouter/anthropic/claude-haiku-4-5]
   local: [local-vllm/qwen3-coder-next, local-vllm/qwen3.6-35b-a3b, local-llama/gpt-oss-20b, local-llama/qwen3-14b]
-  code:  [anthropic/claude-opus-5-5, local-vllm/qwen3-coder-next, anthropic/claude-sonnet-5-5]
+  code:  [anthropic/claude-opus-5-5, local-vllm/qwen3-coder-next, anthropic/claude-sonnet-5-5, openrouter/anthropic/claude-sonnet-5-5]

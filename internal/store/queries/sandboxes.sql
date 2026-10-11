@@ -33,6 +33,9 @@ DELETE FROM sandboxes WHERE id = $1;
 -- name: InsertSandboxEvent :exec
 INSERT INTO sandbox_events (sandbox_id, kind, detail) VALUES ($1, $2, $3);
 
+-- name: ListSandboxEvents :many
+SELECT * FROM sandbox_events WHERE sandbox_id = $1 ORDER BY id DESC LIMIT $2;
+
 -- name: SetProjectRepo :exec
 UPDATE projects SET repo_url = $2, default_branch = $3, updated_at = now() WHERE id = $1;
 

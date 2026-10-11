@@ -21,10 +21,13 @@ import (
 type agentView struct {
 	store.Agent
 	ProjectID *uuid.UUID `json:"project_id"`
+	// Skills are the shelf skills the agent uses; only the single-agent read
+	// fills them, with their instructions.
+	Skills []agents.StoredSkill `json:"skills"`
 }
 
 func viewAgent(a store.Agent) agentView {
-	v := agentView{Agent: a}
+	v := agentView{Agent: a, Skills: []agents.StoredSkill{}}
 	if a.ProjectID.Valid {
 		id := a.ProjectID.UUID
 		v.ProjectID = &id
@@ -69,6 +72,7 @@ type agentInput struct {
 	ToolAllowlist []string                `json:"tool_allowlist"`
 	ToolPolicies  map[string]agent.Policy `json:"tool_policies"`
 	MaxSteps      int                     `json:"max_steps"`
+	MaxRunUSD     float64                 `json:"max_run_usd"`
 	Enabled       *bool                   `json:"enabled"`
 }
 
@@ -89,6 +93,9 @@ func (in *agentInput) validate() (uuid.NullUUID, string) {
 	}
 	if in.MaxSteps > 500 {
 		return uuid.NullUUID{}, "max_steps at most 500"
+	}
+	if in.MaxRunUSD < 0 || in.MaxRunUSD > 10000 {
+		return uuid.NullUUID{}, "max_run_usd must be between 0 (no cap) and 10000"
 	}
 	for _, p := range in.ToolPolicies {
 		switch p {
@@ -167,6 +174,105 @@ func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+// handleImportSkillFolder is POST /api/agents/presets/import-folder: a
+// multipart zip (field "file") holding one skill folder, read into the
+// single-file preview plus an inventory of every other file and the
+// findings on each. Nothing is stored or executed and no tool is granted.
+func (s *Server) handleImportSkillFolder(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(agents.MaxSkillZipBytes)+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeErr(w, 400, "the archive is larger than 5 MB or the upload was cut short")
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 400, "file is required (a .zip of one skill folder)")
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, int64(agents.MaxSkillZipBytes)+1))
+	if err != nil {
+		writeErr(w, 400, "could not read the upload")
+		return
+	}
+	out, err := agents.ImportSkillFolder(data)
+	if err != nil {
+		writeErr(w, 400, strings.TrimPrefix(err.Error(), agents.ErrSkill.Error()+": "))
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+// handleAttachSkill is POST /api/agents/{id}/skills. A multipart zip (field
+// "file") is approved onto the owner's shelf and attached: the server reads
+// the archive again, and nothing the client says about findings is trusted.
+// A JSON body {"skill_id"} attaches a skill already on the shelf. Keeping a
+// skill grants no tool and no secret.
+func (s *Server) handleAttachSkill(w http.ResponseWriter, r *http.Request) {
+	ag, ok := s.loadAgent(w, r)
+	if !ok {
+		return
+	}
+	st := &agents.SkillStore{DB: s.DB, Blobs: s.Blobs}
+	me := Principal(r.Context()).UserID
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var in struct {
+			SkillID uuid.UUID `json:"skill_id"`
+		}
+		if err := decode(r, &in); err != nil || in.SkillID == uuid.Nil {
+			writeErr(w, 400, "skill_id is required")
+			return
+		}
+		row, err := s.DB.GetSkill(r.Context(), in.SkillID)
+		if err != nil || row.OwnerID != me {
+			writeErr(w, 404, "not found")
+			return
+		}
+		if err := st.Attach(r.Context(), ag.ID, row.ID); err != nil {
+			skillError(w, err)
+			return
+		}
+		k := agents.FromRow(row)
+		k.Instructions = ""
+		writeJSON(w, 200, k)
+		return
+	}
+	if s.Blobs == nil {
+		writeErr(w, 503, "file storage is not configured")
+		return
+	}
+	data, ok := readSkillZip(w, r, agents.MaxSkillZipBytes)
+	if !ok {
+		return
+	}
+	k, err := st.ApproveForAgent(r.Context(), ag.ID, me, data)
+	if err != nil {
+		skillError(w, err)
+		return
+	}
+	k.Instructions = ""
+	writeJSON(w, 200, k)
+}
+
+// handleRemoveSkill is DELETE /api/agents/{id}/skills/{name}.
+func (s *Server) handleRemoveSkill(w http.ResponseWriter, r *http.Request) {
+	ag, ok := s.loadAgent(w, r)
+	if !ok {
+		return
+	}
+	st := &agents.SkillStore{DB: s.DB, Blobs: s.Blobs}
+	found, err := st.Detach(r.Context(), ag.ID, chi.URLParam(r, "name"))
+	if err != nil {
+		writeErr(w, 500, "could not remove the skill")
+		return
+	}
+	if !found {
+		writeErr(w, 404, "not found")
+		return
+	}
+	w.WriteHeader(204)
+}
+
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	p := Principal(r.Context())
 	var in agentInput
@@ -187,7 +293,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	tp, _ := json.Marshal(in.ToolPolicies)
 	row, err := s.DB.CreateAgent(r.Context(), store.CreateAgentParams{
 		OwnerID: p.UserID, ProjectID: pid, Name: in.Name, Goal: in.Goal, SystemPrompt: in.SystemPrompt,
-		ModelPolicy: mp, ToolAllowlist: in.ToolAllowlist, ToolPolicies: tp, MaxSteps: int32(in.MaxSteps),
+		ModelPolicy: mp, ToolAllowlist: in.ToolAllowlist, ToolPolicies: tp, MaxSteps: int32(in.MaxSteps), MaxRunUsd: in.MaxRunUSD,
 	})
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -223,7 +329,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	tp, _ := json.Marshal(in.ToolPolicies)
 	row, err := s.DB.UpdateAgent(r.Context(), store.UpdateAgentParams{
 		ID: ag.ID, Name: in.Name, Goal: in.Goal, SystemPrompt: in.SystemPrompt, ModelPolicy: mp,
-		ToolAllowlist: in.ToolAllowlist, ToolPolicies: tp, MaxSteps: int32(in.MaxSteps), Enabled: enabled, ProjectID: pid,
+		ToolAllowlist: in.ToolAllowlist, ToolPolicies: tp, MaxSteps: int32(in.MaxSteps), Enabled: enabled, ProjectID: pid, MaxRunUsd: in.MaxRunUSD,
 	})
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -289,12 +395,23 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	spent, _ := s.DB.SumUsageForAgentSince(ctx, store.SumUsageForAgentSinceParams{AgentID: store.NullUUID(ag.ID), CreatedAt: monthStart})
 	budgets, _ := s.DB.ListBudgetsForScope(ctx, store.ListBudgetsForScopeParams{Scope: "agent", ScopeID: store.NullUUID(ag.ID)})
+	// With no budget of its own the agent is under the default for every
+	// agent (a row with no scope_id), when the owner set one.
+	isDefault := false
+	if len(budgets) == 0 {
+		budgets, _ = s.DB.ListBudgetsForScope(ctx, store.ListBudgetsForScopeParams{Scope: "agent"})
+		isDefault = len(budgets) > 0
+	}
 	if budgets == nil {
 		budgets = []store.Budget{}
 	}
+	av := viewAgent(*ag)
+	if sk, err := (&agents.SkillStore{DB: s.DB, Blobs: s.Blobs}).ForAgent(ctx, ag.ID); err == nil && len(sk) > 0 {
+		av.Skills = sk
+	}
 	writeJSON(w, 200, map[string]any{
-		"agent": viewAgent(*ag), "triggers": tv, "runs": runs, "pending_approvals": pending,
-		"spend": map[string]any{"since": monthStart, "usd": spent, "budgets": budgets},
+		"agent": av, "triggers": tv, "runs": runs, "pending_approvals": pending,
+		"spend": map[string]any{"since": monthStart, "usd": spent, "budgets": budgets, "default": isDefault},
 	})
 }
 

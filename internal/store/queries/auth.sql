@@ -53,6 +53,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *;
 -- name: ListPasskeysByUser :many
 SELECT * FROM passkeys WHERE user_id = $1 ORDER BY created_at;
 
+-- name: CountPasskeysByUser :one
+SELECT count(*)::int FROM passkeys WHERE user_id = $1;
+
 -- name: GetPasskeyByCredentialID :one
 SELECT * FROM passkeys WHERE credential_id = $1;
 
@@ -83,7 +86,11 @@ WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
 RETURNING *;
 
 -- name: CreateSession :one
-INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip) VALUES ($1, $2, $3, $4, $5) RETURNING *;
+INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip, stepped_up_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+
+-- name: MarkSessionSteppedUp :exec
+-- A passkey assertion was just made on this session (M5 step-up).
+UPDATE sessions SET stepped_up_at = now() WHERE id = $1 AND revoked_at IS NULL;
 
 -- name: GetSessionByTokenHash :one
 SELECT s.*, u.email, u.display_name, u.role

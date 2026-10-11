@@ -16,6 +16,8 @@ At boot, both `serve` and `worker` log in with that machine identity and load ev
 
 Which wins when a name is in both? At boot, a value already in the environment wins unless you set `INFISICAL_OVERWRITE=1`. But the five-minute refresh always overwrites, so a name Infisical holds replaces a `.env` value after a few minutes. Keep each name in one place. For a self-hosted Infisical, set `INFISICAL_SITE_URL`.
 
+One trap, reported from setting this up on a real box (board `556b`): Infisical shows a machine identity's own ID and, separately, the Client ID of its Universal Auth method. `INFISICAL_CLIENT_ID` takes the Universal Auth *Client ID*; using the identity's ID makes the login fail. On a deployment that loads everything from Infisical, `.env` keeps only the bootstrap and the few names Compose reads itself; the list is in [Configuration](../CONFIGURATION.md).
+
 The full variable list is in [Configuration](../CONFIGURATION.md).
 
 ## MCP servers

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +61,24 @@ func (d *DB) SeedRegistry(ctx context.Context, sf *gateway.SeedFile) error {
 		}); err != nil {
 			return err
 		}
+		// Only what the file says: an omitted tier or routable leaves what
+		// the owner set in Admin.
+		if e.Tier != "" || e.Routable != nil {
+			cur, err := d.GetEndpoint(ctx, e.ID)
+			if err != nil {
+				return err
+			}
+			tier, routable := cur.Tier, cur.Routable
+			if e.Tier != "" {
+				tier = e.Tier
+			}
+			if e.Routable != nil {
+				routable = *e.Routable
+			}
+			if err := d.SetEndpointRouting(ctx, SetEndpointRoutingParams{ID: e.ID, Tier: tier, Routable: routable}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -71,6 +92,7 @@ func (d *DB) LoadRegistry(ctx context.Context, reg *gateway.Registry) error {
 		return err
 	}
 	var provs []*gateway.Provider
+	var noKey []string
 	have := map[string]bool{}
 	for _, r := range provRows {
 		base := r.BaseUrl
@@ -87,13 +109,14 @@ func (d *DB) LoadRegistry(ctx context.Context, reg *gateway.Registry) error {
 			if p.APIKey == "" {
 				// No server key: the provider stays registered and serves only
 				// people who saved a key of their own for it (gateway/keys.go).
-				slog.Info("provider has no server key; own keys only", "provider", r.ID, "env", *r.ApiKeyEnv)
+				noKey = append(noKey, r.ID+" ("+*r.ApiKeyEnv+")")
 			}
 		}
 		_ = json.Unmarshal(r.Headers, &p.Headers)
 		provs = append(provs, p)
 		have[p.ID] = true
 	}
+	logNoServerKey(noKey)
 	epRows, err := d.ListEndpoints(ctx)
 	if err != nil {
 		return err
@@ -106,6 +129,7 @@ func (d *DB) LoadRegistry(ctx context.Context, reg *gateway.Registry) error {
 		e := &gateway.Endpoint{
 			ID: r.ID, ProviderID: r.ProviderID, ModelName: r.ModelName, DisplayName: r.DisplayName,
 			ThroughputClass: r.ThroughputClass, LatencyClass: r.LatencyClass, Local: r.IsLocal, Enabled: r.Enabled,
+			Tier: r.Tier, NotRoutable: !r.Routable,
 			Health: gateway.Health{Status: r.HealthStatus},
 		}
 		_ = json.Unmarshal(r.Capabilities, &e.Capabilities)
@@ -113,6 +137,7 @@ func (d *DB) LoadRegistry(ctx context.Context, reg *gateway.Registry) error {
 		if len(r.ExtraBody) > 2 {
 			_ = json.Unmarshal(r.ExtraBody, &e.ExtraBody)
 		}
+		e.LiftDefaultSystem()
 		if r.P50LatencyMs != nil {
 			e.Health.P50LatencyMS = int(*r.P50LatencyMs)
 		}
@@ -228,3 +253,58 @@ func nilIfEmpty(s string) *string {
 }
 
 func ptrInt32(v int32) *int32 { return &v }
+
+var (
+	noKeyMu   sync.Mutex
+	noKeyLast string
+	noKeySeen bool
+)
+
+// logNoServerKey says which hosted providers have no server key, once and
+// again only when that set changes: the registry reloads every half minute
+// and a line per provider each time buried the lines that matter.
+func logNoServerKey(missing []string) {
+	sort.Strings(missing)
+	key := strings.Join(missing, ", ")
+	noKeyMu.Lock()
+	defer noKeyMu.Unlock()
+	if noKeySeen && key == noKeyLast {
+		return
+	}
+	noKeySeen, noKeyLast = true, key
+	if key == "" {
+		slog.Info("every hosted provider has a server key")
+		return
+	}
+	slog.Info("hosted providers without a server key (own keys only)", "providers", key)
+}
+
+// RouteCapKey is the server_settings key of the daily ceiling on
+// verdict-routing classifier spend, in US dollars.
+const RouteCapKey = "route_classifier_max_usd_day"
+
+// RouteClassifierCap returns the owner's daily ceiling, or def when the
+// owner has not set one. A stored value of 0 or less means no ceiling.
+func (d *DB) RouteClassifierCap(ctx context.Context, def float64) float64 {
+	row, err := d.GetServerSetting(ctx, RouteCapKey)
+	if err != nil {
+		return def
+	}
+	var v float64
+	if json.Unmarshal(row.Value, &v) != nil {
+		return def
+	}
+	return v
+}
+
+// SetRouteClassifierCap stores the owner's daily ceiling.
+func (d *DB) SetRouteClassifierCap(ctx context.Context, usd float64) error {
+	b, _ := json.Marshal(usd)
+	return d.SetServerSetting(ctx, SetServerSettingParams{Key: RouteCapKey, Value: b})
+}
+
+// RouteSpendToday is what verdict calls have cost since UTC midnight.
+func (d *DB) RouteSpendToday(ctx context.Context) (float64, error) {
+	now := time.Now().UTC()
+	return d.SumRouteSpendSince(ctx, time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC))
+}

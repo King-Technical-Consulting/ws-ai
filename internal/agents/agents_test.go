@@ -409,3 +409,31 @@ func TestSystemPrompt(t *testing.T) {
 		t.Errorf("custom prompt = %q", p)
 	}
 }
+
+// TestPlanFirstReachesTheRequest: an agent whose model policy says
+// plan_first starts every run in plan mode, so a cron-triggered run waits
+// for a person's approval before any tool runs; one without it does not.
+func TestPlanFirstReachesTheRequest(t *testing.T) {
+	svc, db, rt, ag := newService(t)
+	ctx := context.Background()
+	if _, err := svc.Start(ctx, StartParams{AgentID: ag.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if rt.last.Request.Plan {
+		t.Error("plan mode must be off unless the agent asks for it")
+	}
+	a := db.agents[ag.ID]
+	a.ModelPolicy, _ = json.Marshal(ModelPolicy{Selector: "cheap", TaskClass: gateway.TaskChat, PlanFirst: true})
+	db.agents[ag.ID] = a
+	// Close the first run so the agent is free to start again.
+	for id, r := range db.runs {
+		r.Status = "done"
+		db.runs[id] = r
+	}
+	if _, err := svc.Start(ctx, StartParams{AgentID: ag.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if !rt.last.Request.Plan {
+		t.Error("plan_first should set Request.Plan")
+	}
+}

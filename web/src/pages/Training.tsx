@@ -1,9 +1,13 @@
-import { useEffect, useId, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import clsx from 'clsx'
-import { api, type Adapter, type Dataset, type FinetuneJob, type FinetuneTarget, type FinetuneTargetID, type HubModel, type ModelsResponse, type TrainingExample, type TrainingRoute } from '../api'
-import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm } from '../components/ui'
+import { api, type Adapter, type Dataset, type FinetuneJob, type FinetuneTarget, type FinetuneTargetID, type ModelsResponse, type TrainingExample, type TrainingRoute } from '../api'
+import { SectionHead, PageTitle, Callout, ListGroup, Row, btn, inputSm, useConfirm } from '../components/ui'
 import { ago } from './Agents'
+import { DatasetUpload, UploadedDetails } from '../components/DatasetUpload'
+import { BaseModelPicker } from '../components/BaseModelPicker'
+import { Recipes } from '../components/Recipes'
+import { DEFAULT_SMOKE_EVAL_EXAMPLES, isSmokeEval, pointsPerExample, smokeTitle } from '../lib/evalSize'
 
 const MODES = ['chat', 'code', 'design', 'agent']
 // Task classes a route or a promotion can name (config/policies/default.yaml).
@@ -26,10 +30,12 @@ export default function Training() {
     queryFn: () => api.get<{ jobs: FinetuneJob[]; runner: boolean; targets: FinetuneTarget[] }>('/api/training/jobs'),
     refetchInterval: (q) => (q.state.data?.jobs.some((j) => j.status === 'queued' || j.status === 'running') ? 3000 : false),
   })
-  const adapters = useQuery({ queryKey: ['training', 'adapters'], queryFn: () => api.get<{ adapters: Adapter[] }>('/api/training/adapters'), refetchInterval: 10000 })
+  const adapters = useQuery({ queryKey: ['training', 'adapters'], queryFn: () => api.get<{ adapters: Adapter[]; smoke_eval_examples?: number }>('/api/training/adapters'), refetchInterval: (q) => (q.state.data?.adapters.some((a) => a.eval_job?.state === 'queued' || a.eval_job?.state === 'running') ? 3000 : 10000) })
   const routes = useQuery({ queryKey: ['training', 'routes'], queryFn: () => api.get<{ routes: TrainingRoute[]; policy: string }>('/api/training/routes') })
   const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelsResponse>('/api/models'), staleTime: 60_000 })
   const refresh = () => qc.invalidateQueries({ queryKey: ['training'] })
+  // Under this many held-out examples an eval is a smoke result; the server owns the number.
+  const smoke = adapters.data?.smoke_eval_examples ?? DEFAULT_SMOKE_EVAL_EXAMPLES
 
   return (
     <div className="flex-1 min-h-0 overflow-y-auto">
@@ -38,9 +44,11 @@ export default function Training() {
         <p className="text-sm text-fg-2">
           Rated answers from people who opted in become datasets; a dataset and a base model become an adapter; an adapter that beats its base on the held-out set gets promoted to an endpoint. Operational notes are in <code className="font-mono text-xs">infra/training/README.md</code>.
         </p>
-        <Datasets datasets={datasets.data?.datasets ?? []} onChange={refresh} />
+        <Datasets datasets={datasets.data?.datasets ?? []} smoke={smoke} onChange={refresh} />
+        <DatasetUpload onChange={refresh} />
+        <Recipes datasets={datasets.data?.datasets ?? []} smoke={smoke} />
         <Jobs jobs={jobs.data?.jobs ?? []} runner={!!jobs.data?.runner} targets={jobs.data?.targets ?? []} datasets={datasets.data?.datasets ?? []} models={models.data} onChange={refresh} />
-        <Adapters adapters={adapters.data?.adapters ?? []} onChange={refresh} />
+        <Adapters adapters={adapters.data?.adapters ?? []} smoke={smoke} onChange={refresh} />
         <Routes routes={routes.data?.routes ?? []} policy={routes.data?.policy ?? 'training-adapters'} models={models.data} onChange={refresh} />
       </div>
     </div>
@@ -52,7 +60,7 @@ function StatusWord({ s }: { s: string }) {
   return <span className={clsx('section-head border-0 shrink-0', open ? 'text-fg' : s === 'failed' ? 'text-danger' : 'text-fg-3')}>{s}</span>
 }
 
-function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () => void }) {
+function Datasets({ datasets, smoke, onChange }: { datasets: Dataset[]; smoke: number; onChange: () => void }) {
   const [name, setName] = useState('')
   const [modes, setModes] = useState<string[]>([])
   const [modelsText, setModelsText] = useState('')
@@ -78,6 +86,7 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
   })
   const remove = useMutation({ mutationFn: (id: string) => api.del(`/api/training/datasets/${id}`), onSuccess: onChange })
   const [previewID, setPreviewID] = useState<string | null>(null)
+  const [detailsID, setDetailsID] = useState<string | null>(null)
   return (
     <section className="space-y-3">
       <SectionHead aside={datasets.length ? `${datasets.length}` : undefined}>datasets</SectionHead>
@@ -86,34 +95,40 @@ function Datasets({ datasets, onChange }: { datasets: Dataset[]; onChange: () =>
           <Row
             key={d.id}
             action={
-              <span className="flex items-center gap-3">
+              <span className="flex flex-wrap items-center gap-x-3">
+                {d.kind === 'uploaded' && (
+                  <button onClick={() => setDetailsID(detailsID === d.id ? null : d.id)} className={btn.link}>
+                    {detailsID === d.id ? 'hide details' : 'details'}
+                  </button>
+                )}
                 {d.status === 'ready' && (
                   <>
-                    <button onClick={() => setPreviewID(previewID === d.id ? null : d.id)} className="text-xs text-fg-2 hover:text-fg">
+                    <button onClick={() => setPreviewID(previewID === d.id ? null : d.id)} className={btn.link}>
                       {previewID === d.id ? 'hide' : 'preview'}
                     </button>
-                    <a href={`/api/training/datasets/${d.id}/download`} download title="Download the train split as JSONL" className="text-xs text-fg-2 hover:text-fg">train.jsonl</a>
-                    {d.eval_examples > 0 && <a href={`/api/training/datasets/${d.id}/download?split=eval`} download title="Download the held-out split as JSONL" className="text-xs text-fg-2 hover:text-fg">eval.jsonl</a>}
+                    <a href={`/api/training/datasets/${d.id}/download`} download title="Download the train split as JSONL" className={btn.link}>train.jsonl</a>
+                    {d.eval_examples > 0 && <a href={`/api/training/datasets/${d.id}/download?split=eval`} download title="Download the held-out split as JSONL" className={btn.link}>eval.jsonl</a>}
                   </>
                 )}
                 <button onClick={() => remove.mutate(d.id)} className={btn.danger}>remove</button>
               </span>
             }
           >
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-baseline gap-x-2">
               <StatusWord s={d.status} />
               {d.name}
             </span>
             <span className="meta block">
               {d.status === 'ready' ? `${d.examples} examples, ${d.eval_examples} held out · ${(d.bytes / 1024).toFixed(0)} KB · ` : ''}
-              {d.filters.modes?.length ? d.filters.modes.join(', ') + ' · ' : ''}
-              {d.filters.min_rating === 1 ? 'upvoted only' : d.filters.min_rating === -1 ? 'all ratings' : 'upvoted or unrated'} · {ago(d.created_at)}
+              {d.status === 'ready' && isSmokeEval(d.eval_examples, smoke) ? `an eval on its ${d.eval_examples} held out would be a smoke result (under ${smoke}) · ` : ''}
+              {d.kind === 'merged' ? 'merged from a recipe' : d.kind === 'uploaded' ? `uploaded ${d.source_name ?? ''}` : (d.filters.modes?.length ? d.filters.modes.join(', ') + ' · ' : '') + (d.filters.min_rating === 1 ? 'upvoted only' : d.filters.min_rating === -1 ? 'all ratings' : 'upvoted or unrated')} · {ago(d.created_at)}
               {d.error ? ` · ${d.error}` : ''}
             </span>
           </Row>
         ))}
       </ListGroup>
       {previewID && <Preview id={previewID} />}
+      {datasets.filter((d) => d.id === detailsID && d.kind === 'uploaded').map((d) => <UploadedDetails key={d.id + d.status + (d.built_at ?? '')} dataset={d} onChange={onChange} />)}
       <form
         className="space-y-2 rounded-lg border border-line bg-bg-2 p-3"
         onSubmit={(e) => {
@@ -164,7 +179,7 @@ function Preview({ id }: { id: string }) {
       </div>
       {q.error && <Callout kind="error">{q.error.message}</Callout>}
       {exs.map((e, i) => (
-        <div key={e.meta.message_id || i} className="reading space-y-1 border-t border-line pt-2 text-sm">
+        <div key={e.meta.message_id || e.meta.source || i} className="reading space-y-1 border-t border-line pt-2 text-sm">
           {e.messages.map((m, j) => (
             <p key={j}>
               <span className="section-head border-0 mr-2">{m.role}</span>
@@ -172,7 +187,7 @@ function Preview({ id }: { id: string }) {
             </p>
           ))}
           <p className="meta">
-            {e.meta.mode ?? ''} {e.meta.model ? `· ${e.meta.model}` : ''} {e.meta.rating ? `· rated ${e.meta.rating > 0 ? 'up' : 'down'}` : ''}
+            {e.meta.source ?? ''} {e.meta.mode ?? ''} {e.meta.model ? `· ${e.meta.model}` : ''} {e.meta.rating ? `· rated ${e.meta.rating > 0 ? 'up' : 'down'}` : ''}
           </p>
         </div>
       ))}
@@ -201,7 +216,7 @@ function Routes({ routes, policy, models, onChange }: { routes: TrainingRoute[];
       <ListGroup empty="No routes: every class follows the default policy.">
         {routes.map((r) => (
           <Row key={r.task_class + r.endpoint} action={<button onClick={() => remove.mutate(r)} className={btn.danger}>remove</button>}>
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-baseline gap-x-2">
               <span className="section-head border-0 shrink-0">{r.task_class}</span>
               <span className="font-mono text-xs">{r.endpoint}</span>
             </span>
@@ -275,8 +290,8 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
           <Row
             key={j.id}
             action={
-              <span className="flex items-center gap-3">
-                <button onClick={() => setShowLog(showLog === j.id ? null : j.id)} className="text-xs text-fg-2 hover:text-fg">
+              <span className="flex flex-wrap items-center gap-x-3">
+                <button onClick={() => setShowLog(showLog === j.id ? null : j.id)} className={btn.link}>
                   {showLog === j.id ? 'hide log' : 'log'}
                 </button>
                 {(j.status === 'queued' || j.status === 'running') && (
@@ -285,7 +300,7 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
               </span>
             }
           >
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-baseline gap-x-2">
               <StatusWord s={j.status} />
               {j.adapter_name} <span className="meta">on {j.base_model}</span>
             </span>
@@ -340,11 +355,19 @@ function Jobs({ jobs, runner, targets, datasets, models, onChange }: { jobs: Fin
   )
 }
 
-function Adapters({ adapters, onChange }: { adapters: Adapter[]; onChange: () => void }) {
+/** The sentence the promote confirmations add when the eval rests on few examples. */
+function smokeBody(examples: number, smoke: number) {
+  return `The eval had only ${examples} held-out examples (fewer than ${smoke}), and one example moves the score by ${pointsPerExample(examples)} points: the verdict is a smoke result, not a measurement.`
+}
+
+function Adapters({ adapters, smoke, onChange }: { adapters: Adapter[]; smoke: number; onChange: () => void }) {
+  const confirmDialog = useConfirm()
   const [err, setErr] = useState('')
   // The task class a promotion routes to; '' enables the endpoint only.
   const [taskClass, setTaskClass] = useState('chat')
-  const evaluate = useMutation({ mutationFn: (id: string) => api.post(`/api/training/adapters/${id}/evaluate`, {}), onSuccess: onChange, onError: (e) => setErr(e.message) })
+  // The server runs the worker's own checks before it queues anything, so a click that cannot work
+  // answers at once with the reason, and so does a second click while one is queued or running.
+  const evaluate = useMutation({ mutationFn: (id: string) => api.post(`/api/training/adapters/${id}/evaluate`, {}), onMutate: () => setErr(''), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const promote = useMutation({ mutationFn: ({ id, force }: { id: string; force: boolean }) => api.post(`/api/training/adapters/${id}/promote`, { force, task_class: taskClass || undefined }), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const unpromote = useMutation({ mutationFn: (id: string) => api.del(`/api/training/adapters/${id}/promote`), onSuccess: onChange, onError: (e) => setErr(e.message) })
   const remove = useMutation({ mutationFn: (id: string) => api.del(`/api/training/adapters/${id}`), onSuccess: onChange, onError: (e) => setErr(e.message) })
@@ -368,34 +391,61 @@ function Adapters({ adapters, onChange }: { adapters: Adapter[]; onChange: () =>
           <Row
             key={a.id}
             action={
-              <span className="flex items-center gap-3">
-                <a href={`/api/training/adapters/${a.id}/download`} download className="text-xs text-fg-2 hover:text-fg">download</a>
-                {a.endpoint_id && (
-                  <button onClick={() => evaluate.mutate(a.id)} disabled={evaluate.isPending} className="text-xs text-fg-2 hover:text-fg" title="Run the held-out set through the adapter's endpoint and its base; needs the adapter loaded on the server">
-                    evaluate
-                  </button>
+              <span className="flex flex-wrap items-center gap-x-3">
+                <a href={`/api/training/adapters/${a.id}/download`} download className={btn.link}>download</a>
+                {a.endpoint_id && (a.eval_job?.state === 'queued' || a.eval_job?.state === 'running') ? (
+                  <span className="meta">{a.eval_job.state === 'queued' ? 'evaluation queued…' : 'evaluating…'}</span>
+                ) : (
+                  a.endpoint_id && (
+                    <button onClick={() => evaluate.mutate(a.id)} disabled={evaluate.isPending} className={btn.link} title="Run the held-out set through the adapter's endpoint and its base; needs the adapter loaded on the server">
+                      {a.eval_job?.state === 'failed' ? 'evaluate again' : 'evaluate'}
+                    </button>
+                  )
                 )}
                 {a.promoted ? (
-                  <button onClick={() => unpromote.mutate(a.id)} className="text-xs text-fg-2 hover:text-fg">unpromote</button>
+                  <button onClick={() => unpromote.mutate(a.id)} className={btn.link}>unpromote</button>
                 ) : (
                   <>
-                    <button onClick={() => promote.mutate({ id: a.id, force: false })} className={btn.secondarySm}>promote</button>
-                    <button onClick={() => { if (confirm('Promote without the eval gate?')) promote.mutate({ id: a.id, force: true }) }} className="text-xs text-fg-2 hover:text-fg">force</button>
+                    <button
+                      onClick={async () => {
+                        // A passing gate on a few examples is worth a second look before it goes live.
+                        if (a.eval && isSmokeEval(a.eval.examples, smoke) && !(await confirmDialog({ title: 'Promote on a smoke result?', body: smokeBody(a.eval.examples, smoke), confirm: 'Promote' }))) return
+                        promote.mutate({ id: a.id, force: false })
+                      }}
+                      className={btn.secondarySm}
+                    >
+                      promote
+                    </button>
+                    <button onClick={async () => { if (await confirmDialog({ title: 'Promote without the eval gate?', body: `The adapter goes live even if it scored below its base model.${a.eval && isSmokeEval(a.eval.examples, smoke) ? ` ${smokeBody(a.eval.examples, smoke)}` : ''}`, confirm: 'Promote anyway', danger: true })) promote.mutate({ id: a.id, force: true }) }} className={btn.link}>force</button>
                   </>
                 )}
-                <button onClick={() => { if (confirm(`Delete adapter ${a.name}?`)) remove.mutate(a.id) }} className={btn.danger}>delete</button>
+                <button onClick={async () => { if (await confirmDialog({ title: `Delete adapter ${a.name}?`, body: 'The stored adapter files are removed.', confirm: 'Delete adapter', danger: true })) remove.mutate(a.id) }} className={btn.danger}>delete</button>
               </span>
             }
           >
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-baseline gap-x-2">
               <span className={clsx('section-head border-0 shrink-0', a.promoted ? 'text-fg' : 'text-fg-3')}>{a.promoted ? 'promoted' : 'adapter'}</span>
               {a.name} <span className="meta">on {a.base_model}</span>
             </span>
             <span className="meta block">
               {a.endpoint_id ? `endpoint ${a.endpoint_id} · ` : 'no endpoint (job named no base endpoint) · '}
-              {a.eval ? `eval ${pct(a.eval_score)} vs base ${pct(a.baseline_score)} on ${a.eval.examples} (${a.eval.adapter_wins}–${a.eval.baseline_wins}–${a.eval.ties}) · ` : 'not evaluated · '}
+              {a.eval ? (
+                <>
+                  {`eval ${pct(a.eval_score)} vs base ${pct(a.baseline_score)} on ${a.eval.examples} (${a.eval.adapter_wins}–${a.eval.baseline_wins}–${a.eval.ties})`}
+                  {isSmokeEval(a.eval.examples, smoke) && <span className="section-head border-0 ml-1.5 text-fg-2" title={smokeTitle(a.eval.examples, smoke)}>smoke result</span>}
+                  {' · '}
+                </>
+              ) : (
+                'not evaluated · '
+              )}
+              {a.recipe_id?.Valid ? `from a recipe${a.system_prompt ? `, trained under its system prompt (“${a.system_prompt.slice(0, 60)}${a.system_prompt.length > 60 ? '…' : ''}”)` : ''}${a.rubric ? ', judged by its rubric' : ''} · ` : ''}
               {(a.bytes / 1024 / 1024).toFixed(1)} MB · {ago(a.created_at)}
             </span>
+            {a.eval_job?.state === 'failed' && (
+              <span className="block whitespace-normal break-words text-xs text-danger">
+                The last evaluation failed{a.eval_job.at ? ` ${ago(a.eval_job.at)}` : ''}: {a.eval_job.error}
+              </span>
+            )}
           </Row>
         ))}
       </ListGroup>
@@ -405,96 +455,3 @@ function Adapters({ adapters, onChange }: { adapters: Adapter[]; onChange: () =>
 }
 
 /** Formats a parameter count the way model names do: 494M, 1.5B, 7.6B. */
-function paramsLabel(n?: number) {
-  if (!n) return ''
-  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 10e9 ? 0 : 1)}B`
-  return `${Math.round(n / 1e6)}M`
-}
-
-function countLabel(n: number) {
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-  if (n >= 1e3) return `${Math.round(n / 1e3)}k`
-  return String(n)
-}
-
-/**
- * The base model field: a Hugging Face id, typed or picked. Typing searches
- * the hub through the server (debounced); an empty box lists the suggested
- * small bases. Arrow keys move, Enter picks, Escape closes; the typed text
- * is always accepted as is, so an id the hub does not list still works.
- */
-function BaseModelPicker({ value, onChange }: { value: string; onChange: (id: string) => void }) {
-  const [open, setOpen] = useState(false)
-  const [q, setQ] = useState(value)
-  const [active, setActive] = useState(0)
-  const [debounced, setDebounced] = useState('')
-  const listId = useId()
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(q.trim()), 250)
-    return () => clearTimeout(t)
-  }, [q])
-  const hits = useQuery({
-    queryKey: ['training', 'hub', debounced],
-    queryFn: () => api.get<{ models: HubModel[] }>(`/api/training/models?q=${encodeURIComponent(debounced)}`),
-    enabled: open,
-    staleTime: 10 * 60 * 1000,
-    retry: false,
-  })
-  const models = hits.data?.models ?? []
-  useEffect(() => setActive(0), [debounced, open])
-  const pick = (id: string) => {
-    onChange(id)
-    setQ(id)
-    setOpen(false)
-  }
-  return (
-    <div className="relative flex-1 min-w-64">
-      <input
-        value={q}
-        role="combobox"
-        aria-expanded={open}
-        aria-controls={listId}
-        aria-autocomplete="list"
-        aria-label="Base model"
-        onChange={(e) => { setQ(e.target.value); onChange(e.target.value); setOpen(true) }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 120)}
-        onKeyDown={(e) => {
-          if (!open && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { setOpen(true); return }
-          if (e.key === 'ArrowDown') { e.preventDefault(); setActive((a) => Math.min(a + 1, models.length - 1)) }
-          else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((a) => Math.max(a - 1, 0)) }
-          else if (e.key === 'Enter' && open && models[active]) { e.preventDefault(); pick(models[active].id) }
-          else if (e.key === 'Escape') setOpen(false)
-        }}
-        placeholder="base model: a Hugging Face id, e.g. Qwen/Qwen2.5-0.5B-Instruct"
-        title="What the trainer downloads and trains on. Type to search the hub; required unless the endpoint's model name is already a Hugging Face id (org/name)"
-        className={clsx(inputSm, 'font-mono')}
-      />
-      {open && (
-        <ul id={listId} role="listbox" className="absolute z-20 mt-1 max-h-72 w-full overflow-y-auto rounded-lg border border-line bg-bg-2 py-1 font-sans text-sm">
-          {hits.isError && <li className="px-3 py-1.5 meta">The model hub did not answer; type the id by hand.</li>}
-          {!hits.isError && hits.isFetching && models.length === 0 && <li className="px-3 py-1.5 meta">Searching…</li>}
-          {!hits.isError && !hits.isFetching && models.length === 0 && debounced && <li className="px-3 py-1.5 meta">No text-generation model matches; the id typed above is used as is.</li>}
-          {!debounced && models.length > 0 && <li className="px-3 py-1 meta">suggested small bases</li>}
-          {models.map((m, i) => (
-            <li
-              key={m.id}
-              role="option"
-              aria-selected={i === active}
-              onMouseDown={(e) => { e.preventDefault(); pick(m.id) }}
-              onMouseEnter={() => setActive(i)}
-              className={clsx('flex cursor-pointer items-baseline gap-2 px-3 py-1.5', i === active ? 'bg-bg-3' : 'hover:bg-bg-3')}
-            >
-              <span className="font-mono text-xs truncate">{m.id}</span>
-              <span className="meta ml-auto shrink-0 tnum">
-                {paramsLabel(m.params)}
-                {m.downloads ? ` · ${countLabel(m.downloads)} downloads` : ''}
-                {m.gated ? ' · gated' : ''}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  )
-}

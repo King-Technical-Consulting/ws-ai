@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { useFavorites } from '../lib/favorites'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useChat } from '@ai-sdk/react'
 import { DefaultChatTransport, lastAssistantMessageIsCompleteWithApprovalResponses, type UIMessage } from 'ai'
@@ -7,10 +8,11 @@ import { api, type Conversation, type ModelsResponse } from '../api'
 import { MessageList } from '../components/MessageList'
 import { Composer, type FilePart } from '../components/Composer'
 import { ModelPicker } from '../components/ModelPicker'
-import { ArtifactContext, ArtifactPanel, type ArtifactRef } from '../components/ArtifactPanel'
+import { ArtifactContext, ArtifactPanel, ArtifactsList, type ArtifactRef } from '../components/ArtifactPanel'
 import { CodePanel } from '../components/CodePanel'
 import { DesignPanel } from '../components/DesignPanel'
-import { Palette, PanelRight } from 'lucide-react'
+import { Palette, PanelRight, SquareTerminal } from 'lucide-react'
+import clsx from 'clsx'
 
 type ConvResponse = { conversation: Conversation; messages: UIMessage[] }
 
@@ -30,11 +32,18 @@ export default function Chat() {
       initial={conv.data}
       models={models.data}
       onTitleMaybeChanged={() => {
-        qc.invalidateQueries({ queryKey: ['convs'] })
-        // The cached conversation seeds the chat when this page is opened
-        // again; without this, going back to it shows the empty copy loaded
-        // when it was created, until a reload.
-        qc.invalidateQueries({ queryKey: ['conv', id] })
+        const refresh = () => {
+          qc.invalidateQueries({ queryKey: ['convs'] })
+          // The cached conversation seeds the chat when this page is opened
+          // again; without this, going back to it shows the empty copy loaded
+          // when it was created, until a reload.
+          qc.invalidateQueries({ queryKey: ['conv', id] })
+        }
+        refresh()
+        // The title is written by a background job after the reply ends, a
+        // model call away, so read again while it lands. A refresh after
+        // leaving the page is harmless: the client is shared.
+        for (const ms of [3000, 8000, 20000]) setTimeout(refresh, ms)
       }}
     />
   )
@@ -67,6 +76,7 @@ function ChatInner({
 }) {
   const [model, setModel] = useState(initial.conversation.model_selector || 'auto')
   const [reasoning, setReasoning] = useState(false)
+  const [plan, setPlan] = useState(false)
   const modelRef = useRef(model)
   const reasoningRef = useRef(reasoning)
   modelRef.current = model
@@ -98,18 +108,35 @@ function ChatInner({
     }
   }, [model, id, initial.conversation.model_selector])
 
-  // Artifact panel: open the newest artifact when one arrives.
-  const [panel, setPanel] = useState<{ id: string; version?: number } | null>(() => {
-    const a = latestArtifact(initial.messages)
-    return a ? { id: a.artifact_id, version: a.version } : null
-  })
+  // Artifact panel: closed when a conversation is opened, whatever it holds. An artifact that
+  // arrives while you are here opens it, on a screen wide enough to show it beside the chat; on a
+  // phone the panel covers the chat, so it only opens when you tap the artifact's card.
+  const [panel, setPanel] = useState<{ id: string; version?: number } | null>(null)
+  // One right-hand panel at a time: the sandbox, the design system, the artifacts list or one
+  // artifact. Opening one closes the others.
+  const isCode = initial.conversation.mode === 'code'
+  const isDesign = initial.conversation.mode === 'design'
+  const [codeOpen, setCodeOpen] = useState(isCode)
+  const [designOpen, setDesignOpen] = useState(false)
+  const [listOpen, setListOpen] = useState(false)
+  const showOnly = (which: 'code' | 'design' | 'list' | 'artifact' | null, artifact?: { id: string; version?: number }) => {
+    setCodeOpen(which === 'code')
+    setDesignOpen(which === 'design')
+    setListOpen(which === 'list')
+    setPanel(which === 'artifact' && artifact ? artifact : null)
+  }
   const lastSeen = useRef<string | null>(latestArtifact(initial.messages)?.version_id ?? null)
+  const anyOpen = useRef(false)
+  anyOpen.current = codeOpen || designOpen || listOpen
   useEffect(() => {
     const a = latestArtifact(chat.messages)
     if (a && a.version_id !== lastSeen.current) {
       lastSeen.current = a.version_id
-      setPanel({ id: a.artifact_id, version: a.version })
+      qc.invalidateQueries({ queryKey: ['conv-artifacts', id] })
+      // Beside the chat, never over it, and never in place of a panel that is open.
+      if (window.matchMedia('(min-width: 768px)').matches && !anyOpen.current) setPanel({ id: a.artifact_id, version: a.version })
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.messages])
 
   // Ratings (PLAN M10): thumbs on assistant answers, one per user.
@@ -151,28 +178,57 @@ function ChatInner({
   }, [attach])
 
   const busy = chat.status === 'submitted' || chat.status === 'streaming'
-  const isCode = initial.conversation.mode === 'code'
-  const isDesign = initial.conversation.mode === 'design'
-  const [codeOpen, setCodeOpen] = useState(isCode)
-  const [designOpen, setDesignOpen] = useState(false)
+  const fav = useFavorites()
+  const nav = useNavigate()
+  const prompts = useQuery({ queryKey: ['saved-prompts'], queryFn: () => api.get<{ prompts: { id: string; name: string; text: string }[] }>('/api/saved-prompts') })
+  // A research notebook's chat carries the notebook id in its settings.
+  const notebookId = (initial.conversation.settings as { notebook_id?: string } | null | undefined)?.notebook_id
+  // Whether there is an artifact to list: one in the messages, or any the server has for this
+  // conversation (a code conversation's artifacts come from elsewhere than its chat).
+  const artifactRows = useQuery({ queryKey: ['conv-artifacts', id], queryFn: () => api.get<unknown[] | null>(`/api/conversations/${id}/artifacts`) })
+  const hasArtifacts = latestArtifact(chat.messages) !== null || (artifactRows.data?.length ?? 0) > 0
+  const headerBtn = (on: boolean) => clsx('shrink-0 p-1.5 min-h-9 min-w-9 md:min-h-0 md:min-w-0 inline-flex items-center justify-center rounded-md', on ? 'text-fg bg-bg-3' : 'text-fg-2 hover:bg-bg-3 hover:text-fg')
 
   return (
-    <ArtifactContext.Provider value={{ open: (aid, version) => setPanel({ id: aid, version }) }}>
+    <ArtifactContext.Provider value={{ open: (aid, version) => showOnly('artifact', { id: aid, version }) }}>
       <div className="flex-1 min-h-0 flex">
         <div className="flex-1 min-w-0 flex flex-col">
           <header className="h-12 shrink-0 border-b border-line flex items-center justify-between px-4 gap-3">
             <h2 className="reading-tight truncate text-fg">{initial.conversation.title || 'New conversation'}</h2>
-            <div className="flex items-center gap-2">
+            {notebookId && (
+              <Link to={`/notebooks/${notebookId}`} className="meta shrink-0 text-accent border-b border-dotted border-link-underline hover:text-accent-hover">
+                Notebook
+              </Link>
+            )}
+            {/* min-w-0 and shrink-0: with a side panel open the chat column is narrow, and it is the model picker that gives way, not the panel buttons */}
+            <div className="flex items-center gap-2 min-w-0">
               <ModelPicker value={model} onChange={setModel} models={models} reasoning={reasoning} onReasoning={setReasoning} />
-              {isCode && !codeOpen && (
-                <button onClick={() => setCodeOpen(true)} className="p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg" title="Files, terminal, preview" aria-label="Open code panel">
+              {hasArtifacts && (
+                <button
+                  onClick={() => showOnly(listOpen || panel ? null : 'list')}
+                  className={headerBtn(listOpen || !!panel)}
+                  title="Artifacts"
+                  aria-label="Artifacts"
+                  aria-pressed={listOpen || !!panel}
+                >
                   <PanelRight size={16} />
+                </button>
+              )}
+              {isCode && (
+                <button
+                  onClick={() => showOnly(codeOpen ? null : 'code')}
+                  className={headerBtn(codeOpen)}
+                  title="Sandbox: files, terminal, preview"
+                  aria-label="Sandbox: files, terminal, preview"
+                  aria-pressed={codeOpen}
+                >
+                  <SquareTerminal size={16} />
                 </button>
               )}
               {isDesign && (
                 <button
-                  onClick={() => setDesignOpen(!designOpen)}
-                  className={designOpen ? 'p-1.5 rounded-md text-fg bg-bg-3' : 'p-1.5 rounded-md text-fg-2 hover:bg-bg-3 hover:text-fg'}
+                  onClick={() => showOnly(designOpen ? null : 'design')}
+                  className={headerBtn(designOpen)}
                   title="Design system"
                   aria-label="Design system"
                   aria-pressed={designOpen}
@@ -186,28 +242,52 @@ function ChatInner({
             messages={chat.messages}
             status={chat.status}
             error={chat.error}
-            onApproval={(approvalId, approved) => chat.addToolApprovalResponse({ id: approvalId, approved })}
+            onApproval={(approvalId, approved, reason) => chat.addToolApprovalResponse({ id: approvalId, approved, reason })}
             ratings={ratings.data?.ratings}
             onRate={(messageId, score) => rate.mutate({ messageId, score })}
+            notebookId={notebookId}
+            isStarred={(mid) => fav.isStarred('message', mid)}
+            onStar={(mid) => fav.toggle('message', mid)}
           />
           <Composer
             disabled={busy}
+            plan={plan}
+            onPlan={setPlan}
+            savedPrompts={prompts.data?.prompts}
+            onCommand={async (name, arg) => {
+              if (name === 'remember') {
+                if (!arg) return 'Say what to remember: /remember I prefer metric units.'
+                try {
+                  await api.post('/api/memory', { content: arg })
+                  return 'Remembered. You can change it under Settings, Memory.'
+                } catch (e) {
+                  return e instanceof Error ? e.message : 'Could not remember that.'
+                }
+              }
+              if (name === 'schedule') nav(arg ? `/scheduled?prompt=${encodeURIComponent(arg)}` : '/scheduled')
+              if (name === 'notebook') nav('/notebooks')
+            }}
             imageNote={noVisionNote(model, models)}
             initialFiles={initialFiles}
             onStop={busy ? () => chat.stop() : undefined}
-            onSend={(text, files) => {
-              chat.sendMessage({ text, files })
+            onSend={(text, files, opts) => {
+              // Plan mode applies to this message only; the resume that
+              // follows an approval is not a new turn and never carries it.
+              chat.sendMessage({ text, files }, opts?.plan ? { body: { plan: true } } : undefined)
+              setPlan(false)
             }}
           />
         </div>
         {isCode && codeOpen && <CodePanel projectId={initial.conversation.project_id} onClose={() => setCodeOpen(false)} />}
         {isDesign && designOpen && <DesignPanel conversationId={id} settings={initial.conversation.settings} onClose={() => setDesignOpen(false)} />}
-        {panel && !(isCode && codeOpen) && !designOpen && (
+        {listOpen && <ArtifactsList conversationId={id} onPick={(aid, version) => showOnly('artifact', { id: aid, version })} onClose={() => setListOpen(false)} />}
+        {panel && (
           <ArtifactPanel
             id={panel.id}
             version={panel.version}
             onClose={() => setPanel(null)}
             onVersion={(v) => setPanel({ id: panel.id, version: v })}
+            onBack={() => showOnly('list')}
           />
         )}
       </div>

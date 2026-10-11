@@ -121,6 +121,18 @@ services:
       app:
         condition: service_healthy   # app owns migrations; wait for it
 
+  # ---- OCR (profile "ocr") ----
+  # Reads scans and photographs for document reading (PLAN M13). Set
+  # OCR_URL=http://ocr:8000 in .env and start with --profile ocr. No port is
+  # published: only app and worker reach it. See infra/ocr/README.md.
+  ocr:
+    image: ${WS_OCR_IMAGE:-ws-ocr:latest}
+    build:
+      context: ../ocr
+    restart: unless-stopped
+    logging: *logging
+    profiles: ["ocr"]
+
   # ---- MCP servers (profile "infisical") ----
   # Infisical's MCP server is stdio-only; supergateway bridges it to
   # Streamable HTTP on the internal network. ws connects per config/mcp.yaml

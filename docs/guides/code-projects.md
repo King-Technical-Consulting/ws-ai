@@ -6,6 +6,8 @@ A code project gives the assistant a sandbox: a private Linux container with you
 
 Choose "New code project" in the sidebar, optionally with an `https://` clone URL. ws creates your sandbox and clones the repository into it when you open the project's panel or the assistant first uses a tool. There is one sandbox per user and project, with a persistent volume at `/workspace`. Code conversations run on the worker, the only process that can talk to Docker, and stream back to your browser.
 
+If the sandbox does not come up, the panel says so instead of staying blank: a red block names the step that failed (image pull, workspace volume, container start or repository clone), gives the reason the worker recorded, and has a **Retry** button. The panel stops asking while a failure stands, so one failed pull is one attempt, not one every few seconds; Retry starts a new attempt. A clone that fails after the sandbox is running (for example a private repository with no GitHub credential configured) is shown the same way while the sandbox itself stays up. The reason is the newest setup error recorded for your sandbox, unless a later start or successful clone came after it (`GET /api/projects/{id}/sandbox/status` in the [API reference](../API.md)).
+
 Sandboxes need Docker reachable from the worker. If Docker is not available the worker logs it and runs without sandboxes, and code projects will not work.
 
 ## What the assistant can do
@@ -21,7 +23,7 @@ Sandboxes need Docker reachable from the worker. If Docker is not available the 
 
 ## The side panel
 
-Code conversations open with a side panel (you can close it and reopen it, and while it is open it takes the place of the artifact panel). It has three tabs:
+Code conversations open with a side panel (you can close it and reopen it with the **Sandbox** button, the terminal icon in the chat header, and only one side panel is open at a time, so opening the artifacts list or an artifact closes it). It has three tabs:
 
 - **Files:** a file tree and a CodeMirror editor; Cmd or Ctrl+S saves into the sandbox.
 - **Terminal:** a real `bash` in the sandbox.

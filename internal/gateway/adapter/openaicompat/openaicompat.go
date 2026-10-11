@@ -313,7 +313,7 @@ func buildMessage(m gateway.Message) ([]sdk.ChatCompletionMessageParamUnion, err
 				parts = nil
 			}
 		}
-		for _, p := range m.Parts {
+		for _, p := range gateway.ResolveAlt(m.Parts, false) {
 			switch p.Kind {
 			case gateway.PartText:
 				if p.Text != "" {

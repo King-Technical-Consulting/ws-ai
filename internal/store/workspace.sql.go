@@ -325,11 +325,36 @@ func (q *Queries) GetAttachment(ctx context.Context, id uuid.UUID) (Attachment, 
 }
 
 const getConversation = `-- name: GetConversation :one
-SELECT id, project_id, user_id, title, mode, agent_id, model_selector, settings, compaction_head_message_seq, created_at, updated_at, archived_at FROM conversations WHERE id = $1 AND archived_at IS NULL
+SELECT c.id, c.project_id, c.user_id, c.title, c.mode, c.agent_id, c.model_selector, c.settings, c.compaction_head_message_seq, c.created_at, c.updated_at, c.archived_at FROM conversations c JOIN projects p ON p.id = c.project_id
+WHERE c.id = $1 AND c.archived_at IS NULL AND p.archived_at IS NULL
 `
 
 func (q *Queries) GetConversation(ctx context.Context, id uuid.UUID) (Conversation, error) {
 	row := q.db.QueryRow(ctx, getConversation, id)
+	var i Conversation
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.UserID,
+		&i.Title,
+		&i.Mode,
+		&i.AgentID,
+		&i.ModelSelector,
+		&i.Settings,
+		&i.CompactionHeadMessageSeq,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
+const getConversationAny = `-- name: GetConversationAny :one
+SELECT id, project_id, user_id, title, mode, agent_id, model_selector, settings, compaction_head_message_seq, created_at, updated_at, archived_at FROM conversations WHERE id = $1
+`
+
+func (q *Queries) GetConversationAny(ctx context.Context, id uuid.UUID) (Conversation, error) {
+	row := q.db.QueryRow(ctx, getConversationAny, id)
 	var i Conversation
 	err := row.Scan(
 		&i.ID,
@@ -377,6 +402,29 @@ SELECT id, owner_id, name, kind, settings, repo_url, default_branch, github_inst
 
 func (q *Queries) GetProject(ctx context.Context, id uuid.UUID) (Project, error) {
 	row := q.db.QueryRow(ctx, getProject, id)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.Kind,
+		&i.Settings,
+		&i.RepoUrl,
+		&i.DefaultBranch,
+		&i.GithubInstallationID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
+const getProjectAny = `-- name: GetProjectAny :one
+SELECT id, owner_id, name, kind, settings, repo_url, default_branch, github_installation_id, created_at, updated_at, archived_at FROM projects WHERE id = $1
+`
+
+func (q *Queries) GetProjectAny(ctx context.Context, id uuid.UUID) (Project, error) {
+	row := q.db.QueryRow(ctx, getProjectAny, id)
 	var i Project
 	err := row.Scan(
 		&i.ID,
@@ -852,8 +900,9 @@ func (q *Queries) ListProjectsForUser(ctx context.Context, userID uuid.UUID) ([]
 }
 
 const listRecentConversationsForUser = `-- name: ListRecentConversationsForUser :many
-SELECT id, project_id, user_id, title, mode, agent_id, model_selector, settings, compaction_head_message_seq, created_at, updated_at, archived_at FROM conversations WHERE user_id = $1 AND archived_at IS NULL
-ORDER BY updated_at DESC LIMIT $2
+SELECT c.id, c.project_id, c.user_id, c.title, c.mode, c.agent_id, c.model_selector, c.settings, c.compaction_head_message_seq, c.created_at, c.updated_at, c.archived_at FROM conversations c JOIN projects p ON p.id = c.project_id
+WHERE c.user_id = $1 AND c.archived_at IS NULL AND p.archived_at IS NULL
+ORDER BY c.updated_at DESC LIMIT $2
 `
 
 type ListRecentConversationsForUserParams struct {
@@ -903,6 +952,24 @@ func (q *Queries) NextMessageSeq(ctx context.Context, conversationID uuid.UUID) 
 	var column_1 int32
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const restoreConversation = `-- name: RestoreConversation :exec
+UPDATE conversations SET archived_at = NULL WHERE id = $1
+`
+
+func (q *Queries) RestoreConversation(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, restoreConversation, id)
+	return err
+}
+
+const restoreProject = `-- name: RestoreProject :exec
+UPDATE projects SET archived_at = NULL WHERE id = $1
+`
+
+func (q *Queries) RestoreProject(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, restoreProject, id)
+	return err
 }
 
 const setCompactionHead = `-- name: SetCompactionHead :exec

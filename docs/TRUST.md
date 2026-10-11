@@ -13,7 +13,10 @@ A code project gets one Docker container per user, created by the worker. From `
 - a read-only root filesystem, with writable space only in `/tmp`, `/home/dev` and `/run` tmpfs mounts and the project's `/workspace` volume;
 - all Linux capabilities dropped and `no-new-privileges` set;
 - a memory limit (4096 MB by default), a CPU limit and a process limit;
-- a non-root user, an init process, and gVisor (`runsc`) as the runtime when it is installed, otherwise runc.
+- a non-root user, an init process, and gVisor (`runsc`) as the runtime when it is installed, otherwise runc;
+- no privileged mode and no host devices.
+
+The owner can turn the read-only root, the capability drop and `no-new-privileges` off with `WS_SANDBOX_HARDENING=off` on a box where an image breaks under them; the worker logs a warning when it is off. It is on by default.
 
 An optional extra layer, `WS_SANDBOX_JAIL` (off by default), runs each `bash` command inside bubblewrap: a read-only view of the container with only `/workspace`, `/home/dev` and `/tmp` writable, and its own process, IPC and hostname namespaces, so a command cannot see or signal the other processes in the container. The network is not changed by it. It needs user namespaces, which Docker's default seccomp profile blocks, so it has not been tried inside a real sandbox container; with it on and `bwrap` failing, every `bash` call fails. One test host (Ubuntu, reported by `claude-swarm`) needed both Docker's seccomp profile and AppArmor's `kernel.apparmor_restrict_unprivileged_userns` relaxed before `bwrap` ran in the sandbox image; relaxing either alone was not enough, and nothing was relaxed or run with the jail on.
 

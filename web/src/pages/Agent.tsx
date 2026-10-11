@@ -1,12 +1,12 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UIMessage } from 'ai'
 import clsx from 'clsx'
-import { api, type AgentDetail, type AgentInput, type AgentMemory, type AgentRun, type AgentStep, type AgentTrigger, type Approval, type Conversation, type ModelsResponse, type Project } from '../api'
-import { SectionHead, PageTitle, Callout, ListGroup, btn, inputSm } from '../components/ui'
+import { api, type AgentDetail, type AgentInput, type AgentMemory, type AgentRun, type AgentStep, type AgentTrigger, type Approval, type Conversation, type ModelsResponse, type Project, type SkillFolderImport, type StoredSkill } from '../api'
+import { SectionHead, PageTitle, Callout, ListGroup, btn, inputSm, useConfirm } from '../components/ui'
 import { MessageList } from '../components/MessageList'
-import { AgentForm, ago, until } from './Agents'
+import { AgentForm, SkillFolderReview, ago, until } from './Agents'
 import { useMe } from '../App'
 
 const OPEN = new Set(['queued', 'running', 'paused_approval', 'paused_steer', 'paused_manual'])
@@ -17,6 +17,7 @@ const OPEN = new Set(['queued', 'running', 'paused_approval', 'paused_steer', 'p
  * transcript and a steer box. Polls while a run is open.
  */
 export default function AgentMonitor() {
+  const confirmDialog = useConfirm()
   const { id = '' } = useParams()
   const qc = useQueryClient()
   const nav = useNavigate()
@@ -77,7 +78,7 @@ export default function AgentMonitor() {
             </div>
             {a.goal && <p className="reading text-fg-2">{a.goal}</p>}
             <p className="meta">
-              {a.model_policy?.selector ?? 'auto'} · {a.model_policy?.task_class ?? 'chat'} · up to {a.max_steps} steps
+              {a.model_policy?.selector ?? 'auto'} · {a.model_policy?.task_class ?? 'chat'} · up to {a.max_steps} steps{a.max_run_usd > 0 ? ` · at most $${a.max_run_usd.toFixed(2)} a run` : ''}
               {a.last_run_at ? ` · last run ${ago(a.last_run_at)}` : ''}
             </p>
           </div>
@@ -93,8 +94,8 @@ export default function AgentMonitor() {
               {editing ? 'Close' : 'Edit'}
             </button>
             <button
-              onClick={() => {
-                if (confirm(`Delete ${a.name} and its runs?`)) remove.mutate()
+              onClick={async () => {
+                if (await confirmDialog({ title: `Delete ${a.name}?`, body: 'Its runs go with it.', confirm: 'Delete agent', danger: true })) remove.mutate()
               }}
               className={clsx(btn.danger, 'ml-auto')}
             >
@@ -107,11 +108,13 @@ export default function AgentMonitor() {
             <AgentForm initial={a} projects={projects.data ?? []} models={models.data} pending={update.isPending} error={update.error as Error | null} onCancel={() => setEditing(false)} onSubmit={(input) => update.mutate(input)} />
           )}
 
-          <Budget agentID={id} usd={d.spend.usd} since={d.spend.since} budget={budget} owner={me.data?.role === 'owner'} onChange={refresh} />
+          <Budget agentID={id} usd={d.spend.usd} since={d.spend.since} budget={budget} isDefault={d.spend.default} owner={me.data?.role === 'owner'} onChange={refresh} />
 
           {d.pending_approvals.length > 0 && <Inbox approvals={d.pending_approvals} onDecided={refresh} onOpenRun={setSelectedRun} />}
 
           <Triggers agentID={id} triggers={d.triggers} onChange={refresh} />
+
+          <Skills agentID={id} skills={a.skills ?? []} onChange={refresh} />
 
           <Memories agentID={id} runs={d.runs} />
 
@@ -155,7 +158,7 @@ type AgentBudget = { id: string; period: string; limit_usd: number; on_exceed: s
  * changes the budget here (it is the same row Admin → budgets shows with
  * scope agent).
  */
-function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: string; usd: number; since: string; budget?: AgentBudget; owner?: boolean; onChange: () => void }) {
+function Budget({ agentID, usd, since, budget, isDefault, owner, onChange }: { agentID: string; usd: number; since: string; budget?: AgentBudget; isDefault?: boolean; owner?: boolean; onChange: () => void }) {
   const month = new Date(since).toLocaleDateString(undefined, { month: 'long' })
   const [editing, setEditing] = useState(false)
   const [limit, setLimit] = useState(budget?.limit_usd ?? 10)
@@ -168,6 +171,8 @@ function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: str
     },
   })
   const remove = useMutation({
+    // Removing applies only to this agent's own row; the default for every
+    // agent is changed under Admin, budgets.
     mutationFn: () => api.del(`/api/admin/budgets/${budget!.id}`),
     onSuccess: () => {
       setEditing(false)
@@ -180,7 +185,7 @@ function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: str
       <p className="meta">
         {budget ? (
           <>
-            ${usd.toFixed(2)} of ${budget.limit_usd.toFixed(2)} {budget.period === 'month' ? `in ${month}` : `per ${budget.period}`} ({pct}%). At the limit runs {budget.on_exceed === 'block' ? 'stop' : 'fall back to local models'}.
+            ${usd.toFixed(2)} of ${budget.limit_usd.toFixed(2)} {budget.period === 'month' ? `in ${month}` : `per ${budget.period}`} ({pct}%){isDefault ? ', the default for every agent' : ''}. At the limit runs {budget.on_exceed === 'block' ? 'stop' : 'fall back to local models'}.
           </>
         ) : (
           <>
@@ -216,7 +221,7 @@ function Budget({ agentID, usd, since, budget, owner, onChange }: { agentID: str
           <button type="submit" disabled={save.isPending || limit <= 0} className={btn.secondarySm}>
             Save
           </button>
-          {budget && (
+          {budget && !isDefault && (
             <button type="button" onClick={() => remove.mutate()} disabled={remove.isPending} className={btn.danger}>
               remove budget
             </button>
@@ -262,6 +267,106 @@ function Inbox({ approvals, onDecided, onOpenRun }: { approvals: Approval[]; onD
 }
 
 type TriggerKind = 'cron' | 'webhook' | 'repo_push'
+
+function Skills({ agentID, skills, onChange }: { agentID: string; skills: StoredSkill[]; onChange: () => void }) {
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [file, setFile] = useState<File | null>(null)
+  const [review, setReview] = useState<SkillFolderImport | null>(null)
+  const [error, setError] = useState('')
+  const post = async <T,>(path: string, f: File): Promise<T> => {
+    const fd = new FormData()
+    fd.append('file', f)
+    const res = await fetch(path, { method: 'POST', body: fd, credentials: 'same-origin' })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error((body as { error?: string }).error ?? 'Could not read that archive.')
+    return body as T
+  }
+  const pick = async (f: File | undefined) => {
+    setError('')
+    setReview(null)
+    setFile(null)
+    if (!f) return
+    try {
+      setReview(await post<SkillFolderImport>('/api/agents/presets/import-folder', f))
+      setFile(f)
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+  const approve = useMutation({
+    mutationFn: () => post<StoredSkill>(`/api/agents/${agentID}/skills`, file as File),
+    onSuccess: () => {
+      setReview(null)
+      setFile(null)
+      onChange()
+    },
+    onError: (e) => setError((e as Error).message),
+  })
+  const remove = useMutation({ mutationFn: (name: string) => api.del(`/api/agents/${agentID}/skills/${encodeURIComponent(name)}`), onSuccess: onChange })
+  // The member's shelf: skills approved once, picked here without a new upload.
+  const shelf = useQuery({ queryKey: ['skills'], queryFn: () => api.get<StoredSkill[]>('/api/skills') })
+  const [shelfPick, setShelfPick] = useState('')
+  const available = (shelf.data ?? []).filter((k) => !skills.some((s) => s.id === k.id))
+  const attach = useMutation({
+    mutationFn: (skill_id: string) => api.post(`/api/agents/${agentID}/skills`, { skill_id }),
+    onSuccess: () => {
+      setShelfPick('')
+      onChange()
+    },
+    onError: (e) => setError((e as Error).message),
+  })
+  return (
+    <section className="space-y-3">
+      <SectionHead aside={skills.length ? `${skills.length} approved` : undefined}>skills</SectionHead>
+      <ListGroup empty="No skills. A skill folder you approve here adds its instructions to every run; it grants no tool.">
+        {skills.map((k) => (
+          <li key={k.name} className="px-3 py-2 space-y-1">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-sm">{k.title}</span>
+              <button onClick={() => remove.mutate(k.name)} disabled={remove.isPending} className={btn.danger}>remove</button>
+            </div>
+            {k.description && <p className="meta">{k.description}</p>}
+            <p className="meta">
+              {k.has_scripts ? 'has scripts (run only in a code project, through bash)' : 'instructions only'} · {k.files.length} file{k.files.length === 1 ? '' : 's'} · approved {ago(k.approved_at)}
+            </p>
+            {(k.findings.length > 0 || k.refused_secrets.length > 0) && (
+              <details className="text-xs text-fg-2">
+                <summary className="cursor-pointer">findings</summary>
+                <ul className="list-disc pl-4">
+                  {k.refused_secrets.length > 0 && <li>credentials named, not stored: {k.refused_secrets.join(', ')}</li>}
+                  {k.findings.map((f) => <li key={f}>{f}</li>)}
+                </ul>
+              </details>
+            )}
+          </li>
+        ))}
+      </ListGroup>
+      {available.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <select value={shelfPick} onChange={(e) => setShelfPick(e.target.value)} aria-label="Skill from the shelf" className={`${inputSm} max-w-xs`}>
+            <option value="">Add a skill from the shelf…</option>
+            {available.map((k) => <option key={k.id} value={k.id}>{k.title}{k.has_scripts ? ' (scripts)' : ''}</option>)}
+          </select>
+          <button type="button" disabled={!shelfPick || attach.isPending} onClick={() => attach.mutate(shelfPick)} className={btn.secondarySm}>Add</button>
+        </div>
+      )}
+      <input ref={fileRef} type="file" accept=".zip,application/zip" aria-label="Skill folder to approve" className="hidden" onChange={(e) => { void pick(e.target.files?.[0]); e.target.value = '' }} />
+      <button type="button" onClick={() => fileRef.current?.click()} className={btn.secondarySm}>Approve a new skill folder (.zip)…</button>
+      {error && <Callout kind="error">{error}</Callout>}
+      {review && (
+        <div className="space-y-2">
+          <p className="text-sm">Read what is in "{review.skill.preset.title}" before you approve it. Approving keeps its instructions and files for this agent; nothing is run and no tool is granted.</p>
+          <SkillFolderReview folder={review} />
+          {(review.skill.warnings ?? []).length > 0 && <ul className="list-disc pl-4 text-xs text-fg-2">{review.skill.warnings.map((w) => <li key={w}>{w}</li>)}</ul>}
+          <div className="flex gap-2">
+            <button onClick={() => approve.mutate()} disabled={approve.isPending} className={btn.primarySm}>Approve for this agent</button>
+            <button onClick={() => { setReview(null); setFile(null) }} className={btn.secondarySm}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
 
 function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: AgentTrigger[]; onChange: () => void }) {
   const [kind, setKind] = useState<TriggerKind>('cron')
@@ -374,6 +479,7 @@ function Triggers({ agentID, triggers, onChange }: { agentID: string; triggers: 
 
 /** The memory browser: what reflection kept from earlier runs. */
 function Memories({ agentID, runs }: { agentID: string; runs: AgentRun[] }) {
+  const confirmDialog = useConfirm()
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const openRuns = runs.filter((r) => OPEN.has(r.status)).length
@@ -421,8 +527,8 @@ function Memories({ agentID, runs }: { agentID: string; runs: AgentRun[] }) {
               </button>
             )}
             <button
-              onClick={() => {
-                if (confirm('Forget everything this agent remembers?')) clear.mutate()
+              onClick={async () => {
+                if (await confirmDialog({ title: 'Forget everything?', body: 'This agent loses all of its memories.', confirm: 'Forget memories', danger: true })) clear.mutate()
               }}
               className={clsx(btn.danger, 'ml-auto')}
             >

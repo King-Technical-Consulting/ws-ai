@@ -1,8 +1,11 @@
 package httpx
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -274,6 +277,7 @@ func (s *Server) handleStartFinetune(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		DatasetID      string                  `json:"dataset_id"`
+		RecipeID       string                  `json:"recipe_id"`
 		BaseModel      string                  `json:"base_model"`
 		BaseEndpointID string                  `json:"base_endpoint_id"`
 		AdapterName    string                  `json:"adapter_name"`
@@ -283,12 +287,21 @@ func (s *Server) handleStartFinetune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json")
 		return
 	}
-	dsID, err := uuid.Parse(in.DatasetID)
-	if err != nil {
-		writeErr(w, 400, "bad dataset_id")
-		return
+	var dsID, recipeID uuid.UUID
+	var err error
+	if in.RecipeID != "" {
+		if recipeID, err = uuid.Parse(in.RecipeID); err != nil {
+			writeErr(w, 400, "bad recipe_id")
+			return
+		}
 	}
-	job, err := s.Training.StartFinetune(r.Context(), Principal(r.Context()).UserID, training.FinetuneSpec{DatasetID: dsID, BaseModel: in.BaseModel, BaseEndpointID: in.BaseEndpointID, AdapterName: in.AdapterName, Config: in.Config})
+	if in.DatasetID != "" || in.RecipeID == "" {
+		if dsID, err = uuid.Parse(in.DatasetID); err != nil {
+			writeErr(w, 400, "bad dataset_id")
+			return
+		}
+	}
+	job, err := s.Training.StartFinetune(r.Context(), Principal(r.Context()).UserID, training.FinetuneSpec{DatasetID: dsID, RecipeID: recipeID, BaseModel: in.BaseModel, BaseEndpointID: in.BaseEndpointID, AdapterName: in.AdapterName, Config: in.Config})
 	if err != nil {
 		writeTrainingErr(w, err)
 		return
@@ -335,7 +348,85 @@ func (s *Server) handleListAdapters(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"adapters": rows})
+	ids := make([]uuid.UUID, len(rows))
+	for i, a := range rows {
+		ids[i] = a.ID
+	}
+	jobs := s.evalJobs(r.Context(), ids)
+	out := make([]adapterView, len(rows))
+	for i, a := range rows {
+		out[i] = adapterView{Adapter: a, EvalJob: jobs[a.ID]}
+	}
+	writeJSON(w, 200, map[string]any{"adapters": out, "smoke_eval_examples": training.SmokeEvalExamples})
+}
+
+// adapterView is an adapter with where its newest evaluation stands.
+type adapterView struct {
+	store.Adapter
+	EvalJob *evalJobView `json:"eval_job"`
+}
+
+// evalJobView is the newest training.eval job of an adapter, from River's own table: `queued`
+// (waiting, scheduled or retrying), `running`, `failed` (it gave up or was cancelled, with the
+// error it recorded) or `done`. The adapter's own eval fields carry the result of a done one.
+type evalJobView struct {
+	State string     `json:"state"`
+	Error string     `json:"error,omitempty"`
+	At    *time.Time `json:"at"`
+}
+
+// evalJobs reads the newest training.eval job of each adapter. Any failure to read leaves the
+// map empty: the list is the adapters, and the state is a nicety on top of it.
+func (s *Server) evalJobs(ctx context.Context, ids []uuid.UUID) map[uuid.UUID]*evalJobView {
+	out := map[uuid.UUID]*evalJobView{}
+	if len(ids) == 0 {
+		return out
+	}
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	rows, err := s.DB.Pool.Query(ctx, `
+		SELECT DISTINCT ON (args->>'adapter_id') args->>'adapter_id', state::text,
+		       (errors)[COALESCE(array_length(errors, 1), 0)], COALESCE(finalized_at, attempted_at, created_at)
+		FROM river_job
+		WHERE kind = 'training.eval' AND args->>'adapter_id' = ANY($1)
+		ORDER BY args->>'adapter_id', id DESC`, strs)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id, state string
+			last      []byte
+			at        *time.Time
+		)
+		if rows.Scan(&id, &state, &last, &at) != nil {
+			continue
+		}
+		u, err := uuid.Parse(id)
+		if err != nil {
+			continue
+		}
+		v := &evalJobView{At: at}
+		switch state {
+		case "running":
+			v.State = "running"
+		case "completed":
+			v.State = "done"
+		case "discarded", "cancelled":
+			v.State = "failed"
+			v.Error = lastJobError(last)
+			if v.Error == "" {
+				v.Error = "the evaluation was cancelled"
+			}
+		default: // available, pending, scheduled, retryable
+			v.State = "queued"
+		}
+		out[u] = v
+	}
+	return out
 }
 
 // handleDownloadAdapter is GET /api/training/adapters/{id}/download: the
@@ -373,16 +464,15 @@ func (s *Server) handleEvaluateAdapter(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad id")
 		return
 	}
-	if _, err := s.DB.GetAdapter(r.Context(), id); err != nil {
-		writeErr(w, 404, "not found")
-		return
-	}
 	if s.Training.EnqueueEval == nil {
 		writeErr(w, 503, "no worker queue")
 		return
 	}
-	if err := s.Training.EnqueueEval(r.Context(), id); err != nil {
-		writeErr(w, 500, err.Error())
+	// The worker's own checks run here first (404 unknown adapter, 400 it cannot be evaluated,
+	// 409 nothing to judge yet or an evaluation already queued or running), so a click that
+	// cannot work says why at once.
+	if err := s.Training.QueueEval(r.Context(), id); err != nil {
+		writeTrainingErr(w, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"status": "queued", "at": time.Now().UTC()})
@@ -533,11 +623,21 @@ func (s *Server) handleSearchBaseModels(w http.ResponseWriter, r *http.Request) 
 func (s *Server) trainingRoutes(r chi.Router) {
 	r.Get("/datasets", s.handleListDatasets)
 	r.Post("/datasets", s.handleCreateDataset)
+	r.Post("/datasets/upload", s.handleUploadDataset)
+	r.Put("/datasets/{id}/mapping", s.handleSetDatasetMapping)
 	r.Get("/datasets/{id}", s.handleGetDataset)
 	r.Get("/datasets/{id}/download", s.handleDownloadDataset)
 	r.Get("/datasets/{id}/preview", s.handleDatasetPreview)
 	r.Delete("/datasets/{id}", s.handleDeleteDataset)
 	r.Get("/models", s.handleSearchBaseModels)
+	r.Get("/spec-prompt", s.handleSpecPrompt)
+	r.Get("/recipes", s.handleListRecipes)
+	r.Post("/recipes", s.handleCreateRecipe)
+	r.Get("/recipes/{id}", s.handleGetRecipe)
+	r.Put("/recipes/{id}", s.handleUpdateRecipe)
+	r.Put("/recipes/{id}/spec", s.handleSetRecipeSpec)
+	r.Post("/recipes/{id}/flesh-out", s.handleFleshOut)
+	r.Delete("/recipes/{id}", s.handleDeleteRecipe)
 	r.Get("/jobs", s.handleListFinetuneJobs)
 	r.Post("/jobs", s.handleStartFinetune)
 	r.Get("/jobs/{id}", s.handleGetFinetuneJob)
@@ -545,10 +645,262 @@ func (s *Server) trainingRoutes(r chi.Router) {
 	r.Get("/adapters", s.handleListAdapters)
 	r.Get("/adapters/{id}/download", s.handleDownloadAdapter)
 	r.Post("/adapters/{id}/evaluate", s.handleEvaluateAdapter)
-	r.Post("/adapters/{id}/promote", s.handlePromoteAdapter)
-	r.Delete("/adapters/{id}/promote", s.handleUnpromoteAdapter)
-	r.Delete("/adapters/{id}", s.handleDeleteAdapter)
+	// The destructive and live-changing actions are step-up gated when away (M5): promoting,
+	// force-promoting and unpromoting an adapter, deleting one, and changing the training routes.
+	su := s.stepUp()
+	r.With(su.require(ActTraining)).Post("/adapters/{id}/promote", s.handlePromoteAdapter)
+	r.With(su.require(ActTraining)).Delete("/adapters/{id}/promote", s.handleUnpromoteAdapter)
+	r.With(su.require(ActTraining)).Delete("/adapters/{id}", s.handleDeleteAdapter)
 	r.Get("/routes", s.handleListRoutes)
-	r.Put("/routes", s.handleAddRoute)
-	r.Post("/routes/remove", s.handleRemoveRoute)
+	r.With(su.require(ActTraining)).Put("/routes", s.handleAddRoute)
+	r.With(su.require(ActTraining)).Post("/routes/remove", s.handleRemoveRoute)
+}
+
+// handleUploadDataset is POST /api/training/datasets/upload, a multipart
+// form read as a stream: the fields name, task_class, mapping (JSON, may
+// be empty or absent) and holdout_pct come first and the file last. The
+// 32 MB JSON limit does not apply; WS_TRAINING_UPLOAD_MAX_BYTES does.
+func (s *Server) handleUploadDataset(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.Training.UploadMax()+1<<20)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeErr(w, 400, "send multipart/form-data: the fields first, the file last")
+		return
+	}
+	var spec training.UploadSpec
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				writeErr(w, 413, "the upload is over the limit (WS_TRAINING_UPLOAD_MAX_BYTES)")
+				return
+			}
+			writeErr(w, 400, "the form has no file part (put the file last)")
+			return
+		}
+		if part.FormName() != "file" {
+			v, err := io.ReadAll(io.LimitReader(part, 64<<10))
+			if err != nil {
+				writeErr(w, 400, "bad form")
+				return
+			}
+			switch part.FormName() {
+			case "name":
+				spec.Name = string(v)
+			case "task_class":
+				spec.TaskClass = strings.TrimSpace(string(v))
+			case "holdout_pct":
+				if n, err := strconv.Atoi(strings.TrimSpace(string(v))); err == nil {
+					spec.HoldoutPct = &n
+				}
+			case "mapping":
+				if t := strings.TrimSpace(string(v)); t != "" {
+					if err := json.Unmarshal([]byte(t), &spec.Mapping); err != nil {
+						writeErr(w, 400, "mapping is not valid JSON")
+						return
+					}
+				}
+			}
+			continue
+		}
+		spec.SourceName = part.FileName()
+		ds, err := s.Training.CreateUploaded(r.Context(), Principal(r.Context()).UserID, spec, part)
+		if err != nil {
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				writeErr(w, 413, "the upload is over the limit (WS_TRAINING_UPLOAD_MAX_BYTES)")
+				return
+			}
+			writeTrainingErr(w, err)
+			return
+		}
+		writeJSON(w, 201, ds)
+		return
+	}
+}
+
+// handleSetDatasetMapping is PUT /api/training/datasets/{id}/mapping
+// {input, output, system, system_text, split, chunk_chars}: re-maps an
+// uploaded dataset and queues a rebuild.
+func (s *Server) handleSetDatasetMapping(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	var m training.Mapping
+	if err := decode(r, &m); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	ds, err := s.Training.SetMapping(r.Context(), id, m)
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, ds)
+}
+
+// ---- recipes (M12 cut b) ----
+
+type recipeBody struct {
+	Name           string                  `json:"name"`
+	BaseModel      string                  `json:"base_model"`
+	BaseEndpointID string                  `json:"base_endpoint_id"`
+	Instructions   string                  `json:"instructions"`
+	DatasetIDs     []uuid.UUID             `json:"dataset_ids"`
+	Target         string                  `json:"target"`
+	Config         training.FinetuneConfig `json:"config"`
+	SpecModel      string                  `json:"spec_model"`
+}
+
+func (b recipeBody) input() training.RecipeInput {
+	return training.RecipeInput{Name: b.Name, BaseModel: b.BaseModel, BaseEndpointID: b.BaseEndpointID, Instructions: b.Instructions, DatasetIDs: b.DatasetIDs, Target: b.Target, Config: b.Config, SpecModel: b.SpecModel}
+}
+
+// handleSpecPrompt is GET /api/training/spec-prompt: what the flesh-out
+// model is asked, as written.
+func (s *Server) handleSpecPrompt(w http.ResponseWriter, r *http.Request) {
+	p, schema := training.SpecPrompt()
+	writeJSON(w, 200, map[string]any{"prompt": p, "schema": schema})
+}
+
+// handleListRecipes is GET /api/training/recipes.
+func (s *Server) handleListRecipes(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.DB.ListRecipes(r.Context(), 100)
+	if err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"recipes": rows})
+}
+
+// handleCreateRecipe is POST /api/training/recipes.
+func (s *Server) handleCreateRecipe(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	var in recipeBody
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	rec, err := s.Training.CreateRecipe(r.Context(), Principal(r.Context()).UserID, in.input())
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 201, rec)
+}
+
+// handleGetRecipe is GET /api/training/recipes/{id}.
+func (s *Server) handleGetRecipe(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	rec, err := s.DB.GetRecipe(r.Context(), id)
+	if err != nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, rec)
+}
+
+// handleUpdateRecipe is PUT /api/training/recipes/{id}: the owner's fields,
+// not the spec.
+func (s *Server) handleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	var in recipeBody
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	rec, err := s.Training.UpdateRecipe(r.Context(), id, in.input())
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, rec)
+}
+
+// handleSetRecipeSpec is PUT /api/training/recipes/{id}/spec: the keys to
+// change, each replaced whole; a key whose value changed is marked edited.
+func (s *Server) handleSetRecipeSpec(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	var in map[string]json.RawMessage
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	rec, err := s.Training.SetSpec(r.Context(), id, in)
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 200, rec)
+}
+
+// handleFleshOut is POST /api/training/recipes/{id}/flesh-out {model?, replace?}.
+func (s *Server) handleFleshOut(w http.ResponseWriter, r *http.Request) {
+	if !s.needTraining(w) {
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	var in struct {
+		Model   string `json:"model"`
+		Replace bool   `json:"replace"`
+	}
+	if r.ContentLength != 0 {
+		if err := decode(r, &in); err != nil {
+			writeErr(w, 400, "bad json")
+			return
+		}
+	}
+	rec, err := s.Training.FleshOut(r.Context(), id, in.Model, in.Replace)
+	if err != nil {
+		writeTrainingErr(w, err)
+		return
+	}
+	writeJSON(w, 202, rec)
+}
+
+// handleDeleteRecipe is DELETE /api/training/recipes/{id}.
+func (s *Server) handleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	if err := s.DB.DeleteRecipe(r.Context(), id); err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }

@@ -21,6 +21,7 @@ type chatRequest struct {
 	// Extra body fields we add on the client:
 	Model     string `json:"model"`
 	Reasoning bool   `json:"reasoning"`
+	Plan      bool   `json:"plan"` // plan mode: approve a written plan before any tool runs
 }
 
 // handleChat runs one turn and streams the UI Message Stream protocol.
@@ -50,7 +51,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sw := aistream.NewHTTP(w)
-		if err := s.Chat.ResumeWithApprovals(r.Context(), sw, conv.ID, p.UserID, decisions); err != nil {
+		if err := s.Chat.ResumeWithApprovals(r.Context(), sw, conv.ID, p.UserID, decisions, chat.ApprovalNotes(last.Parts)); err != nil {
 			s.Log.Warn("chat resume failed", "conversation", conv.ID, "err", err)
 			_ = sw.Error(err.Error())
 			_ = sw.Finish("error")
@@ -69,7 +70,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	sw := aistream.NewHTTP(w)
 	if _, err := s.Chat.Run(r.Context(), sw, chat.Turn{
-		ConversationID: conv.ID, UserID: p.UserID, Parts: parts, Selector: in.Model, Reasoning: in.Reasoning,
+		ConversationID: conv.ID, UserID: p.UserID, Parts: parts, Selector: in.Model, Reasoning: in.Reasoning, Plan: in.Plan,
 	}); err != nil {
 		s.Log.Warn("chat turn failed", "conversation", conv.ID, "err", err)
 	}

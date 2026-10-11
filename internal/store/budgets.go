@@ -18,6 +18,15 @@ func (b *BudgetStore) Limits(ctx context.Context, scope, scopeID string) ([]gate
 	if err != nil {
 		return nil, err
 	}
+	// A member or agent with no budget of its own falls under the default
+	// for its scope: the row with a NULL scope_id (0020). Spend is still
+	// summed per member or agent.
+	if len(rows) == 0 && scopeID != "" && (scope == "user" || scope == "agent") {
+		rows, err = b.DB.ListBudgetsForScope(ctx, ListBudgetsForScopeParams{Scope: scope})
+		if err != nil {
+			return nil, err
+		}
+	}
 	out := make([]gateway.BudgetLimit, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, gateway.BudgetLimit{Scope: r.Scope, ScopeID: scopeID, Period: r.Period, LimitUSD: r.LimitUsd, OnExceed: r.OnExceed})

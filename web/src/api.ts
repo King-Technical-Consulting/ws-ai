@@ -2,13 +2,24 @@
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /** The server's machine-readable reason, such as step_up_unavailable. */
+  code?: string
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.status = status
+    this.code = code
   }
 }
 
-async function req<T>(method: string, path: string, body?: unknown, raw?: BodyInit): Promise<T> {
+// A sensitive action from away answers 403 step_up_required until a passkey assertion has been made on
+// this session (M5). The step-up dialog registers itself here; a request that gets that answer waits
+// for it and is sent again once, so a call site never sees the detour.
+let stepUpHandler: (() => Promise<boolean>) | null = null
+export function setStepUpHandler(h: (() => Promise<boolean>) | null) {
+  stepUpHandler = h
+}
+
+async function req<T>(method: string, path: string, body?: unknown, raw?: BodyInit, retried = false): Promise<T> {
   const res = await fetch(path, {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
@@ -17,11 +28,16 @@ async function req<T>(method: string, path: string, body?: unknown, raw?: BodyIn
   })
   if (!res.ok) {
     let msg = res.statusText
+    let code: string | undefined
     try {
       const j = await res.json()
       if (j?.error) msg = j.error
+      if (typeof j?.code === 'string') code = j.code
     } catch {}
-    throw new ApiError(res.status, msg)
+    if (res.status === 403 && code === 'step_up_required' && stepUpHandler && !retried && (await stepUpHandler())) {
+      return req<T>(method, path, body, raw, true)
+    }
+    throw new ApiError(res.status, msg, code)
   }
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
@@ -38,7 +54,31 @@ export const api = {
 
 // ---- types mirrored from the Go side ----
 
-export type User = { id: string; email: string; display_name: string; role: 'owner' | 'member'; via_api_key?: boolean; training_consent?: boolean }
+/** How the request was judged, home or away (internal/httpx/locality.go). */
+export type Locality = {
+  /** WS_HOME_NETWORKS is set; when it is not, every request counts as home and nothing is gated. */
+  configured: boolean
+  locality: 'home' | 'away'
+  listener: 'main' | 'tunnel'
+  /** The client address the request was judged by; empty when there was none. */
+  address: string
+  /** How it was decided, in words fit for a tooltip. */
+  reason: string
+}
+
+export type User = {
+  id: string
+  email: string
+  display_name: string
+  role: 'owner' | 'member'
+  via_api_key?: boolean
+  training_consent?: boolean
+  locality?: Locality
+  /** When this session's passkey assertion runs out (null: none, or expired); step-up is judged only once WS_HOME_NETWORKS is set. */
+  step_up_until?: string | null
+  step_up_window_seconds?: number
+  has_passkey?: boolean
+}
 
 // ---- training flywheel (PLAN M10) ----
 
@@ -69,18 +109,69 @@ export type Dataset = {
   error: string | null
   created_at: string
   built_at: string | null
+  kind: 'chat' | 'uploaded' | 'merged'
+  mapping: DatasetMapping
+  source_name: string | null
+  report: DatasetReport
+}
+
+/** How an uploaded dataset's records become examples (internal/training/upload.go). */
+export type DatasetMapping = { input?: string; output?: string; system?: string; system_text?: string; split?: string; chunk_chars?: number }
+export type DatasetReport = {
+  files?: { name: string; kind: string; rows: number; examples: number; skipped: number }[]
+  files_omitted?: number
+  skipped_types?: Record<string, number>
+  columns?: string[]
+  mapping?: DatasetMapping
+  warnings?: string[]
+  truncated?: boolean
+  train?: number
+  eval?: number
+}
+
+/** A training recipe (internal/training/recipe.go): instructions, attached datasets and the spec a model fleshes out. */
+export type SpecMapping = { dataset_id: string; input: string; output: string; system: string; split: string; note: string }
+export type RecipeSpec = {
+  system_prompt?: string
+  mappings?: SpecMapping[]
+  rubric?: string
+  hyperparameters?: { epochs: number; learning_rate: number; rank: number; max_seq_len: number }
+  data_notes?: string
+}
+export type Recipe = {
+  id: string
+  owner_id: string
+  name: string
+  base_model: string
+  base_endpoint_id: string | null
+  instructions: string
+  dataset_ids: string[]
+  target: string
+  config: Record<string, unknown>
+  spec: RecipeSpec
+  edited: (keyof RecipeSpec)[]
+  spec_draft: RecipeSpec
+  spec_model: string
+  spec_status: 'none' | 'queued' | 'running' | 'ready' | 'failed'
+  spec_error: string | null
+  spec_used_model: string | null
+  spec_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 export type FinetuneTargetID = 'local' | 'remote' | 'rental'
 export type FinetuneConfig = { epochs?: number; learning_rate?: number; rank?: number; alpha?: number; max_seq_len?: number; image?: string; target?: FinetuneTargetID }
 export type FinetuneTarget = { id: FinetuneTargetID; label: string }
-export type TrainingExample = { messages: { role: string; content?: string; tool_call_id?: string; tool_calls?: { function: { name: string; arguments: string } }[] }[]; meta: { conversation_id: string; message_id: string; mode?: string; model?: string; rating?: number } }
+export type TrainingExample = { messages: { role: string; content?: string; tool_call_id?: string; tool_calls?: { function: { name: string; arguments: string } }[] }[]; meta: { conversation_id?: string; message_id?: string; source?: string; mode?: string; model?: string; rating?: number } }
 export type TrainingRoute = { task_class: string; endpoint: string }
 
 export type FinetuneJob = {
   id: string
   owner_id: string
   dataset_id: { UUID: string; Valid: boolean }
+  /** Set when the job trains from a recipe: its datasets are merged first and dataset_id fills in then. */
+  recipe_id: { UUID: string; Valid: boolean }
   base_model: string
   base_endpoint_id: string | null
   adapter_name: string
@@ -108,8 +199,14 @@ export type Adapter = {
   eval: { examples: number; adapter_score: number; baseline_score: number; judge: string; adapter_wins: number; baseline_wins: number; ties: number; errors?: string[]; at: string } | null
   promoted: boolean
   endpoint_id: string | null
+  /** From a recipe: the system prompt it was trained under (its endpoint serves with it by default) and the rubric the eval judges by. */
+  recipe_id: { UUID: string; Valid: boolean }
+  system_prompt: string
+  rubric: string
   created_at: string
   evaluated_at: string | null
+  /** Where the newest evaluation of this adapter stands, from the job queue; null before any. */
+  eval_job: { state: 'queued' | 'running' | 'failed' | 'done'; error?: string; at: string | null } | null
 }
 
 export type Project = {
@@ -257,6 +354,8 @@ export type Agent = {
   tool_allowlist: string[]
   tool_policies: Record<string, 'auto' | 'ask' | 'deny'>
   max_steps: number
+  max_run_usd: number
+  skills?: StoredSkill[]
   enabled: boolean
   last_run_at: string | null
   created_at: string
@@ -272,6 +371,7 @@ export type AgentInput = {
   tool_allowlist: string[]
   tool_policies: Record<string, 'auto' | 'ask' | 'deny'>
   max_steps: number
+  max_run_usd?: number
   enabled?: boolean
 }
 
@@ -288,6 +388,28 @@ export type AgentPreset = {
 }
 
 export type SkillImport = { preset: AgentPreset; requested_tools: string[]; warnings: string[] }
+export type SkillFile = { path: string; kind: 'script' | 'reference' | 'asset' | 'other'; size: number; sha256: string; interpreter?: string; binary?: boolean; refused?: boolean; findings: string[] }
+/** An uploaded skill folder: the SKILL.md preview plus every other file, inventoried (nothing run, stored or granted). */
+export type SkillFolderImport = { skill: SkillImport; files: SkillFile[]; has_scripts: boolean; usable_anywhere: boolean; refused_secrets: string[]; findings: string[]; bytes: number }
+
+/** A skill folder an owner approved for an agent (agents.skills). Keeping one grants no tool and no secret. */
+export type StoredSkill = {
+  id: string
+  /** How many agents use it (the shelf listing only). */
+  agent_count?: number
+  name: string
+  title: string
+  description: string
+  /** Only on the single-agent read. */
+  instructions?: string
+  has_scripts: boolean
+  files: SkillFile[]
+  refused_secrets: string[]
+  findings: string[]
+  warnings: string[]
+  approved_by: string
+  approved_at: string
+}
 
 export type AgentTrigger = {
   id: string
@@ -346,7 +468,7 @@ export type AgentDetail = {
   triggers: AgentTrigger[]
   runs: AgentRun[]
   pending_approvals: Approval[]
-  spend: { since: string; usd: number; budgets: { id: string; period: string; limit_usd: number; on_exceed: string }[] }
+  spend: { since: string; usd: number; budgets: { id: string; period: string; limit_usd: number; on_exceed: string }[]; default?: boolean }
 }
 
 export type AgentMemory = {
@@ -359,3 +481,50 @@ export type AgentMemory = {
   last_used_at: string | null
   created_at: string
 }
+
+// ---- the skill shelf (OpenClaw plan, step 2) ----
+
+export type DiffLine = { op: '+' | '-' | ' '; text: string }
+export type SkillDiff = {
+  same: boolean
+  title_changed: boolean
+  description_changed: boolean
+  instructions: DiffLine[]
+  instructions_changed: boolean
+  files: { added: string[]; removed: string[]; changed: string[] }
+  scripts_added: string[]
+  new_findings: string[]
+  had_scripts: boolean
+  has_scripts: boolean
+}
+/** An import read against the shelf: nothing is stored until it is approved. */
+export type SkillPreview = { import: SkillFolderImport; name: string; existing?: StoredSkill; diff?: SkillDiff; agents?: string[] }
+export type BulkSkillItem = { dir: string; preview?: SkillPreview; error?: string }
+
+// ---- archive, then delete permanently ----
+
+/** What a permanent deletion removes (internal/purge). */
+export type PurgePlan = {
+  conversations: number
+  messages: number
+  artifacts: number
+  runs: number
+  attachments: number
+  agents?: number
+  sandboxes?: number
+  bytes: number
+}
+export type PurgeReport = PurgePlan & { blobs_deleted: number; blobs_shared: number; blobs_failed: number }
+export type ArchivedConversation = {
+  id: string
+  project_id: string
+  project_name: string
+  title: string
+  mode: string
+  archived_at: string
+  messages: number
+  bytes: number
+  can_delete: boolean
+}
+export type ArchivedProject = PurgePlan & { id: string; name: string; kind: string; archived_at: string }
+export type ArchiveListing = { conversations: ArchivedConversation[]; projects: ArchivedProject[]; all: PurgePlan }

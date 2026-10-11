@@ -115,11 +115,14 @@ func TestParseScore(t *testing.T) {
 
 type fakeStore struct {
 	mu       sync.Mutex
-	users    map[uuid.UUID]bool // consent
+	routing  map[string]store.SetEndpointRoutingParams // adapter endpoints: tier and routable
+	users    map[uuid.UUID]bool                        // consent
 	convs    []store.Conversation
 	msgs     map[uuid.UUID][]store.Message
 	ratings  map[uuid.UUID][]store.MessageRating
 	datasets map[uuid.UUID]store.Dataset
+	recipes  map[uuid.UUID]store.TrainingRecipe
+	upserts  map[string]store.UpsertEndpointParams
 	jobs     map[uuid.UUID]store.FinetuneJob
 	adapters map[uuid.UUID]store.Adapter
 	eps      map[string]bool // enabled
@@ -127,7 +130,7 @@ type fakeStore struct {
 }
 
 func newFake() *fakeStore {
-	return &fakeStore{users: map[uuid.UUID]bool{}, msgs: map[uuid.UUID][]store.Message{}, ratings: map[uuid.UUID][]store.MessageRating{}, datasets: map[uuid.UUID]store.Dataset{}, jobs: map[uuid.UUID]store.FinetuneJob{}, adapters: map[uuid.UUID]store.Adapter{}, eps: map[string]bool{}, policies: map[string]store.RoutingPolicy{}}
+	return &fakeStore{users: map[uuid.UUID]bool{}, msgs: map[uuid.UUID][]store.Message{}, ratings: map[uuid.UUID][]store.MessageRating{}, datasets: map[uuid.UUID]store.Dataset{}, recipes: map[uuid.UUID]store.TrainingRecipe{}, jobs: map[uuid.UUID]store.FinetuneJob{}, adapters: map[uuid.UUID]store.Adapter{}, eps: map[string]bool{}, policies: map[string]store.RoutingPolicy{}}
 }
 
 func (f *fakeStore) ListTrainingConversations(_ context.Context, p store.ListTrainingConversationsParams) ([]store.Conversation, error) {
@@ -194,7 +197,7 @@ func (f *fakeStore) DeleteDataset(_ context.Context, id uuid.UUID) error {
 func (f *fakeStore) CreateFinetuneJob(_ context.Context, p store.CreateFinetuneJobParams) (store.FinetuneJob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	j := store.FinetuneJob{ID: uuid.New(), OwnerID: p.OwnerID, DatasetID: p.DatasetID, BaseModel: p.BaseModel, BaseEndpointID: p.BaseEndpointID, AdapterName: p.AdapterName, Config: p.Config, Status: StatusQueued}
+	j := store.FinetuneJob{ID: uuid.New(), OwnerID: p.OwnerID, DatasetID: p.DatasetID, BaseModel: p.BaseModel, BaseEndpointID: p.BaseEndpointID, AdapterName: p.AdapterName, Config: p.Config, Status: StatusQueued, RecipeID: p.RecipeID, Spec: p.Spec}
 	f.jobs[j.ID] = j
 	return j, nil
 }
@@ -248,7 +251,7 @@ func (f *fakeStore) CancelFinetuneJob(_ context.Context, id uuid.UUID) error {
 func (f *fakeStore) CreateAdapter(_ context.Context, p store.CreateAdapterParams) (store.Adapter, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a := store.Adapter{ID: uuid.New(), Name: p.Name, BaseModel: p.BaseModel, BaseEndpointID: p.BaseEndpointID, FinetuneJobID: p.FinetuneJobID, BlobKey: p.BlobKey, Bytes: p.Bytes, EndpointID: p.EndpointID}
+	a := store.Adapter{ID: uuid.New(), Name: p.Name, BaseModel: p.BaseModel, BaseEndpointID: p.BaseEndpointID, FinetuneJobID: p.FinetuneJobID, BlobKey: p.BlobKey, Bytes: p.Bytes, EndpointID: p.EndpointID, RecipeID: p.RecipeID, SystemPrompt: p.SystemPrompt, Rubric: p.Rubric}
 	f.adapters[a.ID] = a
 	return a, nil
 }
@@ -288,8 +291,22 @@ func (f *fakeStore) UpsertEndpoint(_ context.Context, p store.UpsertEndpointPara
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.eps[p.ID] = p.Enabled
+	if f.upserts == nil {
+		f.upserts = map[string]store.UpsertEndpointParams{}
+	}
+	f.upserts[p.ID] = p
 	return nil
 }
+func (f *fakeStore) SetEndpointRouting(_ context.Context, p store.SetEndpointRoutingParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.routing == nil {
+		f.routing = map[string]store.SetEndpointRoutingParams{}
+	}
+	f.routing[p.ID] = p
+	return nil
+}
+
 func (f *fakeStore) SetEndpointEnabled(_ context.Context, p store.SetEndpointEnabledParams) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -480,6 +497,45 @@ func TestDatasetBuildFinetuneEvalPromote(t *testing.T) {
 	}
 	svc.GW = &fakeGW{refs: refs}
 	svc.EvalLimit = 5
+
+	// The evaluate button runs the worker's checks first, and says when one is already queued.
+	var queuedFor []uuid.UUID
+	queueResult := true
+	svc.EnqueueEval = func(_ context.Context, id uuid.UUID) (bool, error) {
+		queuedFor = append(queuedFor, id)
+		return queueResult, nil
+	}
+	if err := svc.QueueEval(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("queue an unknown adapter: %v", err)
+	}
+	noEndpoint := ad
+	noEndpoint.ID = uuid.New()
+	noEndpoint.EndpointID = nil
+	db.adapters[noEndpoint.ID] = noEndpoint
+	if err := svc.QueueEval(ctx, noEndpoint.ID); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "needs an endpoint and a base endpoint") {
+		t.Errorf("queue an adapter with no endpoint: %v", err)
+	}
+	noJob := ad
+	noJob.ID = uuid.New()
+	noJob.FinetuneJobID = uuid.NullUUID{}
+	db.adapters[noJob.ID] = noJob
+	if err := svc.QueueEval(ctx, noJob.ID); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "no held-out set") {
+		t.Errorf("queue an adapter with no job: %v", err)
+	}
+	if len(queuedFor) != 0 {
+		t.Errorf("a failed check still queued a job: %v", queuedFor)
+	}
+	if err := svc.CheckEvaluate(ctx, ad.ID); err != nil {
+		t.Errorf("check a good adapter: %v", err)
+	}
+	if err := svc.QueueEval(ctx, ad.ID); err != nil || len(queuedFor) != 1 || queuedFor[0] != ad.ID {
+		t.Errorf("queue a good adapter: %v %v", err, queuedFor)
+	}
+	queueResult = false
+	if err := svc.QueueEval(ctx, ad.ID); !errors.Is(err, ErrNotReady) || !strings.Contains(err.Error(), "already queued or running") {
+		t.Errorf("queue while one is queued: %v", err)
+	}
+
 	if err := svc.Evaluate(ctx, ad.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -521,4 +577,188 @@ func TestDatasetBuildFinetuneEvalPromote(t *testing.T) {
 	if e, _ := db.GetDataset(ctx, empty.ID); e.Status != StatusFailed || e.Error == nil || !strings.Contains(*e.Error, "no examples") {
 		t.Errorf("empty dataset = %+v", e)
 	}
+}
+
+func (f *fakeStore) CreateUploadedDataset(_ context.Context, p store.CreateUploadedDatasetParams) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := store.Dataset{ID: uuid.New(), OwnerID: p.OwnerID, Name: p.Name, TaskClass: p.TaskClass, Filters: p.Filters, Status: StatusQueued, Kind: KindUploaded, Mapping: p.Mapping, SourceBlobKey: p.SourceBlobKey, SourceName: p.SourceName, Bytes: p.Bytes, Report: []byte("{}"), CreatedAt: time.Now()}
+	f.datasets[d.ID] = d
+	return d, nil
+}
+func (f *fakeStore) RequeueDataset(_ context.Context, p store.RequeueDatasetParams) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d, ok := f.datasets[p.ID]
+	if !ok || d.Kind != KindUploaded || (d.Status != StatusReady && d.Status != StatusFailed) {
+		return d, pgx.ErrNoRows
+	}
+	d.Mapping, d.Status, d.Error = p.Mapping, StatusQueued, nil
+	f.datasets[p.ID] = d
+	return d, nil
+}
+func (f *fakeStore) SetDatasetReport(_ context.Context, p store.SetDatasetReportParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.datasets[p.ID]
+	d.Report = p.Report
+	f.datasets[p.ID] = d
+	return nil
+}
+
+// budgetGW is a judge that returns nothing until it is given enough tokens,
+// the way a model that reasons first behaves on a small budget.
+type budgetGW struct {
+	need  int
+	reply string
+	cut   string // what comes back, cut off, under the budget it needs
+	calls []int
+}
+
+func (g *budgetGW) Complete(_ context.Context, req *gateway.Request) (*gateway.Response, error) {
+	g.calls = append(g.calls, req.MaxTokens)
+	if req.MaxTokens < g.need {
+		res := &gateway.Response{FinishReason: gateway.FinishLength}
+		if g.cut != "" {
+			res.Parts = []gateway.Part{gateway.TextPart(g.cut)}
+		}
+		return res, nil
+	}
+	return &gateway.Response{FinishReason: gateway.FinishStop, Parts: []gateway.Part{gateway.TextPart(g.reply)}}, nil
+}
+
+func TestJudgeBudget(t *testing.T) {
+	prompt := []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart("capital of France?")}}}
+	ctx := context.Background()
+
+	// An answer on the first try costs one call.
+	g := &budgetGW{need: 1, reply: `{"score": 9}`}
+	if got, err := (&Service{GW: g}).judge(ctx, "", prompt, "Paris", "Paris"); err != nil || got != 0.9 || len(g.calls) != 1 {
+		t.Errorf("first try: %v %v calls=%v", got, err, g.calls)
+	}
+
+	// An empty reply (the reasoning used the budget) is retried with more room.
+	g = &budgetGW{need: judgeTokens + 1, reply: `{"score": 8}`}
+	if got, err := (&Service{GW: g}).judge(ctx, "", prompt, "Paris", "Paris"); err != nil || got != 0.8 {
+		t.Errorf("retry: %v %v", got, err)
+	}
+	if len(g.calls) != 2 || g.calls[0] != judgeTokens || g.calls[1] != judgeTokens*3 {
+		t.Errorf("budgets = %v, want [%d %d]", g.calls, judgeTokens, judgeTokens*3)
+	}
+
+	// A reply cut off in the middle of the JSON (what the Orin's gpt-oss judge
+	// returned at 200 tokens) is retried too.
+	g = &budgetGW{need: judgeTokens + 1, cut: `{"score":`, reply: `{"score": 7}`}
+	if got, err := (&Service{GW: g}).judge(ctx, "", prompt, "Paris", "Paris"); err != nil || got != 0.7 || len(g.calls) != 2 {
+		t.Errorf("cut off: %v %v calls=%v", got, err, g.calls)
+	}
+
+	// Still empty after the retry: the error says why it stopped.
+	g = &budgetGW{need: 1 << 30}
+	_, err := (&Service{GW: g}).judge(ctx, "", prompt, "Paris", "Paris")
+	if err == nil || !strings.Contains(err.Error(), "finish: length") || len(g.calls) != 2 {
+		t.Errorf("empty twice: %v calls=%v", err, g.calls)
+	}
+
+	// Words that are not a score are not retried: more room will not help.
+	g = &budgetGW{need: 1, reply: "I cannot judge this."}
+	if _, err := (&Service{GW: g}).judge(ctx, "", prompt, "Paris", "Paris"); err == nil || len(g.calls) != 1 {
+		t.Errorf("prose: %v calls=%v", err, g.calls)
+	}
+}
+
+func (f *fakeStore) CreateRecipe(_ context.Context, p store.CreateRecipeParams) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := store.TrainingRecipe{ID: uuid.New(), OwnerID: p.OwnerID, Name: p.Name, BaseModel: p.BaseModel, BaseEndpointID: p.BaseEndpointID, Instructions: p.Instructions, DatasetIds: p.DatasetIds, Target: p.Target, Config: p.Config, Spec: []byte("{}"), Edited: []string{}, SpecDraft: []byte("{}"), SpecModel: p.SpecModel, SpecStatus: "none", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	f.recipes[r.ID] = r
+	return r, nil
+}
+func (f *fakeStore) GetRecipe(_ context.Context, id uuid.UUID) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.recipes[id]
+	if !ok {
+		return r, pgx.ErrNoRows
+	}
+	return r, nil
+}
+func (f *fakeStore) ListRecipes(_ context.Context, _ int32) ([]store.TrainingRecipe, error) {
+	return nil, nil
+}
+func (f *fakeStore) UpdateRecipe(_ context.Context, p store.UpdateRecipeParams) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[p.ID]
+	r.Name, r.BaseModel, r.BaseEndpointID, r.Instructions, r.DatasetIds, r.Target, r.Config, r.SpecModel = p.Name, p.BaseModel, p.BaseEndpointID, p.Instructions, p.DatasetIds, p.Target, p.Config, p.SpecModel
+	f.recipes[p.ID] = r
+	return r, nil
+}
+func (f *fakeStore) SetRecipeSpec(_ context.Context, p store.SetRecipeSpecParams) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[p.ID]
+	r.Spec, r.Edited = p.Spec, p.Edited
+	f.recipes[p.ID] = r
+	return r, nil
+}
+func (f *fakeStore) QueueRecipeSpec(_ context.Context, p store.QueueRecipeSpecParams) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[p.ID]
+	if r.SpecStatus == "queued" || r.SpecStatus == "running" {
+		return r, pgx.ErrNoRows
+	}
+	r.SpecStatus, r.SpecError, r.SpecModel = "queued", nil, p.SpecModel
+	f.recipes[p.ID] = r
+	return r, nil
+}
+func (f *fakeStore) ClaimRecipeSpec(_ context.Context, id uuid.UUID) (store.TrainingRecipe, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[id]
+	if r.SpecStatus != "queued" {
+		return r, pgx.ErrNoRows
+	}
+	r.SpecStatus = "running"
+	f.recipes[id] = r
+	return r, nil
+}
+func (f *fakeStore) FinishRecipeSpec(_ context.Context, p store.FinishRecipeSpecParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[p.ID]
+	r.Spec, r.Edited, r.SpecDraft, r.SpecUsedModel, r.SpecStatus, r.SpecError = p.Spec, p.Edited, p.SpecDraft, p.SpecUsedModel, "ready", nil
+	f.recipes[p.ID] = r
+	return nil
+}
+func (f *fakeStore) FailRecipeSpec(_ context.Context, p store.FailRecipeSpecParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.recipes[p.ID]
+	r.SpecStatus, r.SpecError = "failed", p.SpecError
+	f.recipes[p.ID] = r
+	return nil
+}
+func (f *fakeStore) DeleteRecipe(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.recipes, id)
+	return nil
+}
+
+func (f *fakeStore) CreateMergedDataset(_ context.Context, p store.CreateMergedDatasetParams) (store.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := store.Dataset{ID: uuid.New(), OwnerID: p.OwnerID, Name: p.Name, Filters: []byte("{}"), Status: StatusBuilding, Kind: "merged", Mapping: []byte("{}"), Report: p.Report, CreatedAt: time.Now()}
+	f.datasets[d.ID] = d
+	return d, nil
+}
+func (f *fakeStore) SetFinetuneDataset(_ context.Context, p store.SetFinetuneDatasetParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j := f.jobs[p.ID]
+	j.DatasetID = p.DatasetID
+	f.jobs[p.ID] = j
+	return nil
 }

@@ -140,6 +140,16 @@ func (c *WorkerClient) Stop(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+// RemoveProject removes every sandbox of a project, volumes included.
+func (c *WorkerClient) RemoveProject(ctx context.Context, projectID uuid.UUID) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/internal/projects/"+projectID.String()+"/sandboxes", nil, "")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
 // Tree lists a directory.
 func (c *WorkerClient) Tree(ctx context.Context, id uuid.UUID, path string) (json.RawMessage, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/internal/sandboxes/"+id.String()+"/tree?path="+url.QueryEscape(path), nil, "")

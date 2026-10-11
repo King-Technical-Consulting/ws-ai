@@ -92,6 +92,8 @@ type ExampleMeta struct {
 	Mode           string `json:"mode,omitempty"`
 	Model          string `json:"model,omitempty"`
 	Rating         int    `json:"rating,omitempty"`
+	// Source is where an uploaded example came from (file:row).
+	Source string `json:"source,omitempty"`
 }
 
 // convert turns stored gateway parts into chat-format messages. A tool

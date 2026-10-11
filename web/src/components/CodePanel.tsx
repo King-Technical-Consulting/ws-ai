@@ -16,12 +16,14 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { ChevronDown, ChevronRight, File as FileIcon, Folder, X, RefreshCw, ExternalLink } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api'
-import { SectionHead, btn, inputSm } from './ui'
+import { api, ApiError } from '../api'
+import { Callout, SectionHead, btn, inputSm } from './ui'
 
 type Entry = { name: string; type: 'file' | 'dir' | 'link' | 'other'; size: number }
 type Tree = { path: string; entries: Entry[] }
 type FileResp = { path: string; binary: boolean; size: number; content: string }
+type SandboxStatus = { status: string; error: string | null; last_error: { stage: string; error: string; at: string } | null }
+const STAGES: Record<string, string> = { pull: 'image pull', volume: 'workspace volume', create: 'container start', clone: 'repository clone' }
 type SandboxInfo = { id: string; status: string; runtime: string; container_id: string; repo_url: string | null }
 
 type Tab = 'files' | 'terminal' | 'preview'
@@ -33,12 +35,45 @@ type Tab = 'files' | 'terminal' | 'preview'
  */
 export function CodePanel({ projectId, onClose }: { projectId: string; onClose: () => void }) {
   const [tab, setTab] = useState<Tab>('files')
+  // The first request blocks while the worker pulls the image and creates
+  // the container, and a browser or a tunnel drops it long before the
+  // server's own timeout. So keep asking every few seconds until the
+  // sandbox says it is running; a dropped request is not the end of it.
   const sandbox = useQuery({
     queryKey: ['sandbox', projectId],
     queryFn: () => api.get<SandboxInfo>(`/api/projects/${projectId}/sandbox`),
     staleTime: 30_000,
-    retry: 1,
+    retry: false,
+    // A server that answered with an error has said why (shown below, with a Retry); asking again
+    // every few seconds would only start another pull. A dropped request has said nothing, so ask again.
+    refetchInterval: (q) => (q.state.data?.status === 'running' || q.state.error instanceof ApiError ? false : 4000),
   })
+  const ready = sandbox.data?.status === 'running'
+  // What the database knows, which answers at once while the request above is still waiting on the
+  // worker, and which also carries a failure the request did not (a clone that failed after the start).
+  const [retrying, setRetrying] = useState(false)
+  const status = useQuery({
+    queryKey: ['sandbox-status', projectId],
+    queryFn: () => api.get<SandboxStatus>(`/api/projects/${projectId}/sandbox/status`),
+    retry: false,
+    refetchInterval: (q) => (ready || (q.state.data?.last_error && !retrying) ? false : 3000),
+  })
+  const qc = useQueryClient()
+  // While a retry is running the old failure is not news, so it is not shown until the retry ends.
+  const failure = retrying
+    ? null
+    : status.data?.last_error
+    ? { stage: STAGES[status.data.last_error.stage] ?? status.data.last_error.stage, text: status.data.last_error.error }
+    : sandbox.error instanceof ApiError
+      ? { stage: '', text: sandbox.error.message }
+      : null
+  const retry = () => {
+    setRetrying(true)
+    void sandbox.refetch().finally(() => {
+      setRetrying(false)
+      void qc.invalidateQueries({ queryKey: ['sandbox-status', projectId] })
+    })
+  }
   return (
     <aside className="fixed inset-0 z-20 md:static md:z-auto md:w-[46rem] md:max-w-[55vw] md:shrink-0 border-l border-line bg-bg flex flex-col min-h-0">
       <header className="h-12 shrink-0 border-b border-line flex items-center justify-between px-3 gap-2">
@@ -55,14 +90,31 @@ export function CodePanel({ projectId, onClose }: { projectId: string; onClose: 
         </nav>
         <div className="flex items-center gap-2 min-w-0">
           <span className="meta truncate">
-            {sandbox.isLoading ? 'starting sandbox…' : sandbox.data ? `${sandbox.data.status} · ${sandbox.data.runtime}` : sandbox.error ? (sandbox.error as Error).message : ''}
+            {ready
+              ? `${sandbox.data!.status} · ${sandbox.data!.runtime}`
+              : sandbox.data
+                ? `${sandbox.data.status}…`
+                : failure
+                  ? 'sandbox not running'
+                  : sandbox.error
+                    ? `starting sandbox… (${(sandbox.error as Error).message})`
+                    : 'starting sandbox…'}
           </span>
           <button onClick={onClose} className="p-1 rounded-md text-fg-3 hover:text-fg hover:bg-bg-3" aria-label="Close panel"><X size={16} /></button>
         </div>
       </header>
+      {failure && (
+        <div className="shrink-0 border-b border-line p-3">
+          <Callout kind="error">
+            <p className="font-medium">{failure.stage ? `The sandbox's ${failure.stage} failed.` : 'The sandbox did not start.'}</p>
+            <p className="mt-1 break-words">{failure.text}</p>
+            <button onClick={retry} className={`${btn.secondarySm} mt-2 min-h-9`}>Retry</button>
+          </Callout>
+        </div>
+      )}
       <div className="flex-1 min-h-0">
-        {tab === 'files' && <Files projectId={projectId} ready={!!sandbox.data} />}
-        {tab === 'terminal' && <Term projectId={projectId} ready={!!sandbox.data} />}
+        {tab === 'files' && <Files projectId={projectId} ready={ready} />}
+        {tab === 'terminal' && <Term projectId={projectId} ready={ready} />}
         {tab === 'preview' && <Preview projectId={projectId} />}
       </div>
     </aside>

@@ -54,6 +54,23 @@ type Store interface {
 	SetDatasetStatus(ctx context.Context, arg store.SetDatasetStatusParams) error
 	FinishDataset(ctx context.Context, arg store.FinishDatasetParams) error
 	DeleteDataset(ctx context.Context, id uuid.UUID) error
+	CreateUploadedDataset(ctx context.Context, arg store.CreateUploadedDatasetParams) (store.Dataset, error)
+	RequeueDataset(ctx context.Context, arg store.RequeueDatasetParams) (store.Dataset, error)
+	SetDatasetReport(ctx context.Context, arg store.SetDatasetReportParams) error
+
+	CreateMergedDataset(ctx context.Context, arg store.CreateMergedDatasetParams) (store.Dataset, error)
+	SetFinetuneDataset(ctx context.Context, arg store.SetFinetuneDatasetParams) error
+
+	CreateRecipe(ctx context.Context, arg store.CreateRecipeParams) (store.TrainingRecipe, error)
+	GetRecipe(ctx context.Context, id uuid.UUID) (store.TrainingRecipe, error)
+	ListRecipes(ctx context.Context, limit int32) ([]store.TrainingRecipe, error)
+	UpdateRecipe(ctx context.Context, arg store.UpdateRecipeParams) (store.TrainingRecipe, error)
+	SetRecipeSpec(ctx context.Context, arg store.SetRecipeSpecParams) (store.TrainingRecipe, error)
+	QueueRecipeSpec(ctx context.Context, arg store.QueueRecipeSpecParams) (store.TrainingRecipe, error)
+	ClaimRecipeSpec(ctx context.Context, id uuid.UUID) (store.TrainingRecipe, error)
+	FinishRecipeSpec(ctx context.Context, arg store.FinishRecipeSpecParams) error
+	FailRecipeSpec(ctx context.Context, arg store.FailRecipeSpecParams) error
+	DeleteRecipe(ctx context.Context, id uuid.UUID) error
 
 	CreateFinetuneJob(ctx context.Context, arg store.CreateFinetuneJobParams) (store.FinetuneJob, error)
 	GetFinetuneJob(ctx context.Context, id uuid.UUID) (store.FinetuneJob, error)
@@ -72,6 +89,7 @@ type Store interface {
 
 	UpsertEndpoint(ctx context.Context, arg store.UpsertEndpointParams) error
 	SetEndpointEnabled(ctx context.Context, arg store.SetEndpointEnabledParams) error
+	SetEndpointRouting(ctx context.Context, arg store.SetEndpointRoutingParams) error
 	DeleteEndpoint(ctx context.Context, id string) error
 
 	// The training-adapters routing policy (policy.go).
@@ -163,10 +181,16 @@ type Service struct {
 	// routes that accept a job are served by serve). Empty falls back to
 	// what Runner offers; neither means jobs are refused up front.
 	Available []Target
+	// UploadMaxBytes caps one dataset upload (default 4 GiB); an archive may
+	// unpack to 8 times that.
+	UploadMaxBytes int64
 	// Enqueue hands a dataset build, a fine-tune or an eval to the worker.
 	EnqueueBuild    func(ctx context.Context, datasetID uuid.UUID) error
 	EnqueueFinetune func(ctx context.Context, jobID uuid.UUID) error
-	EnqueueEval     func(ctx context.Context, adapterID uuid.UUID) error
+	EnqueueEval     func(ctx context.Context, adapterID uuid.UUID) (queued bool, err error)
+	// EnqueueSpec hands a recipe's flesh out to the worker (replace drops
+	// the owner's edits to the spec).
+	EnqueueSpec func(ctx context.Context, recipeID uuid.UUID, replace bool) error
 	// JudgeSelector picks the model that scores eval answers (default auto
 	// under task class classify, so the policy routes it cheap).
 	JudgeSelector string
@@ -248,6 +272,9 @@ func (s *Service) Build(ctx context.Context, datasetID uuid.UUID) error {
 		_ = s.DB.SetDatasetStatus(ctx, store.SetDatasetStatusParams{ID: ds.ID, Status: StatusFailed, Error: &msg})
 		s.log().Warn("training: dataset build failed", "dataset", ds.ID, "err", msg)
 		return nil
+	}
+	if ds.Kind == KindUploaded {
+		return s.buildUploaded(ctx, ds, fail)
 	}
 	var f Filters
 	_ = json.Unmarshal(ds.Filters, &f)
@@ -331,7 +358,10 @@ var adapterNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,63}$`)
 
 // FinetuneSpec starts a job.
 type FinetuneSpec struct {
+	// DatasetID trains on one dataset; RecipeID (instead, never both) trains
+	// from a recipe: its datasets merged under its spec (merge.go).
 	DatasetID uuid.UUID
+	RecipeID  uuid.UUID
 	// BaseModel is the model id the trainer loads (a Hugging Face id or a
 	// path the trainer image can see); BaseEndpointID names the ws
 	// endpoint serving that base, so the adapter can be registered next
@@ -350,12 +380,35 @@ func (s *Service) StartFinetune(ctx context.Context, ownerID uuid.UUID, spec Fin
 	if len(avail) == 0 {
 		return nil, ErrNoRunner
 	}
-	ds, err := s.DB.GetDataset(ctx, spec.DatasetID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: dataset not found", ErrInvalid)
-	}
-	if ds.Status != StatusReady || ds.BlobKey == nil {
-		return nil, fmt.Errorf("%w: the dataset is %s", ErrInvalid, ds.Status)
+	var dsID uuid.NullUUID
+	var recipeID uuid.NullUUID
+	var specSnap json.RawMessage = json.RawMessage("{}")
+	if spec.RecipeID != uuid.Nil {
+		if spec.DatasetID != uuid.Nil {
+			return nil, fmt.Errorf("%w: give a dataset or a recipe, not both", ErrInvalid)
+		}
+		r, hyper, err := s.recipeForJob(ctx, spec.RecipeID)
+		if err != nil {
+			return nil, err
+		}
+		recipeID = store.NullUUID(r.ID)
+		specSnap = r.Spec
+		if spec.BaseModel == "" {
+			spec.BaseModel = r.BaseModel
+		}
+		if spec.BaseEndpointID == "" && r.BaseEndpointID != nil {
+			spec.BaseEndpointID = *r.BaseEndpointID
+		}
+		spec.Config = layerConfig(spec.Config, r, hyper)
+	} else {
+		ds, err := s.DB.GetDataset(ctx, spec.DatasetID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: dataset not found", ErrInvalid)
+		}
+		if ds.Status != StatusReady || ds.BlobKey == nil {
+			return nil, fmt.Errorf("%w: the dataset is %s", ErrInvalid, ds.Status)
+		}
+		dsID = store.NullUUID(ds.ID)
 	}
 	spec.AdapterName = strings.ToLower(strings.TrimSpace(spec.AdapterName))
 	if !adapterNameRe.MatchString(spec.AdapterName) {
@@ -401,7 +454,7 @@ func (s *Service) StartFinetune(ctx context.Context, ownerID uuid.UUID, spec Fin
 	if spec.BaseEndpointID != "" {
 		baseEP = &spec.BaseEndpointID
 	}
-	job, err := s.DB.CreateFinetuneJob(ctx, store.CreateFinetuneJobParams{OwnerID: ownerID, DatasetID: store.NullUUID(ds.ID), BaseModel: spec.BaseModel, BaseEndpointID: baseEP, AdapterName: spec.AdapterName, Config: cfg})
+	job, err := s.DB.CreateFinetuneJob(ctx, store.CreateFinetuneJobParams{OwnerID: ownerID, DatasetID: dsID, BaseModel: spec.BaseModel, BaseEndpointID: baseEP, AdapterName: spec.AdapterName, Config: cfg, RecipeID: recipeID, Spec: specSnap})
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +483,13 @@ func (s *Service) RunFinetune(ctx context.Context, jobID uuid.UUID) error {
 	}
 	if s.Runner == nil {
 		return fail("", ErrNoRunner)
+	}
+	if job.RecipeID.Valid && !job.DatasetID.Valid {
+		id, err := s.mergeRecipe(ctx, job)
+		if err != nil {
+			return fail("", fmt.Errorf("merging the recipe's datasets: %w", err))
+		}
+		job.DatasetID = store.NullUUID(id)
 	}
 	if !job.DatasetID.Valid {
 		return fail("", errors.New("the dataset was deleted"))
@@ -483,6 +543,8 @@ func (s *Service) RunFinetune(ctx context.Context, jobID uuid.UUID) error {
 // server and enables it, or promotes it here.
 func (s *Service) registerAdapter(ctx context.Context, job store.FinetuneJob, key string, size int64) (*store.Adapter, error) {
 	var epID *string
+	var sp Spec
+	_ = json.Unmarshal(job.Spec, &sp)
 	if job.BaseEndpointID != nil && s.Endpoint != nil {
 		if base, ok := s.Endpoint(*job.BaseEndpointID); ok {
 			id := "lora/" + job.AdapterName
@@ -491,6 +553,12 @@ func (s *Service) registerAdapter(ctx context.Context, job store.FinetuneJob, ke
 			extra := map[string]any{}
 			for k, v := range base.ExtraBody {
 				extra[k] = v
+			}
+			if sp.SystemPrompt != "" {
+				// The endpoint serves under the prompt it was trained with
+				// when a request brings none (the gateway lifts this key
+				// out of the body: store/gatewayglue.go).
+				extra[gateway.DefaultSystemKey] = sp.SystemPrompt
 			}
 			if llamaServer(base) {
 				// llama-server ignores the model name; the adapter is
@@ -506,11 +574,15 @@ func (s *Service) registerAdapter(ctx context.Context, job store.FinetuneJob, ke
 				return nil, fmt.Errorf("register endpoint: %w", err)
 			}
 			_ = s.DB.SetEndpointEnabled(ctx, store.SetEndpointEnabledParams{ID: id, Enabled: false})
+			// An adapter is reached by name or by a route naming it (promote
+			// writes one), never as general routing's fallback; it keeps its
+			// base model's tier, so a LoRA on a 0.5B is small.
+			_ = s.DB.SetEndpointRouting(ctx, store.SetEndpointRoutingParams{ID: id, Tier: base.EffectiveTier(), Routable: false})
 			epID = &id
 			s.reload(ctx)
 		}
 	}
-	ad, err := s.DB.CreateAdapter(ctx, store.CreateAdapterParams{Name: job.AdapterName, BaseModel: job.BaseModel, BaseEndpointID: job.BaseEndpointID, FinetuneJobID: store.NullUUID(job.ID), BlobKey: key, Bytes: size, EndpointID: epID})
+	ad, err := s.DB.CreateAdapter(ctx, store.CreateAdapterParams{Name: job.AdapterName, BaseModel: job.BaseModel, BaseEndpointID: job.BaseEndpointID, FinetuneJobID: store.NullUUID(job.ID), BlobKey: key, Bytes: size, EndpointID: epID, RecipeID: job.RecipeID, SystemPrompt: sp.SystemPrompt, Rubric: sp.Rubric})
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +673,7 @@ func (s *Service) Promote(ctx context.Context, id uuid.UUID, force bool, taskCla
 			return fmt.Errorf("%w: evaluate the adapter first (or force)", ErrNotReady)
 		}
 		if *ad.EvalScore < *ad.BaselineScore {
-			return fmt.Errorf("%w: the adapter scored %.2f against the base's %.2f (or force)", ErrNotReady, *ad.EvalScore, *ad.BaselineScore)
+			return fmt.Errorf("%w: the adapter scored %.2f against the base's %.2f (or force).%s", ErrNotReady, *ad.EvalScore, *ad.BaselineScore, smokeNote(evalExamples(ad.Eval)))
 		}
 	}
 	if err := s.DB.SetEndpointEnabled(ctx, store.SetEndpointEnabledParams{ID: *ad.EndpointID, Enabled: true}); err != nil {

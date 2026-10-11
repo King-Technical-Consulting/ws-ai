@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -18,27 +19,36 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
+	wsroot "github.com/jking323/ws"
 	"github.com/jking323/ws/internal/agent"
 	"github.com/jking323/ws/internal/agents"
 	"github.com/jking323/ws/internal/artifacts"
 	"github.com/jking323/ws/internal/auth"
+	"github.com/jking323/ws/internal/budgets"
 	"github.com/jking323/ws/internal/ccjobs"
 	"github.com/jking323/ws/internal/ccrouter"
 	"github.com/jking323/ws/internal/ccweb"
 	"github.com/jking323/ws/internal/chat"
 	"github.com/jking323/ws/internal/compaction"
 	"github.com/jking323/ws/internal/config"
+	"github.com/jking323/ws/internal/docread"
+	"github.com/jking323/ws/internal/documents"
+	"github.com/jking323/ws/internal/favorites"
 	"github.com/jking323/ws/internal/fleet/rental"
 	"github.com/jking323/ws/internal/gateway"
 	anthropicad "github.com/jking323/ws/internal/gateway/adapter/anthropic"
 	"github.com/jking323/ws/internal/gateway/adapter/openaicompat"
 	"github.com/jking323/ws/internal/github"
+	"github.com/jking323/ws/internal/helpdocs"
 	"github.com/jking323/ws/internal/httpx"
 	"github.com/jking323/ws/internal/jobs"
 	"github.com/jking323/ws/internal/mcpclient"
 	"github.com/jking323/ws/internal/mcpserver"
 	"github.com/jking323/ws/internal/media"
+	"github.com/jking323/ws/internal/memory"
+	"github.com/jking323/ws/internal/notebooks"
 	"github.com/jking323/ws/internal/sandbox"
+	"github.com/jking323/ws/internal/scheduled"
 	"github.com/jking323/ws/internal/sealed"
 	"github.com/jking323/ws/internal/secrets"
 	"github.com/jking323/ws/internal/store"
@@ -166,6 +176,20 @@ func buildGateway(ctx context.Context, cfg *config.Config, db *store.DB, log *sl
 	gw.RegisterAdapter(gateway.ProviderOpenAICompat, openaicompat.New())
 	gw.Priority = newPriorityFunc(db)
 	gw.Use(gateway.BudgetMiddleware(&store.BudgetStore{DB: db}, log))
+	// Verdict routing (docs/design/llm-routing.md): off unless
+	// WS_ROUTE_CLASSIFIER=auto. The daily ceiling is the owner's setting in
+	// Admin; the env var is only its default.
+	if strings.EqualFold(strings.TrimSpace(cfg.RouteClassifier), "auto") {
+		gw.EnableVerdicts(gateway.VerdictConfig{
+			Deadline:   time.Duration(cfg.RouteClassifierDeadlineMS) * time.Millisecond,
+			ReuseTurns: cfg.RouteClassifierReuseTurns,
+			MaxUSDDay: func(ctx context.Context) float64 {
+				return db.RouteClassifierCap(ctx, cfg.RouteClassifierMaxUSDDay)
+			},
+			SpentToday: db.RouteSpendToday,
+		})
+		log.Info("verdict routing on", "deadline_ms", cfg.RouteClassifierDeadlineMS, "reuse_turns", cfg.RouteClassifierReuseTurns)
+	}
 
 	// serve and worker are separate processes; each polls Postgres for the
 	// health the worker writes and for policy edits made in the admin UI.
@@ -216,6 +240,11 @@ type stack struct {
 	mcp       *mcpserver.Server
 	media     *media.Service
 	agents    *agents.Service
+	personal  *memory.Service
+	docs      *documents.Service
+	nbs       *notebooks.Service
+	favs      *favorites.Service
+	sched     *scheduled.Service
 	rental    *rental.Controller
 	training  *training.Service
 }
@@ -232,9 +261,16 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 		return nil, err
 	}
 	art := &artifacts.Service{DB: db, Secret: []byte(cfg.SessionSecret), BaseURL: cfg.ArtifactURL}
-	tools := agent.NewRegistry(agent.ReadBlobTool{}, &agent.WebFetchTool{}, agent.AskUserTool{})
+	tools := agent.NewRegistry(agent.ReadBlobTool{}, &agent.WebFetchTool{}, agent.AskUserTool{}, agent.SubmitPlanTool{}, agent.PlanStepTool{})
 	for _, t := range agent.ArtifactTools(art) {
 		tools.Add(t)
+	}
+	// ws_help: the public docs embedded in this build, so the assistant can
+	// explain ws itself. A docs list that does not load leaves chat without it.
+	if hd, err := helpdocs.Load(wsroot.HelpDocs); err != nil {
+		log.Warn("in-app help disabled", "err", err)
+	} else {
+		tools.Add(helpdocs.NewTool(hd))
 	}
 	// Sandbox tools live only in the worker, which has the Docker socket.
 	// Code-mode runs are enqueued by serve and driven here.
@@ -267,6 +303,9 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 			for _, t := range sandbox.GitTools(sbm, resolve, buildGitHub(cfg, db, log)) {
 				tools.Add(t)
 			}
+			// skill_open places an approved skill folder's files in the
+			// sandbox; it runs nothing (internal/agents/skillopen.go).
+			tools.Add(&agents.SkillOpen{DB: db, Skills: (&agents.SkillStore{DB: db, Blobs: blobs}).ForAgent, Blobs: blobs, M: sbm, Resolve: resolve})
 			stdioRunner = &sandbox.StdioRunner{M: sbm, Resolve: resolve}
 		}
 	}
@@ -354,11 +393,52 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	// Long-lived agents (PLAN M7): runs go to the worker like code turns;
 	// the worker's minute tick fires due cron triggers.
 	mem := &agents.Memory{DB: db, GW: gw, Log: log}
-	ags := &agents.Service{DB: db, Runtime: rt, Memory: mem, Log: log}
-	// remember and recall exist for agent runs only (a chat turn gets an
-	// error result); chat conversations are not offered them.
-	tools.Add(agents.NewRememberTool(mem))
-	tools.Add(agents.NewRecallTool(mem))
+	// Each member's own memory and card (PLAN M13): remember and recall
+	// fall back to it in a chat turn, and the worker's reflection job and
+	// its due-check run on it.
+	pmem := &memory.Service{DB: db, GW: gw, Log: log}
+	// Scheduled prompts (PLAN M13 cut 5): the worker's minute tick fires
+	// them as ordinary chat runs; serve lists, edits and runs them now.
+	sched := &scheduled.Service{DB: db, Runs: rt, Mail: newMailer(cfg, log), Memory: pmem, PublicURL: cfg.PublicURL, Log: log}
+	ags := &agents.Service{DB: db, Runtime: rt, Memory: mem, Log: log,
+		SkillsFor: (&agents.SkillStore{DB: db, Blobs: blobs}).ForAgent,
+		ProjectKind: func(ctx context.Context, id uuid.UUID) (string, error) {
+			p, err := db.GetProject(ctx, id)
+			return p.Kind, err
+		}}
+	// remember and recall: an agent's memory in an agent run, the person's
+	// own in a chat turn, which is offered them.
+	// Document reading (PLAN M13 cut 4): extraction in Go, OCR through the
+	// container at OCR_URL when set, the read_document tool for chats.
+	docReader := &docread.Reader{Limits: docread.Limits{MaxBytes: cfg.DocMaxBytes, MaxPages: cfg.DocMaxPages}}
+	if cfg.OCRURL != "" {
+		docReader.OCR = &docread.HTTPOCR{URL: cfg.OCRURL}
+	}
+	// Research notebooks (PLAN M13 cut 6): sources chunked and embedded,
+	// the chat's context, and the notebook_note tool. Pages are fetched
+	// through the same guarded fetch web_fetch uses.
+	webFetch := &agent.WebFetchTool{}
+	nbs := &notebooks.Service{DB: db, Blobs: blobs, Reader: docReader, GW: gw, Log: log,
+		Fetch: func(ctx context.Context, rawURL string) (string, error) {
+			args, _ := json.Marshal(map[string]any{"url": rawURL, "max_chars": 100000})
+			res, err := webFetch.Call(ctx, agent.ToolCtx{}, args)
+			if err != nil {
+				return "", err
+			}
+			if res.IsError {
+				return "", errors.New(strings.TrimPrefix(res.Text, "Error: "))
+			}
+			return res.Text, nil
+		}}
+	tools.Add(&notebooks.Tool{Svc: nbs})
+	docs := &documents.Service{DB: db, Blobs: blobs, Reader: docReader, GW: gw, Log: log, InlineChars: cfg.DocInlineChars}
+	tools.Add(&documents.Tool{Svc: docs, OCR: cfg.OCRURL != ""})
+	chat.AllowTools(documents.ToolName)
+	remember, recall := agents.NewRememberTool(mem), agents.NewRecallTool(mem)
+	remember.Personal, recall.Personal = pmem, pmem
+	tools.Add(remember)
+	tools.Add(recall)
+	chat.AllowTools(agents.ToolRemember, agents.ToolRecall)
 	// Agent presets: starting points for the new-agent form, from disk.
 	if presets, warn, err := agents.LoadPresets(cfg.PresetsDir, presetToolKnown(tools)); err != nil {
 		log.Warn("agent presets", "dir", cfg.PresetsDir, "err", err)
@@ -377,7 +457,11 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	// eval gate. The runner exists only where WS_FINETUNE_IMAGE is set
 	// and Docker answers.
 	trn := buildTraining(ctx, cfg, db, gw, blobs, rent, log, workers)
-	deps := &jobs.Deps{DB: db, Runtime: rt, Compactor: comp, Log: log, Media: med, Agents: ags, Memory: mem, Rental: rent, Training: trn}
+	deps := &jobs.Deps{DB: db, Runtime: rt, Compactor: comp, Log: log, Media: med, Agents: ags, Memory: mem, Personal: pmem, Scheduled: sched, Rental: rent, Training: trn}
+	if workers {
+		// Budget warning mails (PLAN M7): the worker's hourly sweep.
+		deps.Budgets = &budgets.Service{DB: db, Spend: &store.BudgetStore{DB: db}, Mail: newMailer(cfg, log), PublicURL: cfg.PublicURL, Log: log}
+	}
 	if sbm != nil {
 		deps.Sandbox = sbm
 	}
@@ -393,7 +477,9 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	spawn.Enqueue = jc.EnqueueRun
 	med.Enqueue = jc.EnqueueMedia
 	ags.Enqueue = jc.EnqueueRun
+	sched.Enqueue = jc.EnqueueRun
 	trn.EnqueueBuild, trn.EnqueueFinetune, trn.EnqueueEval = jc.EnqueueTrainingBuild, jc.EnqueueFinetune, jc.EnqueueEval
+	trn.EnqueueSpec = jc.EnqueueTrainingSpec
 	// ws as an MCP server (PLAN M5): the same gateway, runtime, worker
 	// queue and task router, scoped to the API key's user per request.
 	var mcpSrv *mcpserver.Server
@@ -423,7 +509,7 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 	if ks != nil {
 		box = ks.Box
 	}
-	return &stack{gw: gw, secrets: box, keyStore: ks, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, rental: rent, training: trn}, nil
+	return &stack{gw: gw, secrets: box, keyStore: ks, blobs: blobs, artifacts: art, runtime: rt, compactor: comp, jobs: jc, sandbox: sbm, ccJobs: ccJobs, mcp: mcpSrv, media: med, agents: ags, personal: pmem, docs: docs, nbs: nbs, favs: &favorites.Service{DB: db}, sched: sched, rental: rent, training: trn}, nil
 }
 
 // buildTraining wires the training service. The targets a job can name
@@ -436,7 +522,7 @@ func buildStack(ctx context.Context, cfg *config.Config, db *store.DB, log *slog
 // the reason on its row.
 func buildTraining(ctx context.Context, cfg *config.Config, db *store.DB, gw *gateway.Gateway, blobs blob.Store, rent *rental.Controller, log *slog.Logger, worker bool) *training.Service {
 	t := &training.Service{
-		DB: db, Blobs: blobs, GW: gw, Log: log, JudgeSelector: cfg.TrainingJudge,
+		DB: db, Blobs: blobs, GW: gw, Log: log, JudgeSelector: cfg.TrainingJudge, UploadMaxBytes: cfg.TrainingUploadMaxBytes,
 		// The base model picker searches the hub through the server; the
 		// token (when set) lets it see gated and private models too.
 		Hub:            &training.Hub{Token: os.Getenv("HF_TOKEN")},
@@ -553,14 +639,22 @@ func buildSandbox(ctx context.Context, cfg *config.Config, db *store.DB, log *sl
 	if proxyURL == "none" {
 		proxyURL = ""
 	}
+	hardeningOff := strings.EqualFold(strings.TrimSpace(cfg.SandboxHardening), "off")
+	if hardeningOff {
+		log.Warn("sandbox hardening is off (WS_SANDBOX_HARDENING=off): writable root, capabilities kept, privilege escalation allowed")
+	} else if h := strings.ToLower(strings.TrimSpace(cfg.SandboxHardening)); h != "on" {
+		log.Warn("WS_SANDBOX_HARDENING must be on or off; hardening stays on", "value", cfg.SandboxHardening)
+	}
+	gh := buildGitHub(cfg, db, log)
 	m, err := sandbox.New(ctx, db, log, sandbox.Config{
 		Image: cfg.SandboxImage, Network: network, ProxyURL: proxyURL, Runtime: cfg.SandboxRuntime,
-		Jail: cfg.SandboxJail, MemoryMB: cfg.SandboxMemoryMB, CPUs: cfg.SandboxCPUs, IdleStop: idle, Remove: remove,
+		Jail: cfg.SandboxJail, MemoryMB: cfg.SandboxMemoryMB, CPUs: cfg.SandboxCPUs, Pids: cfg.SandboxPids,
+		HardeningOff: hardeningOff, IdleStop: idle, Remove: remove,
+		RegistryToken: cfg.GHCRToken, GitHubCredential: gh.Configured() || cfg.GitHubToken != "",
 	})
 	if err != nil {
 		return nil, err
 	}
-	gh := buildGitHub(cfg, db, log)
 	allow := append([]string{}, sandbox.DefaultAllow...)
 	allow = append(allow, sandbox.ParseAllow(cfg.EgressAllow)...)
 	allow = append(allow, sandbox.ParseAllow(cfg.PublicURL)...) // M5: Claude Code in the sandbox talks to ws
@@ -611,6 +705,22 @@ func buildGitHub(cfg *config.Config, db *store.DB, log *slog.Logger) *github.Hos
 }
 
 func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+	// A home-networks list that cannot be read stops the server: guessing home or away is worse than not starting.
+	if _, err := httpx.ParseHomeNetworks(cfg.HomeNetworks); err != nil {
+		return err
+	}
+	if _, err := httpx.ParseStepUpActions(cfg.StepUpActions); err != nil {
+		return err
+	}
+	if _, err := httpx.ParseStepUpWindow(cfg.StepUpWindow); err != nil {
+		return err
+	}
+	// The tunnel listener believes CF-Connecting-IP, so it must know which peers may reach it.
+	if cfg.TunnelListen != "" {
+		if _, err := httpx.ParseTunnelPeers(cfg.TunnelPeers); err != nil {
+			return err
+		}
+	}
 	db, err := store.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -620,13 +730,7 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	var mailer auth.Mailer
-	if cfg.ResendAPIKey != "" {
-		mailer = auth.NewResendMailer(cfg.ResendAPIKey, cfg.EmailFrom)
-	} else {
-		log.Warn("RESEND_API_KEY not set; magic links and invites are logged, not emailed")
-		mailer = auth.LogMailer{Log: log}
-	}
+	mailer := newMailer(cfg, log)
 	authSvc, err := auth.New(db, mailer, auth.Config{
 		RPID: cfg.RPID, RPDisplayName: cfg.RPDisplayName, RPOrigins: cfg.RPOrigins,
 		PublicURL: cfg.PublicURL, SecureCookies: !cfg.IsDev(),
@@ -664,7 +768,11 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	srv := &httpx.Server{
 		Cfg: cfg, DB: db, Auth: authSvc, GW: gw, Secrets: st.secrets, KeyStore: st.keyStore,
-		Chat:                &chat.Service{DB: db, GW: gw, Runtime: st.runtime, Log: log, Enqueue: st.jobs.EnqueueRun},
+		Chat:                &chat.Service{DB: db, GW: gw, Runtime: st.runtime, Log: log, Enqueue: st.jobs.EnqueueRun, Memory: st.personal, Documents: st.docs, Notebooks: st.nbs},
+		Memory:              st.personal,
+		Scheduled:           st.sched,
+		Notebooks:           st.nbs,
+		Favorites:           st.favs,
 		Artifacts:           art,
 		Jobs:                st.jobs,
 		Worker:              worker,
@@ -695,14 +803,36 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	// The Cloudflare tunnel's listener (WS_TUNNEL_LISTEN): the same app, with the client
+	// address taken from CF-Connecting-IP, the only place it is believed.
+	var th *http.Server
+	if cfg.TunnelListen != "" {
+		th = &http.Server{
+			Addr:              cfg.TunnelListen,
+			Handler:           srv.TunnelHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = h.Shutdown(sctx)
 		_ = ah.Shutdown(sctx)
+		if th != nil {
+			_ = th.Shutdown(sctx)
+		}
 	}()
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
+	if th != nil {
+		go func() {
+			log.Info("ws tunnel listener", "listen", cfg.TunnelListen, "home_networks_set", cfg.HomeNetworks != "")
+			if err := th.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("tunnel listener: %w", err)
+			}
+		}()
+	}
 	go func() {
 		log.Info("ws artifacts", "listen", cfg.ArtifactListen, "origin", cfg.ArtifactURL)
 		if err := ah.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -828,4 +958,13 @@ func newPriorityFunc(db *store.DB) func(context.Context, gateway.Metadata) int {
 		mu.Unlock()
 		return prio
 	}
+}
+
+// newMailer is Resend when its key is set, else the log.
+func newMailer(cfg *config.Config, log *slog.Logger) auth.Mailer {
+	if cfg.ResendAPIKey != "" {
+		return auth.NewResendMailer(cfg.ResendAPIKey, cfg.EmailFrom)
+	}
+	log.Warn("RESEND_API_KEY not set; mail (magic links, invites, budget warnings) is logged, not sent")
+	return auth.LogMailer{Log: log}
 }

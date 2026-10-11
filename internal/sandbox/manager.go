@@ -9,6 +9,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,17 +36,28 @@ const Workspace = "/workspace"
 
 // Config is the sandbox manager's configuration.
 type Config struct {
-	Image    string        // sandbox image, e.g. ghcr.io/king-technical-consulting/ws-sandbox:latest
-	Network  string        // internal Docker network sandboxes join (compose: ws_sandbox-net)
-	ProxyURL string        // egress proxy sandboxes must use, e.g. http://worker:3128
-	Runtime  string        // "auto" (runsc if present, else runc), "runc", or "runsc"
-	MemoryMB int64         // memory limit per sandbox
-	CPUs     float64       // CPU limit per sandbox
-	Pids     int64         // pids limit
-	Jail     bool          // run bash tool commands inside bubblewrap (needs bwrap in the image and user namespaces in the container)
-	IdleStop time.Duration // stop containers idle this long
-	Remove   time.Duration // remove stopped containers idle this long (volume kept)
-	Labels   map[string]string
+	Image    string  // sandbox image, e.g. ghcr.io/king-technical-consulting/ws-sandbox:latest
+	Network  string  // internal Docker network sandboxes join (compose: ws_sandbox-net)
+	ProxyURL string  // egress proxy sandboxes must use, e.g. http://worker:3128
+	Runtime  string  // "auto" (runsc if present, else runc), "runc", or "runsc"
+	MemoryMB int64   // memory limit per sandbox
+	CPUs     float64 // CPU limit per sandbox
+	Pids     int64   // pids limit
+	// HardeningOff drops the read-only root, the capability drop and
+	// no-new-privileges, for a box where an image breaks under them. The
+	// memory, CPU and pids limits are separate settings and stay.
+	HardeningOff bool
+	// RegistryToken, when set, authenticates the image pull against ghcr.io
+	// (and only ghcr.io): the sandbox image is a private package.
+	RegistryToken string
+	// GitHubCredential says whether the egress proxy can inject a GitHub
+	// credential (the App or GITHUB_TOKEN); it only changes the words of a
+	// failed clone.
+	GitHubCredential bool
+	Jail             bool          // run bash tool commands inside bubblewrap (needs bwrap in the image and user namespaces in the container)
+	IdleStop         time.Duration // stop containers idle this long
+	Remove           time.Duration // remove stopped containers idle this long (volume kept)
+	Labels           map[string]string
 }
 
 // Sandbox is a (project, user) sandbox and its container.
@@ -150,6 +162,9 @@ func fromRow(r store.Sandbox) *Sandbox {
 }
 
 func (m *Manager) event(ctx context.Context, id uuid.UUID, kind string, detail any) {
+	if id == uuid.Nil { // a probe container has no sandbox row
+		return
+	}
 	b, _ := json.Marshal(detail)
 	if b == nil {
 		b = []byte("{}")
@@ -201,16 +216,20 @@ func (m *Manager) Ensure(ctx context.Context, projectID, userID uuid.UUID) (*San
 		sb.ContainerID = ""
 	}
 
-	if err := m.ensureImage(ctx); err != nil {
+	if err := m.ensureImage(ctx, sb.ID); err != nil {
 		_ = m.db.SetSandboxStatus(ctx, store.SetSandboxStatusParams{ID: sb.ID, Status: "failed", Error: ptr(err.Error())})
 		return nil, err
 	}
 	if _, err := m.cli.VolumeCreate(ctx, client.VolumeCreateOptions{Name: sb.Volume, Labels: m.labels(sb)}); err != nil {
+		m.event(ctx, sb.ID, "error", map[string]any{"stage": "volume", "error": "could not create the workspace volume: " + short(err)})
+		_ = m.db.SetSandboxStatus(ctx, store.SetSandboxStatusParams{ID: sb.ID, Status: "failed", Error: ptr("volume: " + short(err))})
 		return nil, fmt.Errorf("sandbox: volume: %w", err)
 	}
 	cid, err := m.create(ctx, sb)
 	if err != nil {
-		_ = m.db.SetSandboxStatus(ctx, store.SetSandboxStatusParams{ID: sb.ID, Status: "failed", Error: ptr(err.Error())})
+		reason := createFailure(err, m.cfg.Network)
+		m.event(ctx, sb.ID, "error", map[string]any{"stage": "create", "error": reason})
+		_ = m.db.SetSandboxStatus(ctx, store.SetSandboxStatusParams{ID: sb.ID, Status: "failed", Error: ptr(reason)})
 		return nil, err
 	}
 	sb.ContainerID = cid
@@ -235,22 +254,61 @@ func (m *Manager) labels(sb *Sandbox) map[string]string {
 	return l
 }
 
-func (m *Manager) ensureImage(ctx context.Context) error {
+// pullTimeout bounds one image pull; a private image without credentials
+// should fail fast, so this is only reached by a slow registry.
+const pullTimeout = 10 * time.Minute
+
+// ensureImage makes the sandbox image present, pulling it when it is not.
+// Failures are returned as plain sentences naming the cause, because they
+// are shown to the person whose code project did not start.
+func (m *Manager) ensureImage(ctx context.Context, sbID uuid.UUID) error {
 	if _, err := m.cli.ImageInspect(ctx, m.cfg.Image); err == nil {
 		return nil
 	}
-	m.log.Info("sandbox: pulling image", "image", m.cfg.Image)
-	pctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	m.log.Info("sandbox: pulling image", "image", m.cfg.Image, "authenticated", registryAuth(m.cfg.Image, m.cfg.RegistryToken) != "")
+	m.event(ctx, sbID, "pulling_image", map[string]any{"image": m.cfg.Image})
+	pctx, cancel := context.WithTimeout(ctx, pullTimeout)
 	defer cancel()
-	resp, err := m.cli.ImagePull(pctx, m.cfg.Image, client.ImagePullOptions{})
-	if err != nil {
-		return fmt.Errorf("sandbox: pull %s: %w", m.cfg.Image, err)
+	resp, err := m.cli.ImagePull(pctx, m.cfg.Image, client.ImagePullOptions{RegistryAuth: registryAuth(m.cfg.Image, m.cfg.RegistryToken)})
+	if err == nil {
+		defer resp.Close()
+		err = resp.Wait(pctx)
 	}
-	defer resp.Close()
-	if err := resp.Wait(pctx); err != nil {
-		return fmt.Errorf("sandbox: pull %s: %w", m.cfg.Image, err)
+	if err != nil {
+		reason := pullFailure(err, m.cfg.Image, m.cfg.RegistryToken != "", pctx.Err() != nil)
+		m.log.Warn("sandbox: image pull failed", "image", m.cfg.Image, "reason", reason, "err", err)
+		m.event(ctx, sbID, "error", map[string]any{"stage": "pull", "image": m.cfg.Image, "error": reason})
+		return errors.New("sandbox: " + reason)
 	}
 	return nil
+}
+
+// registryAuth is the X-Registry-Auth value for an image on ghcr.io, empty
+// for any other registry or when no token is set: the token is never sent
+// anywhere else.
+func registryAuth(image, token string) string {
+	if token == "" || !strings.HasPrefix(strings.ToLower(image), "ghcr.io/") {
+		return ""
+	}
+	b, _ := json.Marshal(map[string]string{"username": "ws", "password": token})
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+// pullFailure turns a pull error into one sentence for the person.
+func pullFailure(err error, image string, haveToken, timedOut bool) string {
+	msg := strings.ToLower(err.Error())
+	switch {
+	case timedOut || errors.Is(err, context.DeadlineExceeded):
+		return fmt.Sprintf("image pull timed out after %d minutes (%s)", int(pullTimeout.Minutes()), image)
+	case strings.Contains(msg, "denied") || strings.Contains(msg, "unauthorized") || strings.Contains(msg, "authentication required") || strings.Contains(msg, "forbidden"):
+		if !haveToken && strings.HasPrefix(strings.ToLower(image), "ghcr.io/") {
+			return "image pull denied: the package is private and GHCR_TOKEN is not set"
+		}
+		return "image pull denied: the registry refused the credentials for " + image
+	case strings.Contains(msg, "not found") || strings.Contains(msg, "manifest unknown"):
+		return "image not found in the registry: " + image
+	}
+	return "image pull failed: " + err.Error()
 }
 
 func (m *Manager) create(ctx context.Context, sb *Sandbox) (string, error) {
@@ -291,9 +349,15 @@ func (m *Manager) clone(ctx context.Context, sb *Sandbox, repo, branch string) {
 		detail["exit_code"] = res.ExitCode
 		if res.ExitCode != 0 {
 			detail["stderr"] = res.Stderr
+			if r := cloneFailure(res.Stderr, m.cfg.GitHubCredential); r != "" {
+				detail["reason"] = r
+			}
 		}
 	}
 	m.event(ctx, sb.ID, "clone", detail)
+	if reason, _ := detail["reason"].(string); reason != "" {
+		m.event(ctx, sb.ID, "error", map[string]any{"stage": "clone", "error": reason})
+	}
 }
 
 // ExecOptions configures one command run inside the sandbox.
@@ -435,8 +499,28 @@ func (m *Manager) WriteFile(ctx context.Context, sb *Sandbox, p string, data []b
 	if dir == "" {
 		dir = Workspace + "/"
 	}
-	if _, err := m.Exec(ctx, sb, ExecOptions{Cmd: []string{"mkdir", "-p", dir}, Timeout: 10 * time.Second}); err != nil {
+	mk, err := m.Exec(ctx, sb, ExecOptions{Cmd: []string{"mkdir", "-p", dir}, Timeout: 10 * time.Second})
+	if err != nil {
 		return err
+	}
+	if mk.ExitCode != 0 {
+		// Say why instead of going on: the copy below would fail with a
+		// daemon message about a missing directory that hides the cause.
+		return fmt.Errorf("sandbox: write %s: cannot create %s: %s", p, dir, strings.TrimSpace(mk.Stderr))
+	}
+	if !strings.HasPrefix(path.Clean(p), Workspace+"/") {
+		// Outside the volume everything writable is a tmpfs (/home/dev,
+		// /tmp), and Docker's archive API cannot write into a tmpfs mount:
+		// the copy fails with "Could not find the file". Stream the bytes to
+		// cat as the sandbox user instead (found placing a skill, board 088b).
+		res, err := m.Exec(ctx, sb, ExecOptions{Cmd: []string{"sh", "-c", `umask 022 && cat > "$1"`, "sh", path.Clean(p)}, Stdin: data, Timeout: 30 * time.Second})
+		if err != nil {
+			return fmt.Errorf("sandbox: write %s: %w", p, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("sandbox: write %s: %s", p, strings.TrimSpace(res.Stderr))
+		}
+		return nil
 	}
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -581,4 +665,46 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func short(err error) string {
+	s := err.Error()
+	if len(s) > 300 {
+		s = s[:300]
+	}
+	return s
+}
+
+// createFailure turns a container create or start error into a sentence.
+func createFailure(err error, network string) string {
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "network") && strings.Contains(msg, "not found"):
+		return fmt.Sprintf("network %s not found: the worker must run in the Compose project that defines it, or WS_SANDBOX_NETWORK names another network", network)
+	case strings.Contains(msg, "no such image"):
+		return "the sandbox image is missing after the pull"
+	case strings.Contains(msg, "runtime") && (strings.Contains(msg, "unknown") || strings.Contains(msg, "not found")):
+		return "the container runtime named by WS_SANDBOX_RUNTIME is not installed on this host"
+	case strings.Contains(msg, "permission denied"):
+		return "the worker may not use the Docker socket (check DOCKER_GID)"
+	}
+	return "could not create the sandbox container: " + short(err)
+}
+
+// cloneFailure explains a failed git clone in a sentence, or returns "".
+// A private repository answers an unauthenticated clone with "not found" or
+// a request for credentials, so with no GitHub credential configured that
+// is the reason to give.
+func cloneFailure(stderr string, haveCredential bool) string {
+	low := strings.ToLower(stderr)
+	authish := strings.Contains(low, "could not read username") || strings.Contains(low, "authentication failed") ||
+		strings.Contains(low, "repository not found") || strings.Contains(low, "terminal prompts disabled") ||
+		strings.Contains(low, "invalid username or password") || strings.Contains(low, "returned error: 403") || strings.Contains(low, "returned error: 401")
+	if !authish {
+		return ""
+	}
+	if !haveCredential {
+		return "private repository and no GitHub credential is configured; set up the GitHub App or GITHUB_TOKEN"
+	}
+	return "the repository was not found or the configured GitHub credential cannot read it"
 }

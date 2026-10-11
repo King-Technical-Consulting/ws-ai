@@ -81,6 +81,7 @@ func (a *InternalAPI) Handler() http.Handler {
 	r.Post("/internal/sandboxes/ensure", a.ensure)
 	r.Get("/internal/sandboxes/{id}", a.get)
 	r.Post("/internal/sandboxes/{id}/stop", a.stop)
+	r.Delete("/internal/projects/{id}/sandboxes", a.removeProject)
 	r.Get("/internal/sandboxes/{id}/tree", a.tree)
 	r.Get("/internal/sandboxes/{id}/file", a.readFile)
 	r.Put("/internal/sandboxes/{id}/file", a.writeFile)
@@ -199,6 +200,36 @@ func (a *InternalAPI) stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// removeProject removes every sandbox of a project: the container and the
+// workspace volume. It is idempotent; a project with none answers 204.
+func (a *InternalAPI) removeProject(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		jsonErr(w, 400, "bad id")
+		return
+	}
+	if err := a.M.RemoveProject(r.Context(), id); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	w.WriteHeader(204)
+}
+
+// RemoveProject removes a project's sandbox containers and wipes their
+// volumes (the working copy). Used when an archived project is deleted.
+func (m *Manager) RemoveProject(ctx context.Context, projectID uuid.UUID) error {
+	rows, err := m.db.ListSandboxesForProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := m.Remove(ctx, fromRow(row), true); err != nil {
+			return fmt.Errorf("sandbox %s: %w", row.ID, err)
+		}
+	}
+	return nil
 }
 
 // Tree lists one directory (not recursive) with types and sizes.

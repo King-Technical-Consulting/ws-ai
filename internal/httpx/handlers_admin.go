@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"errors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -285,4 +286,60 @@ func (s *Server) handleAdminRevokeUserKey(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// routingView is the verdict-routing settings Admin shows.
+type routingView struct {
+	Mode          string  `json:"mode"` // "auto" or "off", from WS_ROUTE_CLASSIFIER
+	MaxUSDDay     float64 `json:"max_usd_day"`
+	DefaultUSDDay float64 `json:"default_usd_day"`
+	SpentTodayUSD float64 `json:"spent_today_usd"`
+	DeadlineMS    int     `json:"deadline_ms"`
+	ReuseTurns    int     `json:"reuse_turns"`
+}
+
+func (s *Server) routingView(ctx context.Context) routingView {
+	mode := "off"
+	if strings.EqualFold(strings.TrimSpace(s.Cfg.RouteClassifier), "auto") {
+		mode = "auto"
+	}
+	spent, _ := s.DB.RouteSpendToday(ctx)
+	return routingView{
+		Mode: mode, MaxUSDDay: s.DB.RouteClassifierCap(ctx, s.Cfg.RouteClassifierMaxUSDDay), DefaultUSDDay: s.Cfg.RouteClassifierMaxUSDDay,
+		SpentTodayUSD: spent, DeadlineMS: s.Cfg.RouteClassifierDeadlineMS, ReuseTurns: s.Cfg.RouteClassifierReuseTurns,
+	}
+}
+
+// handleGetRouting returns the verdict-routing settings and today's spend.
+func (s *Server) handleGetRouting(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.routingView(r.Context()))
+}
+
+// handlePutRouting sets the daily classifier spend ceiling: `{max_usd_day}`,
+// 0 for no ceiling, `null` to go back to the environment's default. The
+// worker and serve read it on each decision, so it takes effect at once.
+func (s *Server) handlePutRouting(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		MaxUSDDay *float64 `json:"max_usd_day"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	switch {
+	case in.MaxUSDDay == nil:
+		if err := s.DB.DeleteServerSetting(r.Context(), store.RouteCapKey); err != nil {
+			writeErr(w, 500, "db")
+			return
+		}
+	case *in.MaxUSDDay < 0 || *in.MaxUSDDay > 10000:
+		writeErr(w, 400, "max_usd_day is 0 (no ceiling) up to 10000")
+		return
+	default:
+		if err := s.DB.SetRouteClassifierCap(r.Context(), *in.MaxUSDDay); err != nil {
+			writeErr(w, 500, "db")
+			return
+		}
+	}
+	writeJSON(w, 200, s.routingView(r.Context()))
 }

@@ -123,6 +123,8 @@ func (s *Server) handleUpsertEndpoint(w http.ResponseWriter, r *http.Request) {
 		ThroughputClass string               `json:"throughput_class"`
 		LatencyClass    string               `json:"latency_class"`
 		Local           bool                 `json:"local"`
+		Tier            string               `json:"tier"`
+		NotRoutable     bool                 `json:"not_routable"`
 		Enabled         *bool                `json:"enabled"`
 		ExtraBody       map[string]any       `json:"extra_body"`
 	}
@@ -164,6 +166,12 @@ func (s *Server) handleUpsertEndpoint(w http.ResponseWriter, r *http.Request) {
 			m.MaxImages = 4
 		}
 	}
+	switch in.Tier {
+	case "", gateway.TierSmall, gateway.TierMedium, gateway.TierLarge:
+	default:
+		writeErr(w, 400, "tier is small, medium or large (or empty to read it off the model name)")
+		return
+	}
 	if in.ThroughputClass == "" {
 		in.ThroughputClass = "medium"
 	}
@@ -176,6 +184,16 @@ func (s *Server) handleUpsertEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	caps, _ := json.Marshal(in.Capabilities)
 	pricing, _ := json.Marshal(in.Pricing)
+	// An adapter's default system prompt is kept out of the extra_body the
+	// form shows (gateway.DefaultSystemKey); an edit must not drop it.
+	if prev, ok := s.GW.Registry.Endpoint(in.ID); ok && prev.DefaultSystem != "" {
+		if in.ExtraBody == nil {
+			in.ExtraBody = map[string]any{}
+		}
+		if _, set := in.ExtraBody[gateway.DefaultSystemKey]; !set {
+			in.ExtraBody[gateway.DefaultSystemKey] = prev.DefaultSystem
+		}
+	}
 	extra := []byte("{}")
 	if len(in.ExtraBody) > 0 {
 		extra, _ = json.Marshal(in.ExtraBody)
@@ -191,6 +209,10 @@ func (s *Server) handleUpsertEndpoint(w http.ResponseWriter, r *http.Request) {
 	// UpsertEndpoint deliberately doesn't touch `enabled` on conflict (admin
 	// toggles survive reseeding), so set it explicitly for UI edits.
 	_ = s.DB.SetEndpointEnabled(r.Context(), store.SetEndpointEnabledParams{ID: in.ID, Enabled: enabled})
+	if err := s.DB.SetEndpointRouting(r.Context(), store.SetEndpointRoutingParams{ID: in.ID, Tier: in.Tier, Routable: !in.NotRoutable}); err != nil {
+		writeErr(w, 500, "db: "+err.Error())
+		return
+	}
 	if err := s.DB.LoadRegistry(r.Context(), s.GW.Registry); err != nil {
 		s.Log.Warn("reload registry", "err", err)
 	}

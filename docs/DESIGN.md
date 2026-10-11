@@ -63,7 +63,28 @@ Logo draw-on on Login only: trunk 1.6s ease-out, second branch .2s later, destin
 
 ## Components
 
-Shared primitives are in `web/src/components/ui.tsx`: `SectionHead`, `PageTitle`, `Divider`, `Callout`, `ListGroup`, `Row`, `WsMark`, `StatusChip`, the `btn` / `input` / `inputSm` class sets, and in `web/src/index.css` the `.reading-tight`, `.prose-ws` and `.wordmark` classes. Everything else is Tailwind utilities in the TSX.
+Shared primitives are in `web/src/components/ui.tsx`: `SectionHead`, `PageTitle`, `Divider`, `Callout`, `ListGroup`, `Row`, `WsMark`, `StatusChip`, `SectionNav` and `RowMenu` (Admin and Settings), `useConfirm` and `usePrompt` (see Dialogs), the `btn` / `input` / `inputSm` class sets, and in `web/src/index.css` the `.reading-tight`, `.prose-ws` and `.wordmark` classes. Everything else is Tailwind utilities in the TSX.
+
+## Dialogs
+
+The app never opens the browser's own `confirm`, `prompt` or `alert`: they cannot be styled, block the page, and look like a different program. A test in `web/src/no-browser-dialogs.test.ts` fails on any call to them in `web/src`. Use the hooks from `web/src/components/ui.tsx` (the code is in `dialogs.tsx`, mounted once by `DialogProvider` in `main.tsx`):
+
+```tsx
+const confirmDialog = useConfirm()
+if (await confirmDialog({ title: 'Delete adapter x?', body: 'The stored adapter files are removed.', confirm: 'Delete adapter', danger: true })) remove.mutate()
+
+const promptDialog = usePrompt()
+const name = await promptDialog({ title: 'New design project', label: 'Project name', initial: 'Design', confirm: 'Create project' }) // null if cancelled
+```
+
+- **When to confirm.** Only for something that cannot be undone, or that stops or removes more than the thing named (a provider and its endpoints, every rented machine). Reversible actions do not ask. Renaming something is not a dialog: edit it in place (Enter saves, Escape cancels, leaving the field saves).
+- **Wording.** A title that is a short question about the thing ("Delete adapter x?"), at most one sentence under it saying what happens, a Cancel button and a primary button named for the verb ("Delete adapter", "Archive conversation"), never "OK" or "Yes". Destructive confirmations pass `danger: true`, which draws the primary button in `danger` (outlined, with words).
+- **Behaviour.** A native `<dialog>` shown with `showModal()`: focus stays inside, Escape and Cancel and a click on the backdrop cancel (`false` or `null`), Enter confirms (the primary button has focus; in a prompt, Enter in the field submits and an empty answer cannot be submitted), and focus returns to the button that opened it. Buttons and the field are at least 36 px tall. No shadow, no animation.
+- **Call sites.** Name the hook's result `confirmDialog` or `promptDialog`, not `confirm` or `prompt`: shadowing the globals would turn a forgotten hook into a silent browser dialog.
+
+## Rows
+
+`Row` (`ui.tsx`) is one line of a list: text on the left, actions on the right. The text wraps and breaks inside a long unbroken name (an adapter id, a model path) instead of being cut with an ellipsis, and when the line is too narrow for both, the actions drop below it. Small text actions in a row use `btn.link` or `btn.danger`, which are at least 36 px by 36 px on a phone and plain text from the md breakpoint up. Test a new list with a long name at 360 px (`e2e/tests/mobile.spec.ts` does it for /training).
 
 ## Copy
 

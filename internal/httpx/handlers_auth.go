@@ -2,9 +2,11 @@ package httpx
 
 import (
 	"unicode/utf8"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -14,6 +16,7 @@ import (
 )
 
 func (s *Server) authRoutes(r chi.Router) {
+	su := s.stepUp()
 	r.Get("/config", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 200, map[string]any{"passkeys": s.Auth.PasskeysEnabled(), "magic_links": true})
 	})
@@ -24,10 +27,15 @@ func (s *Server) authRoutes(r chi.Router) {
 	r.Post("/passkey/login/finish", s.handlePasskeyLoginFinish)
 	r.Group(func(pr chi.Router) {
 		pr.Use(requireAuth)
-		pr.Post("/passkey/register/begin", s.handlePasskeyRegisterBegin)
-		pr.Post("/passkey/register/finish", s.handlePasskeyRegisterFinish)
+		// Adding or removing a passkey is gated like the other sensitive actions: a stolen
+		// cookie used from away must not be able to register a passkey of its own.
+		pr.With(su.require(ActPasskey)).Post("/passkey/register/begin", s.handlePasskeyRegisterBegin)
+		pr.With(su.require(ActPasskey)).Post("/passkey/register/finish", s.handlePasskeyRegisterFinish)
 		pr.Get("/passkeys", s.handleListPasskeys)
-		pr.Delete("/passkeys/{id}", s.handleDeletePasskey)
+		pr.With(su.require(ActPasskey)).Delete("/passkeys/{id}", s.handleDeletePasskey)
+		// Step-up (M5): a passkey assertion on this session unlocks the gated actions for the window.
+		pr.Post("/stepup/begin", s.handleStepUpBegin)
+		pr.Post("/stepup/finish", s.handleStepUpFinish)
 		pr.Post("/logout", s.handleLogout)
 	})
 }
@@ -60,7 +68,7 @@ func (s *Server) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid or expired invite")
 		return
 	}
-	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID); err != nil {
+	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID, false); err != nil {
 		s.Log.Error("create session", "err", err)
 		writeErr(w, 500, "session")
 		return
@@ -84,7 +92,7 @@ func (s *Server) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?error=magic", http.StatusSeeOther)
 		return
 	}
-	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID); err != nil {
+	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID, false); err != nil {
 		http.Redirect(w, r, "/login?error=session", http.StatusSeeOther)
 		return
 	}
@@ -117,7 +125,7 @@ func (s *Server) handlePasskeyLoginFinish(w http.ResponseWriter, r *http.Request
 		writeErr(w, 401, "passkey login failed")
 		return
 	}
-	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID); err != nil {
+	if err := s.Auth.CreateSession(r.Context(), w, r, u.ID, true); err != nil {
 		writeErr(w, 500, "session")
 		return
 	}
@@ -200,7 +208,21 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	if u, err := s.DB.GetUserByID(r.Context(), p.UserID); err == nil {
 		consent = u.TrainingConsent
 	}
-	writeJSON(w, 200, map[string]any{"id": p.UserID, "email": p.Email, "display_name": p.DisplayName, "role": p.Role, "via_api_key": p.APIKeyID.Valid, "training_consent": consent})
+	loc := LocalityOf(r.Context())
+	su := s.stepUp()
+	// Step-up state, for the sidebar mark and Settings: only meaningful once home and away are judged.
+	var until *time.Time
+	hasPasskey := false
+	if loc.Configured && !p.APIKeyID.Valid {
+		if u := su.until(p.SteppedUpAt); !u.IsZero() {
+			until = &u
+		}
+		hasPasskey = su.hasPasskey(r.Context(), p.UserID)
+	}
+	writeJSON(w, 200, map[string]any{
+		"id": p.UserID, "email": p.Email, "display_name": p.DisplayName, "role": p.Role, "via_api_key": p.APIKeyID.Valid, "training_consent": consent,
+		"locality": loc, "step_up_until": until, "step_up_window_seconds": int(su.window.Seconds()), "has_passkey": hasPasskey,
+	})
 }
 
 // handleUpdateMe changes the caller's display name, the one field of a
@@ -229,3 +251,59 @@ func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func isUnauthorized(err error) bool { return errors.Is(err, auth.ErrUnauthorized) }
+
+// stepUpLimit keeps a session from starting ceremonies in a loop.
+var stepUpLimit stepUpBegins
+
+// handleStepUpBegin is POST /api/auth/stepup/begin: the options for a passkey
+// assertion limited to the signed-in user's own passkeys, user verification required.
+func (s *Server) handleStepUpBegin(w http.ResponseWriter, r *http.Request) {
+	p := Principal(r.Context())
+	if p.APIKeyID.Valid || p.SessionID == uuid.Nil {
+		writeErr(w, 403, "step-up is for a signed-in browser session")
+		return
+	}
+	if !stepUpLimit.allow(p.UserID, time.Now()) {
+		writeErr(w, 429, "too many step-up attempts; wait a minute")
+		return
+	}
+	opts, cid, err := s.Auth.BeginStepUp(r.Context(), p.UserID)
+	switch {
+	case errors.Is(err, auth.ErrPasskeysUnavailable):
+		writeErr(w, 503, "Passkeys need a domain name over https.")
+		return
+	case errors.Is(err, auth.ErrNoPasskey):
+		writeStepUpErr(w, codeStepUpUnavailable, "add a passkey to do this away from home", "", s.stepUp().window)
+		return
+	case err != nil:
+		s.Log.Error("step-up begin", "err", err)
+		writeErr(w, 500, "webauthn")
+		return
+	}
+	var options map[string]any
+	_ = json.Unmarshal(opts, &options)
+	writeJSON(w, 200, map[string]any{"options": options, "ceremony_id": cid})
+}
+
+// handleStepUpFinish is POST /api/auth/stepup/finish?ceremony=: validates the
+// assertion and marks the session, so the gated actions pass until
+// stepped_up_until.
+func (s *Server) handleStepUpFinish(w http.ResponseWriter, r *http.Request) {
+	p := Principal(r.Context())
+	if p.APIKeyID.Valid || p.SessionID == uuid.Nil {
+		writeErr(w, 403, "step-up is for a signed-in browser session")
+		return
+	}
+	cid, err := uuid.Parse(r.URL.Query().Get("ceremony"))
+	if err != nil {
+		writeErr(w, 400, "ceremony required")
+		return
+	}
+	at, err := s.Auth.FinishStepUp(r.Context(), cid, p.SessionID, p.UserID, r)
+	if err != nil {
+		s.Log.Warn("step-up failed", "err", err)
+		writeErr(w, 401, "passkey confirmation failed")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"stepped_up_until": at.Add(s.stepUp().window)})
+}

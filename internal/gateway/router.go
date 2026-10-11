@@ -75,6 +75,12 @@ type Rule struct {
 	// below it. Endpoints without enough measurements are kept, and the
 	// filter never empties the list.
 	MinTokensPerSec float64 `yaml:"min_tokens_per_sec,omitempty" json:"min_tokens_per_sec"`
+	// MinTier is the quality floor of the fallback: when none of the
+	// endpoints the rule prefers is usable, the router falls back to any
+	// enabled endpoint, but never to one whose tier ranks below this.
+	// "" (the default) sets no floor. Endpoints the rule names are not
+	// filtered: naming one is a decision.
+	MinTier string `yaml:"min_tier,omitempty" json:"min_tier"`
 }
 
 // Match conditions. Empty slices match everything.
@@ -84,6 +90,10 @@ type Match struct {
 	Agents    []string    `yaml:"agents,omitempty" json:"agents"`
 	Selector  []string    `yaml:"selector,omitempty" json:"selector"` // match the request's Model selector
 	External  *bool       `yaml:"external,omitempty" json:"external"`
+	// Verdict matches the class an LLM verdict gave the turn (simple-chat,
+	// hard-chat, code, summarize, vision, long-context). A rule with it
+	// never matches a turn that has no verdict.
+	Verdict []string `yaml:"verdict,omitempty" json:"verdict"`
 }
 
 func (m Match) matches(in RouteInput) bool {
@@ -100,6 +110,9 @@ func (m Match) matches(in RouteInput) bool {
 		return false
 	}
 	if m.External != nil && *m.External != in.External {
+		return false
+	}
+	if len(m.Verdict) > 0 && !contains(m.Verdict, in.VerdictClass) {
 		return false
 	}
 	return true
@@ -120,6 +133,16 @@ type RouteInput struct {
 	// Downgrade is set by the budget middleware when a budget is exceeded
 	// with on_exceed=downgrade: only Local endpoints may be used.
 	Downgrade bool
+	// VerdictClass is the class of the LLM verdict for this turn, "" when
+	// there is none; Match.Verdict matches on it.
+	VerdictClass string
+	// MinTier is the quality floor the verdict set for this turn. It
+	// replaces the matched rule's min_tier (a cheap turn may go below it)
+	// and applies to every candidate, not only the fallback.
+	MinTier string
+	// ForceLocal restricts candidates to Local endpoints for this turn (a
+	// verdict flagged it sensitive). Like Downgrade, it is never undone.
+	ForceLocal bool
 }
 
 // Candidate is one endpoint the router chose, in order.
@@ -144,6 +167,11 @@ type Decision struct {
 	Chosen     string   `json:"chosen,omitempty"`
 	Tried      []string `json:"tried,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
+	// Verdict is the class the LLM verdict gave the turn, and VerdictSource
+	// says where it came from (llm, cache) or why there is none
+	// (skipped:*, fallthrough:*). Empty when verdict routing is off.
+	Verdict       string `json:"verdict,omitempty"`
+	VerdictSource string `json:"verdict_source,omitempty"`
 }
 
 // Router evaluates policies against the registry.
@@ -219,7 +247,7 @@ func (r *Router) Route(in RouteInput) ([]Candidate, Decision, error) {
 		// then cheapest, rather than failing the request.
 		var ids []string
 		for _, ep := range r.reg.Endpoints() {
-			if contains(rule.Deny, ep.ID) {
+			if contains(rule.Deny, ep.ID) || !fallbackOK(ep, rule, in) {
 				continue
 			}
 			if c, _ := r.candidate(ep, in, rule); c != nil {
@@ -257,7 +285,7 @@ func (r *Router) Route(in RouteInput) ([]Candidate, Decision, error) {
 			// that a key is missing for a provider that is not set up.
 			return nil, dec, fmt.Errorf("router: no endpoint satisfies selector %q task %q (caps %+v, downgrade=%v): %w", in.Selector, in.TaskClass, in.Required, in.Downgrade, nm)
 		}
-		return nil, dec, fmt.Errorf("router: no endpoint satisfies selector %q task %q (caps %+v, downgrade=%v)%s%s%s", in.Selector, in.TaskClass, in.Required, in.Downgrade, r.sizeBlame(in, rule), r.visionBlame(in, rule), r.keyBlame(in, rule))
+		return nil, dec, fmt.Errorf("router: no endpoint satisfies selector %q task %q (caps %+v, downgrade=%v)%s%s%s%s", in.Selector, in.TaskClass, in.Required, in.Downgrade, r.sizeBlame(in, rule), r.visionBlame(in, rule), r.tierBlame(in, rule), r.keyBlame(in, rule))
 	}
 	return out, dec, nil
 }
@@ -271,8 +299,12 @@ func (r *Router) prefs(in RouteInput, dec *Decision) ([]string, Rule) {
 	//    (or alias) wins.
 	prefs, rule := PreferredBy(r.Policies(), in, dec)
 	if prefs == nil {
-		// 3. No policy matched: every enabled endpoint, local first, then cheapest.
+		// 3. No policy matched: every enabled, routable endpoint, local first,
+		//    then cheapest.
 		for _, ep := range r.reg.Endpoints() {
+			if ep.NotRoutable {
+				continue
+			}
 			prefs = append(prefs, ep.ID)
 		}
 		dec.Reason = "fallback-all"
@@ -348,7 +380,9 @@ func (r *Router) ContextCeiling(in RouteInput) int {
 	}
 	if max == 0 && dec.Reason != "fallback-all" {
 		for _, ep := range r.reg.Endpoints() {
-			consider(ep.ID)
+			if fallbackOK(ep, rule, in) {
+				consider(ep.ID)
+			}
 		}
 	}
 	return max
@@ -560,8 +594,11 @@ func (r *Router) candidate(ep *Endpoint, in RouteInput, rule Rule) (*Candidate, 
 	if ep.Health.Status == "down" {
 		return nil, "down"
 	}
-	if (in.Downgrade || rule.LocalOnly) && !ep.Local {
+	if (in.Downgrade || in.ForceLocal || rule.LocalOnly) && !ep.Local {
 		return nil, "budget downgrade: local only"
+	}
+	if in.MinTier != "" && TierRank(ep.EffectiveTier()) < TierRank(in.MinTier) {
+		return nil, "below the tier this turn needs"
 	}
 	req := in.Required
 	req.merge(rule.Require)
@@ -742,4 +779,39 @@ func containsTC(list []TaskClass, s TaskClass) bool {
 		}
 	}
 	return false
+}
+
+// fallbackOK reports whether ep may be reached by the policy fallback: it is
+// routable and its tier is not below the rule's floor.
+func fallbackOK(ep *Endpoint, rule Rule, in RouteInput) bool {
+	if ep.NotRoutable {
+		return false
+	}
+	floor := rule.MinTier
+	if in.MinTier != "" {
+		floor = in.MinTier // the verdict's floor replaces the rule's
+	}
+	return floor == "" || TierRank(ep.EffectiveTier()) >= TierRank(floor)
+}
+
+// tierBlame is ": no model of the <tier> tier or better is available" when
+// the rule's floor is what left no route: some routable endpoint below the
+// floor would have served the request. Said before the missing-key blame,
+// since a request that would otherwise have been answered by a toy model
+// is better told why it was not.
+func (r *Router) tierBlame(in RouteInput, rule Rule) string {
+	if rule.MinTier == "" {
+		return ""
+	}
+	relaxed := rule
+	relaxed.MinTier = ""
+	for _, ep := range r.reg.Endpoints() {
+		if contains(rule.Deny, ep.ID) || ep.NotRoutable || TierRank(ep.EffectiveTier()) >= TierRank(rule.MinTier) {
+			continue
+		}
+		if c, _ := r.candidate(ep, in, relaxed); c != nil {
+			return fmt.Sprintf(": no model of the %s tier or better is available (only smaller ones, such as %s); add a provider key or enable a larger model", rule.MinTier, ep.ID)
+		}
+	}
+	return ""
 }

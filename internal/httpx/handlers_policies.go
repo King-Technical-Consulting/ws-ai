@@ -3,6 +3,7 @@ package httpx
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -153,11 +154,13 @@ func (s *Server) handlePutBudget(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "limit_usd must be positive")
 		return
 	}
+	// A user or agent budget with no scope_id is the default for every
+	// member or agent without a row of its own (0020).
 	var scopeID uuid.NullUUID
-	if in.Scope != "global" {
+	if in.Scope == "api_key" || (in.ScopeID != "" && in.Scope != "global") {
 		id, err := uuid.Parse(in.ScopeID)
 		if err != nil {
-			writeErr(w, 400, "scope_id must be a uuid for non-global budgets")
+			writeErr(w, 400, "scope_id must be a uuid (or empty for a default user or agent budget)")
 			return
 		}
 		scopeID = uuid.NullUUID{UUID: id, Valid: true}
@@ -178,4 +181,109 @@ func (s *Server) handleDeleteBudget(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.DB.DeleteBudget(r.Context(), id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAdminSpend is the owner's overview: this period's spend by member
+// and by agent against the budget each is under (its own row, else the
+// default for its scope), sorted by spend. Spend on a member's own key is
+// not counted, as the budgets do not count it.
+func (s *Server) handleAdminSpend(w http.ResponseWriter, r *http.Request) {
+	period := r.URL.Query().Get("period")
+	switch period {
+	case "day", "week", "month":
+	case "":
+		period = "month"
+	default:
+		writeErr(w, 400, "period must be day, week or month")
+		return
+	}
+	ctx := r.Context()
+	since := gateway.PeriodStart(period, time.Now())
+	budgets, err := s.DB.ListAllBudgets(ctx)
+	if err != nil {
+		writeErr(w, 500, "db")
+		return
+	}
+	limitFor := func(scope string, id uuid.UUID) *store.Budget {
+		var def *store.Budget
+		for i := range budgets {
+			b := budgets[i]
+			if b.Scope != scope || b.Period != period {
+				continue
+			}
+			if b.ScopeID.Valid && b.ScopeID.UUID == id {
+				return &b
+			}
+			if !b.ScopeID.Valid {
+				def = &b
+			}
+		}
+		return def
+	}
+	type row struct {
+		ID       uuid.UUID `json:"id"`
+		Name     string    `json:"name"`
+		Calls    int64     `json:"calls"`
+		USD      float64   `json:"usd"`
+		LimitUSD float64   `json:"limit_usd"`
+		OnExceed string    `json:"on_exceed,omitempty"`
+		Default  bool      `json:"default"`
+		Pct      int       `json:"pct"`
+	}
+	fill := func(scope string, id uuid.UUID, name string, calls int64, usd float64) row {
+		rw := row{ID: id, Name: name, Calls: calls, USD: usd}
+		if b := limitFor(scope, id); b != nil {
+			rw.LimitUSD, rw.OnExceed, rw.Default = b.LimitUsd, b.OnExceed, !b.ScopeID.Valid
+			if b.LimitUsd > 0 {
+				rw.Pct = int(usd / b.LimitUsd * 100)
+			}
+		}
+		return rw
+	}
+	users := []row{}
+	byUser, _ := s.DB.BudgetUsageByUserSince(ctx, since)
+	seenUser := map[uuid.UUID]bool{}
+	for _, u := range byUser {
+		if !u.UserID.Valid {
+			continue
+		}
+		name := u.UserID.UUID.String()
+		if usr, err := s.DB.GetUserByID(ctx, u.UserID.UUID); err == nil {
+			name = usr.Email
+		}
+		seenUser[u.UserID.UUID] = true
+		users = append(users, fill("user", u.UserID.UUID, name, u.Calls, u.CostUsd))
+	}
+	// Members with no spend still show their budget, so the owner sees
+	// everyone the default covers.
+	if all, err := s.DB.ListUsers(ctx); err == nil {
+		for _, usr := range all {
+			if !seenUser[usr.ID] && usr.DisabledAt == nil {
+				users = append(users, fill("user", usr.ID, usr.Email, 0, 0))
+			}
+		}
+	}
+	agentsOut := []row{}
+	byAgent, _ := s.DB.UsageByAgentSince(ctx, since)
+	seenAgent := map[uuid.UUID]bool{}
+	for _, a := range byAgent {
+		if !a.AgentID.Valid {
+			continue
+		}
+		name := a.AgentID.UUID.String()
+		if ag, err := s.DB.GetAgent(ctx, a.AgentID.UUID); err == nil {
+			name = ag.Name
+		}
+		seenAgent[a.AgentID.UUID] = true
+		agentsOut = append(agentsOut, fill("agent", a.AgentID.UUID, name, a.Calls, a.CostUsd))
+	}
+	if all, err := s.DB.ListAllAgents(ctx); err == nil {
+		for _, ag := range all {
+			if !seenAgent[ag.ID] {
+				agentsOut = append(agentsOut, fill("agent", ag.ID, ag.Name, 0, 0))
+			}
+		}
+	}
+	total, _ := s.DB.SumUsageSince(ctx, since)
+	writeJSON(w, 200, map[string]any{"period": period, "since": since, "total_usd": total, "users": users, "agents": agentsOut})
 }

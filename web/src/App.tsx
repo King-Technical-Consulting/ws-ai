@@ -6,6 +6,10 @@ import Invite from './pages/Invite'
 import Shell from './pages/Shell'
 import Chat from './pages/Chat'
 import Settings from './pages/Settings'
+import Memory from './pages/Memory'
+import Scheduled from './pages/Scheduled'
+import Notebooks from './pages/Notebooks'
+import Favorites from './pages/Favorites'
 import Admin from './pages/Admin'
 import Jobs from './pages/Jobs'
 import Training from './pages/Training'
@@ -63,6 +67,11 @@ export default function App() {
         <Route index element={<Centered>Pick a conversation or start a new one.</Centered>} />
         <Route path="c/:id" element={<Chat />} />
         <Route path="settings" element={<Settings />} />
+        <Route path="memory" element={<Memory />} />
+        <Route path="scheduled" element={<Scheduled />} />
+        <Route path="favorites" element={<Favorites />} />
+        <Route path="notebooks" element={<Notebooks />} />
+        <Route path="notebooks/:id" element={<Notebooks />} />
         <Route path="admin" element={<RequireOwner><Admin /></RequireOwner>} />
         <Route path="jobs" element={<RequireOwner><Jobs /></RequireOwner>} />
         <Route path="training" element={<RequireOwner><Training /></RequireOwner>} />

@@ -1,7 +1,9 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
+import { EndpointFilterBar, HealthDot, endpointMatches, filtersActive, groupEndpoints, healthSummary, useModelFilters, useSlashFocus, type ModelFilters } from './adminModels'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
-import { SectionHead, PageTitle, ListGroup, Row, Callout, btn, inputSm } from '../components/ui'
+import { SectionHead, PageTitle, ListGroup, Row, Callout, RowMenu, SectionNav, useSectionHash, btn, inputSm, useConfirm } from '../components/ui'
 
 type Invite = { id: string; email: string; role: string; created_at: string; expires_at: string; used_at: string | null }
 type Usage = {
@@ -9,6 +11,8 @@ type Usage = {
   total_usd: number
   by_endpoint: { endpoint_id: string | null; calls: number; input_tokens: number; output_tokens: number; cost_usd: number; avg_latency_ms: number | null }[]
   by_user: { user_id: string | null; calls: number; cost_usd: number }[]
+  /** The newest ledger rows; `decision` carries the verdict and where it came from. */
+  recent?: { id: number; created_at: string; task_class: string | null; endpoint_id: string | null; decision: { selector?: string; verdict?: string; verdict_source?: string; chosen?: string } | null }[]
 }
 type MediaCaps = { engine: string; image?: boolean; image_edit?: boolean; video?: boolean; image_to_video?: boolean; upscale?: boolean; sizes?: string[]; max_images?: number; max_seconds?: number; seconds?: number[] }
 type Caps = { context_window: number; max_output: number; tools: boolean; vision: boolean; reasoning: boolean; prompt_cache: boolean; json_mode?: boolean; embeddings?: boolean; max_concurrency?: number; media?: MediaCaps }
@@ -18,6 +22,10 @@ type EndpointRow = {
   capabilities: Caps
   pricing: Pricing
   throughput_class: string; latency_class: string
+  /** small, medium or large; empty means read off the model name. */
+  tier?: string
+  /** True: only reached when picked by name or named by a policy rule. */
+  not_routable?: boolean
   health: { status: string; p50_latency_ms: number; error: string }
   extra_body?: { provider?: { order?: string[]; only?: string[] } } & Record<string, unknown>
 }
@@ -55,8 +63,16 @@ type Policy = { name: string; yaml: string; priority: number; enabled: boolean; 
 type Budget = { id: string; scope: string; scope_id: string | null; period: string; limit_usd: number; on_exceed: string }
 type User = { id: string; email: string; display_name: string; role: string; shared_provider_keys?: boolean; disabled_at?: string | null }
 
+const GROUPS = [
+  { id: 'people', label: 'People' },
+  { id: 'models', label: 'Models' },
+  { id: 'machines', label: 'Machines' },
+  { id: 'system', label: 'System' },
+] as const
+
 export default function Admin() {
   const qc = useQueryClient()
+  const [group, setGroup] = useSectionHash(GROUPS.map((g) => g.id))
   const [email, setEmail] = useState('')
   const [link, setLink] = useState<string | null>(null)
   const [inviteErr, setInviteErr] = useState<string | null>(null)
@@ -102,24 +118,18 @@ export default function Admin() {
     },
     onError: (e) => setInviteErr((e as Error).message.replace(/^auth: /, '')),
   })
-  const toggle = useMutation({
-    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.post(`/api/admin/endpoints/${id}/enabled`, { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-endpoints'] }),
-  })
-  const removeEndpoint = useMutation({
-    mutationFn: (id: string) => api.del(`/api/admin/endpoints/${id}`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['admin-endpoints'] })
-      qc.invalidateQueries({ queryKey: ['models'] })
-    },
-  })
-  const [editing, setEditing] = useState<EndpointRow | 'new' | null>(null)
+  const [filters, setFilters, clearFilters] = useModelFilters()
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto max-w-3xl p-6 space-y-10">
+      <div className="mx-auto max-w-5xl p-6 space-y-6">
         <PageTitle>Admin</PageTitle>
+        <div className="flex flex-col gap-6 md:flex-row md:gap-10">
+        <SectionNav label="Admin sections" items={GROUPS} value={group} onChange={setGroup} />
+        <div className="min-w-0 flex-1 space-y-10">
 
+        {group === 'people' && (
+          <>
         <section className="space-y-3">
           <SectionHead>invites</SectionHead>
           <div className="flex gap-2">
@@ -167,61 +177,28 @@ export default function Admin() {
           </ListGroup>
         </section>
 
-        <Providers rows={eps.data?.all_providers ?? []} />
+          </>
+        )}
 
-        <section className="space-y-3">
-          <SectionHead aside={`${eps.data?.endpoints.length ?? 0} configured`}>endpoints</SectionHead>
-          {editing && (
-            <EndpointForm
-              initial={editing === 'new' ? undefined : editing}
-              providers={eps.data?.all_providers ?? []}
-              engines={eps.data?.engines ?? []}
-              onClose={() => setEditing(null)}
-            />
-          )}
-          <ListGroup empty="No endpoints configured.">
-            {eps.data?.endpoints.map((e) => (
-              <li key={e.id} className="flex items-center justify-between px-3 py-2 gap-3">
-                <div className="min-w-0">
-                  <div className="truncate">{e.display_name} <span className="font-mono text-xs text-fg-3">{e.id}</span></div>
-                  <div className="meta">
-                    {e.health.status}
-                    {e.health.p50_latency_ms ? ` · ${e.health.p50_latency_ms} ms` : ''}
-                    {eps.data?.throughput?.[e.id]?.samples ? ` · ${Math.round(eps.data.throughput[e.id].tokens_per_sec)} tok/s · ${Math.round(eps.data.throughput[e.id].ttft_ms)} ms to first token` : ''}
-                    {eps.data?.throughput?.[e.id]?.in_flight ? ` · ${eps.data.throughput[e.id].in_flight}${e.capabilities?.max_concurrency ? ` of ${e.capabilities.max_concurrency}` : ''} busy` : ''}
-                    {eps.data?.throughput?.[e.id]?.queued ? ` · ${eps.data.throughput[e.id].queued} waiting` : ''}
-                    {e.capabilities?.context_window ? ` · ${Math.round(e.capabilities.context_window / 1000)}k ctx` : ''}
-                    {e.local ? ' · local' : e.capabilities?.media ? mediaPrice(e.pricing) : e.pricing ? ` · $${e.pricing.input_per_m}/$${e.pricing.output_per_m} per M` : ''}
-                    {e.capabilities?.tools ? ' · tools' : ''}{e.capabilities?.vision ? ' · vision' : ''}
-                    {e.capabilities?.media ? ` · ${e.capabilities.media.video ? 'video' : 'image'} model (${e.capabilities.media.engine})` : ''}
-                    {routeOf(e) ? ` · via ${routeOf(e)}` : ''}
-                    {e.health.error ? ` · ${e.health.error}` : ''}
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  <label className="flex items-center gap-2 text-xs text-fg-2">
-                    <input type="checkbox" className="accent-accent" checked={e.enabled} onChange={(ev) => toggle.mutate({ id: e.id, enabled: ev.target.checked })} /> enabled
-                  </label>
-                  <button onClick={() => setEditing(e)} className="text-xs text-fg-2 hover:text-fg">Edit</button>
-                  <button onClick={() => removeEndpoint.mutate(e.id)} className={btn.danger}>Remove</button>
-                </div>
-              </li>
-            ))}
-          </ListGroup>
-          <div className="flex flex-wrap gap-2">
-            {!editing && (
-              <button onClick={() => setEditing('new')} className={btn.secondarySm}>
-                Add a model
-              </button>
-            )}
-            <AddFromCatalog providers={eps.data?.providers ?? []} />
-          </div>
-        </section>
+        {group === 'models' && (
+          <>
+        <Providers rows={eps.data?.all_providers ?? []} endpoints={eps.data?.endpoints ?? []} filters={filters} setFilters={setFilters} />
 
-        <Rentals />
-        <GitHub />
+        <EndpointsSection data={eps.data} filters={filters} setFilters={setFilters} clearFilters={clearFilters} />
+
         <Policies />
+        <VerdictRouting />
+        <SpendOverview />
         <Budgets />
+          </>
+        )}
+
+        {group === 'machines' && <Rentals />}
+
+        {group === 'system' && (
+          <>
+        <Failures />
+        <GitHub />
 
         <section className="space-y-3">
           <SectionHead aside={`$${Number(usage.data?.total_usd ?? 0).toFixed(4)} total`}>usage, last 30 days</SectionHead>
@@ -245,8 +222,123 @@ export default function Admin() {
             </tbody>
           </table>
         </section>
+          </>
+        )}
+        </div>
+        </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * The endpoints, found by searching and filtering and laid out by provider: each provider is a
+ * collapsible group with its count and health, rows are enabled first and then by name. Edit opens
+ * its form under the row.
+ */
+function EndpointsSection({ data, filters, setFilters, clearFilters }: { data?: Endpoints; filters: ModelFilters; setFilters: (p: Partial<ModelFilters>) => void; clearFilters: () => void }) {
+  const qc = useQueryClient()
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.post(`/api/admin/endpoints/${id}/enabled`, { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-endpoints'] }),
+  })
+  const removeEndpoint = useMutation({
+    mutationFn: (id: string) => api.del(`/api/admin/endpoints/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['admin-endpoints'] })
+      qc.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+  const [editing, setEditing] = useState<EndpointRow | 'new' | null>(null)
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const search = useRef<HTMLInputElement>(null)
+  useSlashFocus(search)
+  const all = data?.endpoints ?? []
+  const groups = groupEndpoints(all, filters)
+  const shown = all.filter((e) => endpointMatches(e, filters)).length
+  const providerName = (id: string) => data?.all_providers?.find((p) => p.id === id)?.name ?? id
+  return (
+    <section id="endpoints" className="space-y-3">
+      <SectionHead aside={`${all.length} configured`}>endpoints</SectionHead>
+      <EndpointFilterBar f={filters} set={setFilters} clear={clearFilters} shown={shown} total={all.length} inputRef={search} />
+      {all.length === 0 && <ListGroup empty="No endpoints configured." >{[]}</ListGroup>}
+      {all.length > 0 && groups.length === 0 && <p className="meta">Nothing matches. <button type="button" onClick={clearFilters} className="underline decoration-dotted text-fg-2 hover:text-fg">Clear the search and filters</button>.</p>}
+      {groups.map((g) => {
+        const open = !collapsed.has(g.provider)
+        const summary = healthSummary(g.health)
+        return (
+          <div key={g.provider} className="space-y-1">
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-label={`${open ? 'Collapse' : 'Expand'} ${g.provider}`}
+              onClick={() => setCollapsed((c) => { const n = new Set(c); if (n.has(g.provider)) n.delete(g.provider); else n.add(g.provider); return n })}
+              className="w-full min-h-9 md:min-h-0 flex items-baseline gap-2 text-left text-sm"
+            >
+              <span aria-hidden="true" className="text-fg-3 w-3">{open ? '▾' : '▸'}</span>
+              <span className="section-head border-0 !p-0">{providerName(g.provider)}</span>
+              <span className="font-mono text-xs text-fg-3">{g.provider}</span>
+              <span className="meta ml-auto">
+                {filtersActive(filters) ? `${g.rows.length} of ${g.total}` : g.total}
+                {summary ? ` · ${summary}` : ''}
+              </span>
+            </button>
+            {open && (
+              <ListGroup empty="No endpoints match here.">
+                {g.rows.map((e) => (
+                  <Fragment key={e.id}>
+              <li className="flex items-center justify-between px-3 py-2 gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate flex items-center gap-2"><HealthDot status={e.health.status} /><span className="truncate">{e.display_name} <span className="font-mono text-xs text-fg-3">{e.id}</span></span></div>
+                    <div className="meta">
+                      {e.health.status}
+                      {e.health.p50_latency_ms ? ` · ${e.health.p50_latency_ms} ms` : ''}
+                      {data?.throughput?.[e.id]?.samples ? ` · ${Math.round(data.throughput[e.id].tokens_per_sec)} tok/s · ${Math.round(data.throughput[e.id].ttft_ms)} ms to first token` : ''}
+                      {data?.throughput?.[e.id]?.in_flight ? ` · ${data.throughput[e.id].in_flight}${e.capabilities?.max_concurrency ? ` of ${e.capabilities.max_concurrency}` : ''} busy` : ''}
+                      {data?.throughput?.[e.id]?.queued ? ` · ${data.throughput[e.id].queued} waiting` : ''}
+                      {e.capabilities?.context_window ? ` · ${Math.round(e.capabilities.context_window / 1000)}k ctx` : ''}
+                      {e.tier ? ` · ${e.tier} tier` : ''}{e.not_routable ? ' · by name only' : ''}
+                      {e.local ? ' · local' : e.capabilities?.media ? mediaPrice(e.pricing) : e.pricing ? ` · $${e.pricing.input_per_m}/$${e.pricing.output_per_m} per M` : ''}
+                      {e.capabilities?.tools ? ' · tools' : ''}{e.capabilities?.vision ? ' · vision' : ''}
+                      {e.capabilities?.media ? ` · ${e.capabilities.media.video ? 'video' : 'image'} model (${e.capabilities.media.engine})` : ''}
+                      {routeOf(e) ? ` · via ${routeOf(e)}` : ''}
+                      {e.health.error ? ` · ${e.health.error}` : ''}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    <label className="flex items-center gap-2 text-xs text-fg-2">
+                      <input type="checkbox" className="accent-accent" checked={e.enabled} onChange={(ev) => toggle.mutate({ id: e.id, enabled: ev.target.checked })} /> enabled
+                    </label>
+                    <button onClick={() => setEditing(e)} className={btn.link} aria-label={`Edit ${e.id}`}>Edit</button>
+                    <button onClick={() => removeEndpoint.mutate(e.id)} className={btn.danger}>Remove</button>
+                  </div>
+                </li>
+                  {editing && editing !== 'new' && editing.id === e.id && (
+                    <Reveal as="li" onClose={() => setEditing(null)}>
+                      <EndpointForm initial={editing} providers={data?.all_providers ?? []} engines={data?.engines ?? []} onClose={() => setEditing(null)} />
+                    </Reveal>
+                  )}
+                  </Fragment>
+                ))}
+              </ListGroup>
+            )}
+          </div>
+        )
+      })}
+      {editing === 'new' && (
+        <Reveal as="div" onClose={() => setEditing(null)}>
+          <EndpointForm providers={data?.all_providers ?? []} engines={data?.engines ?? []} onClose={() => setEditing(null)} />
+        </Reveal>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {!editing && (
+          <button onClick={() => setEditing('new')} className={btn.secondarySm}>
+            Add a model
+          </button>
+        )}
+        <AddFromCatalog providers={data?.providers ?? []} />
+      </div>
+    </section>
   )
 }
 
@@ -298,16 +390,18 @@ function PersonRow({ user: u, onGrant, onDisable }: { user: User; onGrant: (shar
           <button onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label={`${u.email} API keys`} className={btn.secondarySm}>
             {open ? 'Hide keys' : 'Keys'}
           </button>
-          <button onClick={() => signOut.mutate()} disabled={signOut.isPending} aria-label={`Sign ${u.email} out everywhere`} className={btn.secondarySm}>
-            Sign out everywhere
-          </button>
-          <button
-            onClick={() => onDisable(!u.disabled_at)}
-            aria-label={`${u.disabled_at ? 'Enable' : 'Disable'} ${u.email}`}
-            className={u.disabled_at ? btn.secondarySm : btn.danger}
-          >
-            {u.disabled_at ? 'Enable' : 'Disable'}
-          </button>
+          <RowMenu label={`${u.email} more actions`}>
+            <button onClick={() => signOut.mutate()} disabled={signOut.isPending} aria-label={`Sign ${u.email} out everywhere`} className="text-sm hover:bg-bg-2 rounded-md">
+              Sign out everywhere
+            </button>
+            <button
+              onClick={() => onDisable(!u.disabled_at)}
+              aria-label={`${u.disabled_at ? 'Enable' : 'Disable'} ${u.email}`}
+              className={`text-sm hover:bg-bg-2 rounded-md ${u.disabled_at ? '' : 'text-danger'}`}
+            >
+              {u.disabled_at ? 'Enable' : 'Disable'}
+            </button>
+          </RowMenu>
         </div>
       </div>
       {open && (
@@ -330,9 +424,16 @@ function PersonRow({ user: u, onGrant, onDisable }: { user: User; onGrant: (shar
  * variable so one config serves every box) and the name of the variable
  * holding the key. The key itself stays in .env or Infisical.
  */
-function Providers({ rows }: { rows: ProviderRow[] }) {
+function Providers({ rows, endpoints, filters, setFilters }: { rows: ProviderRow[]; endpoints: EndpointRow[]; filters: ModelFilters; setFilters: (p: Partial<ModelFilters>) => void }) {
+  const confirmDialog = useConfirm()
   const qc = useQueryClient()
   const [editing, setEditing] = useState<ProviderRow | 'new' | null>(null)
+  const count: Record<string, number> = {}
+  for (const e of endpoints) count[e.provider_id] = (count[e.provider_id] ?? 0) + 1
+  const words = filters.pq.toLowerCase().split(/\s+/).filter(Boolean)
+  const visible = rows
+    .filter((p) => words.every((w) => [p.id, p.name, p.kind].join(' ').toLowerCase().includes(w)))
+    .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
   const remove = useMutation({
     mutationFn: (id: string) => api.del(`/api/admin/providers/${id}`),
     onSuccess: () => {
@@ -341,11 +442,25 @@ function Providers({ rows }: { rows: ProviderRow[] }) {
     },
   })
   return (
-    <section className="space-y-3">
+    <section id="providers" className="space-y-3">
       <SectionHead aside={`${rows.filter((p) => p.configured).length} of ${rows.length} configured`}>providers</SectionHead>
-      <ListGroup empty="No providers. Add one, or seed config/endpoints.yaml.">
-        {rows.map((p) => (
-          <li key={p.id} className="flex items-center justify-between px-3 py-2 gap-3">
+      {rows.length > 0 && (
+        <div className="flex items-center gap-2">
+          <input
+            type="search"
+            value={filters.pq}
+            onChange={(e) => setFilters({ pq: e.target.value })}
+            placeholder="Search providers: id, name, kind"
+            aria-label="Search providers"
+            className={`${inputSm} min-h-9 md:min-h-0`}
+          />
+          <span className="meta shrink-0 tnum" aria-live="polite">{visible.length} of {rows.length}</span>
+        </div>
+      )}
+      <ListGroup empty={rows.length ? 'No provider matches.' : 'No providers. Add one, or seed config/endpoints.yaml.'}>
+        {visible.map((p) => (
+          <Fragment key={p.id}>
+          <li className="flex items-center justify-between px-3 py-2 gap-3">
             <div className="min-w-0">
               <div className="truncate">
                 {p.name} <span className="font-mono text-xs text-fg-3">{p.id}</span>
@@ -357,10 +472,21 @@ function Providers({ rows }: { rows: ProviderRow[] }) {
               </div>
             </div>
             <div className="flex items-center gap-3 shrink-0">
-              <button onClick={() => setEditing(p)} className="text-xs text-fg-2 hover:text-fg">Edit</button>
               <button
                 onClick={() => {
-                  if (confirm(`Remove ${p.id} and every endpoint on it?`)) remove.mutate(p.id)
+                  setFilters({ provider: filters.provider === p.id ? '' : p.id })
+                  document.getElementById('endpoints')?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+                }}
+                aria-pressed={filters.provider === p.id}
+                aria-label={`Show the endpoints of ${p.id}`}
+                className={btn.link}
+              >
+                {count[p.id] ?? 0} {(count[p.id] ?? 0) === 1 ? 'endpoint' : 'endpoints'}
+              </button>
+              <button onClick={() => setEditing(p)} className={btn.link} aria-label={`Edit ${p.id}`}>Edit</button>
+              <button
+                onClick={async () => {
+                  if (await confirmDialog({ title: `Remove ${p.id}?`, body: 'Every endpoint on this provider goes with it.', confirm: 'Remove provider', danger: true })) remove.mutate(p.id)
                 }}
                 className={btn.danger}
               >
@@ -368,10 +494,18 @@ function Providers({ rows }: { rows: ProviderRow[] }) {
               </button>
             </div>
           </li>
+          {editing && editing !== 'new' && editing.id === p.id && (
+            <Reveal as="li" onClose={() => setEditing(null)}>
+              <ProviderForm initial={editing} onClose={() => setEditing(null)} />
+            </Reveal>
+          )}
+          </Fragment>
         ))}
       </ListGroup>
-      {editing ? (
-        <ProviderForm initial={editing === 'new' ? undefined : editing} onClose={() => setEditing(null)} />
+      {editing === 'new' ? (
+        <Reveal as="div" onClose={() => setEditing(null)}>
+          <ProviderForm onClose={() => setEditing(null)} />
+        </Reveal>
       ) : (
         <button onClick={() => setEditing('new')} className={btn.secondarySm}>
           Add a provider
@@ -380,6 +514,35 @@ function Providers({ rows }: { rows: ProviderRow[] }) {
       <p className="meta">A provider also in config/endpoints.yaml takes the file's values again at the next boot; change the file for those.</p>
     </section>
   )
+}
+
+/**
+ * Where an Edit or Add form opens: in place, under the row being edited. It scrolls into view (not
+ * animated for people who asked for less motion), focuses its first field, closes on Escape, and
+ * gives focus back to the button that opened it, unless focus has moved on by then.
+ */
+function Reveal({ as, onClose, children }: { as: 'li' | 'div'; onClose: () => void; children: React.ReactNode }) {
+  const ref = useRef<HTMLLIElement & HTMLDivElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null
+    const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollIntoView({ block: 'nearest', behavior: calm ? 'auto' : 'smooth' })
+    el.querySelector<HTMLElement>('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')?.focus({ preventScroll: true })
+    return () => {
+      // The form is closing. Put focus back on the opener when focus is lost (the form was removed
+      // with it) or is still inside the form; leave it alone when the person has moved on, say to
+      // another row's Edit button.
+      const a = document.activeElement
+      if (opener?.isConnected && (!a || a === document.body || el.contains(a))) opener.focus({ preventScroll: true })
+    }
+  }, [])
+  const props = {
+    ref,
+    onKeyDown: (e: React.KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose() } },
+  }
+  return as === 'li' ? <li {...props} className="p-2">{children}</li> : <div {...props}>{children}</div>
 }
 
 function ProviderForm({ initial, onClose }: { initial?: ProviderRow; onClose: () => void }) {
@@ -471,6 +634,8 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
   const [model, setModel] = useState(initial?.model_name ?? '')
   const [display, setDisplay] = useState(initial?.display_name ?? '')
   const [local, setLocal] = useState(initial?.local ?? false)
+  const [tier, setTier] = useState(initial?.tier ?? '')
+  const [notRoutable, setNotRoutable] = useState(initial?.not_routable ?? false)
   const [enabled, setEnabled] = useState(initial?.enabled ?? true)
   const [extra, setExtra] = useState(initial?.extra_body && Object.keys(initial.extra_body).length ? JSON.stringify(initial.extra_body) : '')
   // text
@@ -527,7 +692,7 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
       const pricing: Pricing = kind === 'media' ? { input_per_m: inPerM, output_per_m: outPerM, per_image: perImage, per_second: perSecond } : { input_per_m: inPerM, output_per_m: outPerM }
       return api.put('/api/admin/endpoints', {
         id: initial?.id, provider_id: provider, model_name: model, display_name: display || model,
-        capabilities, pricing, local, enabled, extra_body: extraBody,
+        capabilities, pricing, local, enabled, extra_body: extraBody, tier, not_routable: notRoutable,
         throughput_class: initial?.throughput_class || (kind === 'media' ? 'medium' : 'high'),
         latency_class: initial?.latency_class || (kind === 'media' ? 'slow' : 'normal'),
       })
@@ -610,6 +775,18 @@ function EndpointForm({ initial, providers, engines, onClose }: { initial?: Endp
         </>
       )}
       <div className="flex flex-wrap items-center gap-3">
+        <label className="text-xs text-fg-2 flex items-center gap-1" title="The quality floor of the router's fallback: a rule's min_tier keeps it off models below it. Empty reads the size off the model name.">
+          tier
+          <select value={tier} onChange={(e) => setTier(e.target.value)} className={`${inputSm} w-auto`} aria-label="Quality tier">
+            <option value="">from the name</option>
+            <option value="small">small</option>
+            <option value="medium">medium</option>
+            <option value="large">large</option>
+          </select>
+        </label>
+        {check('Only when picked by name or named by a policy', notRoutable, setNotRoutable)}
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
         {check('local (free, preferred on budget downgrade)', local, setLocal)}
         {check('enabled', enabled, setEnabled)}
         <input value={extra} onChange={(e) => setExtra(e.target.value)} placeholder="extra_body JSON, e.g. {&quot;dimensions&quot;:768}" className={`${inputSm} font-mono flex-1 min-w-48`} />
@@ -651,6 +828,7 @@ const RENTAL_OPEN = new Set(['provisioning', 'warming', 'ready', 'stopping'])
  * worker reconciles every minute; the list polls while a machine is open.
  */
 function Rentals() {
+  const confirmDialog = useConfirm()
   const qc = useQueryClient()
   const q = useQuery({
     queryKey: ['rentals'],
@@ -735,8 +913,8 @@ function Rentals() {
             ))}
           </ListGroup>
           <button
-            onClick={() => {
-              if (confirm('Stop every rented machine now?')) stopAll.mutate()
+            onClick={async () => {
+              if (await confirmDialog({ title: 'Stop every rented machine?', body: 'Open machines stop now and stop billing.', confirm: 'Stop all machines', danger: true })) stopAll.mutate()
             }}
             className={btn.danger}
           >
@@ -859,6 +1037,76 @@ function AddFromCatalog({ providers }: { providers: { id: string; base_url: stri
   )
 }
 
+type RoutingSettings = { mode: 'auto' | 'off'; max_usd_day: number; default_usd_day: number; spent_today_usd: number; deadline_ms: number; reuse_turns: number }
+
+/**
+ * Verdict routing (docs/design/llm-routing.md): whether it is on, the
+ * daily ceiling on what its classifier calls may cost (the owner's setting,
+ * with the environment's value as the default) and today's spend, and the
+ * newest routing decisions with what the verdict said.
+ */
+function VerdictRouting() {
+  const qc = useQueryClient()
+  const q = useQuery({ queryKey: ['admin-routing'], queryFn: () => api.get<RoutingSettings>('/api/admin/routing') })
+  const usage = useQuery({ queryKey: ['usage'], queryFn: () => api.get<Usage>('/api/admin/usage?days=30') })
+  const [cap, setCap] = useState('')
+  const [err, setErr] = useState('')
+  useEffect(() => {
+    if (q.data) setCap(String(q.data.max_usd_day))
+  }, [q.data])
+  const save = useMutation({
+    mutationFn: (v: number | null) => api.put<RoutingSettings>('/api/admin/routing', { max_usd_day: v }),
+    onSuccess: () => {
+      setErr('')
+      qc.invalidateQueries({ queryKey: ['admin-routing'] })
+    },
+    onError: (e) => setErr((e as Error).message),
+  })
+  const rows = (usage.data?.recent ?? []).filter((r) => r.decision?.verdict_source).slice(0, 12)
+  const s = q.data
+  return (
+    <section className="space-y-3">
+      <SectionHead aside={s ? (s.mode === 'auto' ? 'on' : 'off') : undefined}>verdict routing</SectionHead>
+      <p className="text-sm text-fg-2">
+        With <span className="font-mono text-xs">WS_ROUTE_CLASSIFIER=auto</span> a small model reads each chat turn sent to <span className="font-mono text-xs">auto</span> and says how hard it is, so easy turns can go to cheap models. It is off by default; a failure or a slow answer routes the turn as if it were off.
+      </p>
+      {s && (
+        <form
+          className="flex flex-wrap items-end gap-3 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault()
+            const n = Number(cap)
+            if (Number.isFinite(n) && n >= 0) save.mutate(n)
+          }}
+        >
+          <div>
+            <label htmlFor="route-cap" className="meta block">Daily ceiling, US dollars (0 for none)</label>
+            <input id="route-cap" type="text" inputMode="decimal" value={cap} onChange={(e) => setCap(e.target.value)} className={`${inputSm} w-32 tnum`} />
+          </div>
+          <button type="submit" className={btn.secondarySm} disabled={save.isPending}>Save ceiling</button>
+          <button type="button" className={btn.secondarySm} onClick={() => save.mutate(null)} disabled={save.isPending}>Use the default (${s.default_usd_day.toFixed(2)})</button>
+          <span className="meta">Spent today: <span className="tnum">${s.spent_today_usd.toFixed(4)}</span>{s.max_usd_day > 0 ? ` of $${s.max_usd_day.toFixed(2)}` : ''}</span>
+        </form>
+      )}
+      {err && <Callout kind="error">{err}</Callout>}
+      {s?.mode === 'auto' && (
+        <ListGroup empty="No routed turns with a verdict yet.">
+          {rows.map((r) => (
+            <li key={r.id} className="px-3 py-1.5 text-sm" title={r.decision?.verdict_source}>
+              <span className="font-mono text-xs">{r.decision?.selector || 'auto'}</span>
+              {' → '}
+              {r.decision?.verdict ? r.decision.verdict : <span className="meta">no verdict ({r.decision?.verdict_source})</span>}
+              {' → '}
+              <span className="font-mono text-xs">{r.decision?.chosen || r.endpoint_id || '(no route)'}</span>
+              <span className="meta"> · {new Date(r.created_at).toLocaleTimeString()}</span>
+            </li>
+          ))}
+        </ListGroup>
+      )}
+    </section>
+  )
+}
+
 function Policies() {
   const qc = useQueryClient()
   const policies = useQuery({ queryKey: ['policies'], queryFn: () => api.get<Policy[]>('/api/admin/policies') })
@@ -939,26 +1187,39 @@ function Budgets() {
   const users = useQuery({ queryKey: ['admin-users'], queryFn: () => api.get<User[]>('/api/admin/users') })
   const [form, setForm] = useState({ scope: 'global', scope_id: '', period: 'month', limit_usd: 20, on_exceed: 'downgrade' })
   const [err, setErr] = useState<string | null>(null)
+  // The spend overview reads the same rows, so it refreshes with them.
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ['budgets'] })
+    qc.invalidateQueries({ queryKey: ['admin-spend'] })
+  }
   const save = useMutation({
     mutationFn: () => api.put('/api/admin/budgets', form),
-    onSuccess: () => { setErr(null); qc.invalidateQueries({ queryKey: ['budgets'] }) },
+    onSuccess: () => { setErr(null); refresh() },
     onError: (e) => setErr(e.message),
   })
   const remove = useMutation({
     mutationFn: (id: string) => api.del(`/api/admin/budgets/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['budgets'] }),
+    onSuccess: refresh,
   })
+  const agents = useQuery({ queryKey: ['admin-spend-agents'], queryFn: () => api.get<Spend>('/api/admin/spend?period=month') })
   const userName = (id: string | null) => users.data?.find((u) => u.id === id)?.email ?? id ?? ''
+  const agentName = (id: string | null) => agents.data?.agents.find((a) => a.id === id)?.name ?? id ?? ''
+  // What a row covers: one person or agent, or every one without a row of its own.
+  const who = (b: Budget) => {
+    if (b.scope === 'user') return b.scope_id ? userName(b.scope_id) : 'every member'
+    if (b.scope === 'agent') return b.scope_id ? agentName(b.scope_id) : 'every agent'
+    return b.scope_id ?? ''
+  }
 
   return (
     <section className="space-y-3">
       <SectionHead>budgets</SectionHead>
-      <p className="text-sm text-fg-2">Rolling windows. When a budget is spent, requests either downgrade to local models or are blocked. Local endpoints cost nothing.</p>
+      <p className="text-sm text-fg-2">Rolling windows. When a budget is spent, requests either downgrade to local models or are blocked. Local endpoints cost nothing. A member or agent budget with no one chosen is the default for everyone without a budget of their own. People are mailed at 80 percent and at the limit.</p>
       <ListGroup empty="No budgets. Spending is unlimited.">
         {budgets.data?.map((b) => (
           <li key={b.id} className="flex items-center justify-between gap-3 px-3 py-2">
             <span className="min-w-0 truncate">
-              {b.scope}{b.scope_id ? <span className="text-fg-3"> · {userName(b.scope_id)}</span> : ''} <span className="meta">· ${Number(b.limit_usd).toFixed(2)} per {b.period} · {b.on_exceed}</span>
+              {b.scope}{who(b) ? <span className="text-fg-3"> · {who(b)}</span> : ''} <span className="meta">· ${Number(b.limit_usd).toFixed(2)} per {b.period} · {b.on_exceed}</span>
             </span>
             <button onClick={() => remove.mutate(b.id)} className={btn.danger}>Remove</button>
           </li>
@@ -966,12 +1227,18 @@ function Budgets() {
       </ListGroup>
       <div className="flex flex-wrap gap-2 items-center">
         <select value={form.scope} onChange={(e) => setForm({ ...form, scope: e.target.value, scope_id: '' })} className={`${inputSm} max-w-[8rem]`}>
-          <option value="global">global</option><option value="user">user</option><option value="api_key">api key</option>
+          <option value="global">global</option><option value="user">user</option><option value="agent">agent</option><option value="api_key">api key</option>
         </select>
         {form.scope === 'user' && (
-          <select value={form.scope_id} onChange={(e) => setForm({ ...form, scope_id: e.target.value })} className={`${inputSm} max-w-[14rem]`}>
-            <option value="">choose a user</option>
+          <select value={form.scope_id} onChange={(e) => setForm({ ...form, scope_id: e.target.value })} className={`${inputSm} max-w-[14rem]`} aria-label="Which member">
+            <option value="">every member (the default)</option>
             {users.data?.map((u) => <option key={u.id} value={u.id}>{u.email}</option>)}
+          </select>
+        )}
+        {form.scope === 'agent' && (
+          <select value={form.scope_id} onChange={(e) => setForm({ ...form, scope_id: e.target.value })} className={`${inputSm} max-w-[14rem]`} aria-label="Which agent">
+            <option value="">every agent (the default)</option>
+            {agents.data?.agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
           </select>
         )}
         {form.scope === 'api_key' && (
@@ -988,6 +1255,54 @@ function Budgets() {
         <button onClick={() => save.mutate()} className={btn.secondarySm}>Add budget</button>
       </div>
       {err && <Callout kind="error">{err}</Callout>}
+    </section>
+  )
+}
+
+type SpendRow = { id: string; name: string; calls: number; usd: number; limit_usd: number; on_exceed?: string; default: boolean; pct: number }
+type Spend = { period: string; since: string; total_usd: number; users: SpendRow[]; agents: SpendRow[] }
+
+/**
+ * This period's spend by member and by agent against the budget each is
+ * under. Spend on a member's own key is not counted, as budgets do not
+ * count it.
+ */
+function SpendOverview() {
+  const [period, setPeriod] = useState('month')
+  const spend = useQuery({ queryKey: ['admin-spend', period], queryFn: () => api.get<Spend>(`/api/admin/spend?period=${period}`) })
+  const table = (title: string, rows: SpendRow[]) => (
+    <table className="w-full text-sm">
+      <thead className="text-left">
+        <tr className="section-head text-[13px] border-0">
+          <th className="py-1 font-normal">{title}</th><th className="font-normal">calls</th><th className="font-normal">spent</th><th className="font-normal">budget</th><th className="font-normal">used</th>
+        </tr>
+      </thead>
+      <tbody className="tnum">
+        {rows.map((r) => (
+          <tr key={r.id} className="border-t border-line-soft">
+            <td className="py-1.5">{r.name}</td>
+            <td>{r.calls}</td>
+            <td>${r.usd.toFixed(2)}</td>
+            <td>{r.limit_usd > 0 ? <>${r.limit_usd.toFixed(2)}{r.default ? <span className="text-fg-3"> default</span> : ''}{r.on_exceed ? <span className="text-fg-3"> · {r.on_exceed}</span> : ''}</> : <span className="text-fg-3">none</span>}</td>
+            <td>{r.limit_usd > 0 ? `${r.pct}%` : ''}</td>
+          </tr>
+        ))}
+        {rows.length === 0 && <tr><td colSpan={5} className="meta py-3">Nothing yet.</td></tr>}
+      </tbody>
+    </table>
+  )
+  return (
+    <section className="space-y-3">
+      <SectionHead aside={`$${Number(spend.data?.total_usd ?? 0).toFixed(2)} this ${period}`}>spend</SectionHead>
+      <div className="flex items-center gap-2 text-sm text-fg-2">
+        <span>Rolling</span>
+        <select value={period} onChange={(e) => setPeriod(e.target.value)} className={`${inputSm} max-w-[7rem]`} aria-label="Spend period">
+          <option value="day">day</option><option value="week">week</option><option value="month">month</option>
+        </select>
+        <span>against each budget, own-key spend excluded.</span>
+      </div>
+      {table('member', spend.data?.users ?? [])}
+      {table('agent', spend.data?.agents ?? [])}
     </section>
   )
 }
@@ -1088,6 +1403,69 @@ function GitHub() {
             ))}
           </ListGroup>
         </>
+      )}
+    </section>
+  )
+}
+
+type Failure = {
+  id: number
+  kind: string
+  state: 'discarded' | 'retryable'
+  attempt: number
+  max_attempts: number
+  at: string | null
+  error: string
+  ref: { label: string; link: string } | null
+}
+
+/** The last 50 background jobs that failed, of every kind, from the job queue's own table. Clear
+ *  only hides what is listed; the jobs stay where they are. */
+function Failures() {
+  const qc = useQueryClient()
+  const confirmDialog = useConfirm()
+  const failures = useQuery({ queryKey: ['admin-failures'], queryFn: () => api.get<Failure[]>('/api/admin/failures') })
+  const clear = useMutation({
+    mutationFn: () => api.post('/api/admin/failures/clear'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-failures'] }),
+  })
+  const rows = failures.data ?? []
+  return (
+    <section className="space-y-3">
+      <SectionHead aside={failures.data ? `${rows.length} shown` : undefined}>recent failures</SectionHead>
+      <p className="text-sm text-fg-2">
+        Background jobs that failed, newest first: what the worker gave up on, and what is failing and waiting to retry. The error is the last one the job recorded.
+      </p>
+      {failures.error && <Callout kind="error">{(failures.error as Error).message}</Callout>}
+      <ListGroup empty={failures.isLoading ? 'Loading…' : 'No failed jobs.'}>
+        {rows.map((f) => (
+          <li key={f.id} className="px-3 py-2 space-y-1">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+              <span className="font-mono text-xs">{f.kind}</span>
+              <span className="meta">
+                {f.state === 'discarded' ? `gave up after ${f.attempt} of ${f.max_attempts} tries` : `retrying, try ${f.attempt} of ${f.max_attempts}`}
+                {f.at ? ` · ${new Date(f.at).toLocaleString()}` : ''}
+              </span>
+            </div>
+            {f.error && <p className="text-xs text-fg-2 break-words whitespace-pre-wrap">{f.error}</p>}
+            {f.ref && (
+              <p className="text-xs">
+                <Link to={f.ref.link} className="text-accent border-b border-dotted border-link-underline hover:text-accent-hover">{f.ref.label}</Link>
+              </p>
+            )}
+          </li>
+        ))}
+      </ListGroup>
+      {rows.length > 0 && (
+        <button
+          onClick={async () => {
+            if (await confirmDialog({ title: 'Clear the failures list?', body: 'This only hides them here. The jobs and their errors stay in the job queue.', confirm: 'Clear list' })) clear.mutate()
+          }}
+          disabled={clear.isPending}
+          className={`${btn.secondarySm} min-h-9`}
+        >
+          Clear list
+        </button>
       )}
     </section>
   )

@@ -28,6 +28,9 @@ type Adapter struct {
 	EndpointID     *string         `json:"endpoint_id"`
 	CreatedAt      time.Time       `json:"created_at"`
 	EvaluatedAt    *time.Time      `json:"evaluated_at"`
+	RecipeID       uuid.NullUUID   `json:"recipe_id"`
+	SystemPrompt   string          `json:"system_prompt"`
+	Rubric         string          `json:"rubric"`
 }
 
 type Agent struct {
@@ -47,6 +50,7 @@ type Agent struct {
 	UpdatedAt     time.Time       `json:"updated_at"`
 	ProjectID     uuid.NullUUID   `json:"project_id"`
 	LastRunAt     *time.Time      `json:"last_run_at"`
+	MaxRunUsd     float64         `json:"max_run_usd"`
 }
 
 type AgentMemory struct {
@@ -82,6 +86,13 @@ type AgentRun struct {
 	EndedAt        *time.Time      `json:"ended_at"`
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"`
+	MaxRunUsd      float64         `json:"max_run_usd"`
+}
+
+type AgentSkill struct {
+	AgentID uuid.UUID `json:"agent_id"`
+	SkillID uuid.UUID `json:"skill_id"`
+	AddedAt time.Time `json:"added_at"`
 }
 
 type AgentStep struct {
@@ -185,6 +196,16 @@ type Budget struct {
 	CreatedAt time.Time     `json:"created_at"`
 }
 
+type BudgetWarning struct {
+	Scope    string        `json:"scope"`
+	ScopeID  uuid.NullUUID `json:"scope_id"`
+	Period   string        `json:"period"`
+	Pct      int32         `json:"pct"`
+	SpentUsd float64       `json:"spent_usd"`
+	LimitUsd float64       `json:"limit_usd"`
+	SentAt   time.Time     `json:"sent_at"`
+}
+
 type CcJob struct {
 	ID        string        `json:"id"`
 	UserID    uuid.NullUUID `json:"user_id"`
@@ -252,20 +273,46 @@ type Conversation struct {
 }
 
 type Dataset struct {
-	ID           uuid.UUID       `json:"id"`
-	OwnerID      uuid.UUID       `json:"owner_id"`
-	Name         string          `json:"name"`
-	TaskClass    string          `json:"task_class"`
-	Filters      json.RawMessage `json:"filters"`
-	Status       string          `json:"status"`
-	BlobKey      *string         `json:"blob_key"`
-	EvalBlobKey  *string         `json:"eval_blob_key"`
-	Bytes        int64           `json:"bytes"`
-	Examples     int32           `json:"examples"`
-	EvalExamples int32           `json:"eval_examples"`
-	Error        *string         `json:"error"`
-	CreatedAt    time.Time       `json:"created_at"`
-	BuiltAt      *time.Time      `json:"built_at"`
+	ID            uuid.UUID       `json:"id"`
+	OwnerID       uuid.UUID       `json:"owner_id"`
+	Name          string          `json:"name"`
+	TaskClass     string          `json:"task_class"`
+	Filters       json.RawMessage `json:"filters"`
+	Status        string          `json:"status"`
+	BlobKey       *string         `json:"blob_key"`
+	EvalBlobKey   *string         `json:"eval_blob_key"`
+	Bytes         int64           `json:"bytes"`
+	Examples      int32           `json:"examples"`
+	EvalExamples  int32           `json:"eval_examples"`
+	Error         *string         `json:"error"`
+	CreatedAt     time.Time       `json:"created_at"`
+	BuiltAt       *time.Time      `json:"built_at"`
+	Kind          string          `json:"kind"`
+	Mapping       json.RawMessage `json:"mapping"`
+	SourceBlobKey *string         `json:"source_blob_key"`
+	SourceName    *string         `json:"source_name"`
+	Report        json.RawMessage `json:"report"`
+}
+
+type Document struct {
+	AttachmentID   uuid.UUID     `json:"attachment_id"`
+	UserID         uuid.UUID     `json:"user_id"`
+	ConversationID uuid.NullUUID `json:"conversation_id"`
+	Kind           string        `json:"kind"`
+	Method         string        `json:"method"`
+	Pages          int32         `json:"pages"`
+	Chars          int32         `json:"chars"`
+	Truncated      bool          `json:"truncated"`
+	CreatedAt      time.Time     `json:"created_at"`
+}
+
+type DocumentChunk struct {
+	ID           uuid.UUID        `json:"id"`
+	AttachmentID uuid.UUID        `json:"attachment_id"`
+	Seq          int32            `json:"seq"`
+	Page         int32            `json:"page"`
+	Content      string           `json:"content"`
+	Embedding    *pgvector.Vector `json:"embedding"`
 }
 
 type Endpoint struct {
@@ -287,6 +334,8 @@ type Endpoint struct {
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	ExtraBody       json.RawMessage `json:"extra_body"`
+	Tier            string          `json:"tier"`
+	Routable        bool            `json:"routable"`
 }
 
 type EndpointThroughput struct {
@@ -295,6 +344,18 @@ type EndpointThroughput struct {
 	TtftMs       float64   `json:"ttft_ms"`
 	Samples      int32     `json:"samples"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type Favorite struct {
+	ID             uuid.UUID     `json:"id"`
+	UserID         uuid.UUID     `json:"user_id"`
+	Kind           string        `json:"kind"`
+	RefID          uuid.UUID     `json:"ref_id"`
+	Title          string        `json:"title"`
+	Snippet        string        `json:"snippet"`
+	ConversationID uuid.NullUUID `json:"conversation_id"`
+	ProjectID      uuid.NullUUID `json:"project_id"`
+	CreatedAt      time.Time     `json:"created_at"`
 }
 
 type FinetuneJob struct {
@@ -313,6 +374,8 @@ type FinetuneJob struct {
 	CreatedAt      time.Time       `json:"created_at"`
 	StartedAt      *time.Time      `json:"started_at"`
 	EndedAt        *time.Time      `json:"ended_at"`
+	RecipeID       uuid.NullUUID   `json:"recipe_id"`
+	Spec           json.RawMessage `json:"spec"`
 }
 
 type Invite struct {
@@ -357,6 +420,17 @@ type MediaJob struct {
 	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
+type MemorySetting struct {
+	UserID          uuid.UUID       `json:"user_id"`
+	Enabled         bool            `json:"enabled"`
+	ReflectEnabled  bool            `json:"reflect_enabled"`
+	ReflectAt       string          `json:"reflect_at"`
+	Timezone        string          `json:"timezone"`
+	Profile         json.RawMessage `json:"profile"`
+	LastReflectedAt *time.Time      `json:"last_reflected_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+}
+
 type Message struct {
 	ID             uuid.UUID       `json:"id"`
 	ConversationID uuid.UUID       `json:"conversation_id"`
@@ -382,6 +456,48 @@ type MessageRating struct {
 	Score     int16     `json:"score"`
 	Note      *string   `json:"note"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type Notebook struct {
+	ID             uuid.UUID     `json:"id"`
+	UserID         uuid.UUID     `json:"user_id"`
+	Name           string        `json:"name"`
+	ConversationID uuid.NullUUID `json:"conversation_id"`
+	CreatedAt      time.Time     `json:"created_at"`
+	UpdatedAt      time.Time     `json:"updated_at"`
+}
+
+type NotebookChunk struct {
+	ID        uuid.UUID        `json:"id"`
+	SourceID  uuid.UUID        `json:"source_id"`
+	Seq       int32            `json:"seq"`
+	Page      int32            `json:"page"`
+	Content   string           `json:"content"`
+	Embedding *pgvector.Vector `json:"embedding"`
+}
+
+type NotebookNote struct {
+	ID         uuid.UUID `json:"id"`
+	NotebookID uuid.UUID `json:"notebook_id"`
+	Kind       string    `json:"kind"`
+	Title      string    `json:"title"`
+	Body       string    `json:"body"`
+	Author     string    `json:"author"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type NotebookSource struct {
+	ID                 uuid.UUID     `json:"id"`
+	NotebookID         uuid.UUID     `json:"notebook_id"`
+	Kind               string        `json:"kind"`
+	Title              string        `json:"title"`
+	Url                string        `json:"url"`
+	AttachmentID       uuid.NullUUID `json:"attachment_id"`
+	FromConversationID uuid.NullUUID `json:"from_conversation_id"`
+	Pages              int32         `json:"pages"`
+	Chars              int32         `json:"chars"`
+	CreatedAt          time.Time     `json:"created_at"`
 }
 
 type Passkey struct {
@@ -488,15 +604,107 @@ type SandboxEvent struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+type SavedPrompt struct {
+	ID        uuid.UUID `json:"id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Name      string    `json:"name"`
+	Text      string    `json:"text"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ScheduledPrompt struct {
+	ID                uuid.UUID     `json:"id"`
+	UserID            uuid.UUID     `json:"user_id"`
+	ProjectID         uuid.UUID     `json:"project_id"`
+	Title             string        `json:"title"`
+	Prompt            string        `json:"prompt"`
+	ModelSelector     string        `json:"model_selector"`
+	Kind              string        `json:"kind"`
+	CronExpr          string        `json:"cron_expr"`
+	Timezone          string        `json:"timezone"`
+	RunAt             *time.Time    `json:"run_at"`
+	Enabled           bool          `json:"enabled"`
+	AllowWebFetch     bool          `json:"allow_web_fetch"`
+	NotifyEmail       bool          `json:"notify_email"`
+	ReuseConversation bool          `json:"reuse_conversation"`
+	ConversationID    uuid.NullUUID `json:"conversation_id"`
+	NextRunAt         *time.Time    `json:"next_run_at"`
+	LastRunAt         *time.Time    `json:"last_run_at"`
+	LastStatus        string        `json:"last_status"`
+	LastError         string        `json:"last_error"`
+	CreatedAt         time.Time     `json:"created_at"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+}
+
+type ScheduledPromptRun struct {
+	ID             uuid.UUID     `json:"id"`
+	PromptID       uuid.UUID     `json:"prompt_id"`
+	RunID          uuid.NullUUID `json:"run_id"`
+	ConversationID uuid.NullUUID `json:"conversation_id"`
+	Status         string        `json:"status"`
+	Error          string        `json:"error"`
+	Notified       bool          `json:"notified"`
+	StartedAt      time.Time     `json:"started_at"`
+	EndedAt        *time.Time    `json:"ended_at"`
+}
+
+type ServerSetting struct {
+	Key       string          `json:"key"`
+	Value     json.RawMessage `json:"value"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
 type Session struct {
-	ID        uuid.UUID     `json:"id"`
-	UserID    uuid.UUID     `json:"user_id"`
-	TokenHash []byte        `json:"token_hash"`
-	CreatedAt time.Time     `json:"created_at"`
-	ExpiresAt time.Time     `json:"expires_at"`
-	UserAgent string        `json:"user_agent"`
-	Ip        *netip.Prefix `json:"ip"`
-	RevokedAt *time.Time    `json:"revoked_at"`
+	ID          uuid.UUID     `json:"id"`
+	UserID      uuid.UUID     `json:"user_id"`
+	TokenHash   []byte        `json:"token_hash"`
+	CreatedAt   time.Time     `json:"created_at"`
+	ExpiresAt   time.Time     `json:"expires_at"`
+	UserAgent   string        `json:"user_agent"`
+	Ip          *netip.Prefix `json:"ip"`
+	RevokedAt   *time.Time    `json:"revoked_at"`
+	SteppedUpAt *time.Time    `json:"stepped_up_at"`
+}
+
+type Skill struct {
+	ID             uuid.UUID       `json:"id"`
+	OwnerID        uuid.UUID       `json:"owner_id"`
+	Name           string          `json:"name"`
+	Title          string          `json:"title"`
+	Description    string          `json:"description"`
+	Instructions   string          `json:"instructions"`
+	HasScripts     bool            `json:"has_scripts"`
+	Files          json.RawMessage `json:"files"`
+	RefusedSecrets json.RawMessage `json:"refused_secrets"`
+	Findings       json.RawMessage `json:"findings"`
+	Warnings       json.RawMessage `json:"warnings"`
+	ApprovedBy     uuid.NullUUID   `json:"approved_by"`
+	ApprovedAt     time.Time       `json:"approved_at"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+}
+
+type TrainingRecipe struct {
+	ID             uuid.UUID       `json:"id"`
+	OwnerID        uuid.UUID       `json:"owner_id"`
+	Name           string          `json:"name"`
+	BaseModel      string          `json:"base_model"`
+	BaseEndpointID *string         `json:"base_endpoint_id"`
+	Instructions   string          `json:"instructions"`
+	DatasetIds     []uuid.UUID     `json:"dataset_ids"`
+	Target         string          `json:"target"`
+	Config         json.RawMessage `json:"config"`
+	Spec           json.RawMessage `json:"spec"`
+	Edited         []string        `json:"edited"`
+	SpecDraft      json.RawMessage `json:"spec_draft"`
+	SpecModel      string          `json:"spec_model"`
+	SpecStatus     string          `json:"spec_status"`
+	SpecError      *string         `json:"spec_error"`
+	SpecUsedModel  *string         `json:"spec_used_model"`
+	SpecAt         *time.Time      `json:"spec_at"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 type UsageLedger struct {
@@ -534,6 +742,20 @@ type User struct {
 	DisabledAt         *time.Time `json:"disabled_at"`
 	TrainingConsent    bool       `json:"training_consent"`
 	SharedProviderKeys bool       `json:"shared_provider_keys"`
+}
+
+type UserMemory struct {
+	ID                   uuid.UUID        `json:"id"`
+	UserID               uuid.UUID        `json:"user_id"`
+	Kind                 string           `json:"kind"`
+	Content              string           `json:"content"`
+	ContentHash          []byte           `json:"content_hash"`
+	Embedding            *pgvector.Vector `json:"embedding"`
+	SourceConversationID uuid.NullUUID    `json:"source_conversation_id"`
+	Source               string           `json:"source"`
+	Importance           float32          `json:"importance"`
+	LastUsedAt           *time.Time       `json:"last_used_at"`
+	CreatedAt            time.Time        `json:"created_at"`
 }
 
 type UserProviderKey struct {

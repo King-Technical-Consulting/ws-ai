@@ -19,3 +19,12 @@ services:
     ports:
       - "${WS_BIND_ADDR:-127.0.0.1}:${WS_HTTP_PORT:-8080}:8080"
       - "${WS_BIND_ADDR:-127.0.0.1}:${WS_ART_PORT:-8081}:8081"
+      # The tunnel listener (WS_TUNNEL_LISTEN=:8083 and WS_TUNNEL_PEERS in .env). Its own bind
+      # address, loopback by default, so a wider WS_BIND_ADDR for the main port never exposes
+      # it: whoever can reach this port could claim any client address with a CF-Connecting-IP
+      # header, so the app refuses (403) every peer not in WS_TUNNEL_PEERS. Loopback suits a
+      # cloudflared on this host; for one elsewhere on the tailnet set WS_TUNNEL_BIND_ADDR to
+      # this box's tailnet address and WS_TUNNEL_PEERS to the connector. Nothing listens until
+      # WS_TUNNEL_LISTEN is set. With the compose `cloudflare` sidecar, point the route at
+      # http://app:8083 instead and publish nothing.
+      - "${WS_TUNNEL_BIND_ADDR:-127.0.0.1}:${WS_TUNNEL_PORT:-8083}:8083"

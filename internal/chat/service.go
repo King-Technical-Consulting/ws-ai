@@ -16,8 +16,11 @@ import (
 
 	"github.com/jking323/ws/internal/agent"
 	"github.com/jking323/ws/internal/artifacts"
+	"github.com/jking323/ws/internal/docread"
+	"github.com/jking323/ws/internal/documents"
 	"github.com/jking323/ws/internal/gateway"
 	"github.com/jking323/ws/internal/httpx/aistream"
+	"github.com/jking323/ws/internal/memory"
 	"github.com/jking323/ws/internal/store"
 )
 
@@ -31,6 +34,33 @@ type Service struct {
 	// execute there and stream back over NOTIFY; chat-mode runs still run
 	// in-process.
 	Enqueue func(ctx context.Context, runID uuid.UUID) error
+	// Memory, when set, puts the person's card and recalled memories into a
+	// chat turn's system prompt (PLAN M13). Nil leaves prompts as they were.
+	Memory PersonalContext
+	// Documents, when set, reads uploaded documents (PDF, Office, text) into
+	// the message as page-marked text and keeps the original (PLAN M13).
+	Documents DocumentIngester
+	// Notebooks, when set, gives the chat of a research notebook its sources
+	// and notes (PLAN M13 cut 6).
+	Notebooks NotebookContext
+}
+
+// NotebookContext is *notebooks.Service as the chat turn sees it.
+type NotebookContext interface {
+	NotebookForConversation(ctx context.Context, userID uuid.UUID, settings json.RawMessage) (uuid.UUID, bool)
+	Context(ctx context.Context, userID, notebookID uuid.UUID, query string) (string, error)
+}
+
+// DocumentIngester is *documents.Service as the chat turn sees it.
+type DocumentIngester interface {
+	Ingest(ctx context.Context, userID uuid.UUID, conv uuid.NullUUID, mime, name string, data []byte) (*documents.Ingested, error)
+}
+
+// PersonalContext is what a turn needs from the member's memory
+// (*memory.Service implements it).
+type PersonalContext interface {
+	Context(ctx context.Context, userID uuid.UUID, input string) (memory.Block, error)
+	MarkUsed(ctx context.Context, userID uuid.UUID, rec []memory.Recalled)
 }
 
 // Turn is one user message to answer.
@@ -41,6 +71,7 @@ type Turn struct {
 	Selector       string         // model selector; "" uses the conversation default
 	System         string         // optional system prompt override
 	Reasoning      bool
+	Plan           bool // plan mode for this turn (agent.Request.Plan)
 }
 
 // Run persists the user message, creates a run, and drives it while
@@ -54,6 +85,7 @@ func (s *Service) Run(ctx context.Context, w *aistream.Writer, t Turn) (uuid.UUI
 	if selector == "" {
 		selector = conv.ModelSelector
 	}
+	t.Parts = s.readDocuments(ctx, t.UserID, conv.ID, t.Parts)
 	userParts, _ := json.Marshal(t.Parts)
 	seq, err := s.DB.NextMessageSeq(ctx, conv.ID)
 	if err != nil {
@@ -78,9 +110,37 @@ func (s *Service) Run(ctx context.Context, w *aistream.Writer, t Turn) (uuid.UUI
 	if system == "" {
 		system = systemPrompt(conv.Mode, design)
 	}
+	// The person's card and the memories that match this message. A recall
+	// failure starts the turn without them rather than not at all.
+	var recalled []agent.MemoryRef
+	if s.Memory != nil && t.UserID != uuid.Nil {
+		blk, err := s.Memory.Context(ctx, t.UserID, partsText(t.Parts))
+		if err != nil {
+			s.Log.Warn("chat: personal context", "err", err)
+		} else if blk.Text != "" {
+			system += "\n\n" + blk.Text
+			for _, r := range blk.Recalled {
+				recalled = append(recalled, agent.MemoryRef{ID: r.ID.String(), Kind: r.Kind, Content: r.Content})
+			}
+			s.Memory.MarkUsed(ctx, t.UserID, blk.Recalled)
+		}
+	}
+	toolAllow := toolsFor(conv.Mode)
+	if s.Notebooks != nil && t.UserID != uuid.Nil {
+		if nbID, ok := s.Notebooks.NotebookForConversation(ctx, t.UserID, conv.Settings); ok {
+			if blk, err := s.Notebooks.Context(ctx, t.UserID, nbID, partsText(t.Parts)); err != nil {
+				s.Log.Warn("chat: notebook context", "err", err)
+			} else if blk != "" {
+				system += "\n\n" + blk
+				if len(toolAllow) > 0 {
+					toolAllow = append(append([]string{}, toolAllow...), "notebook_note")
+				}
+			}
+		}
+	}
 	run, err := s.Runtime.Create(ctx, agent.StartParams{
 		ConversationID: conv.ID, UserID: t.UserID,
-		Request:  agent.Request{Selector: selector, System: system, TaskClass: taskFor(conv.Mode), Reasoning: t.Reasoning, ToolAllow: toolsFor(conv.Mode)},
+		Request:  agent.Request{Selector: selector, System: system, TaskClass: taskFor(conv.Mode), Reasoning: t.Reasoning, ToolAllow: toolAllow, Plan: t.Plan, Memory: recalled},
 		Policies: policies, MaxSteps: maxStepsFor(conv.Mode),
 	})
 	if err != nil {
@@ -133,11 +193,11 @@ func (s *Service) relay(ctx context.Context, runID uuid.UUID, sink agent.Sink) e
 
 // chatTools is what non-code conversations advertise to the model;
 // sandbox tools exist only in code projects.
-var chatTools = []string{"create_artifact", "update_artifact", "web_fetch", "read_blob", "ask_user"}
+var chatTools = []string{"create_artifact", "update_artifact", "web_fetch", "read_blob", "ask_user", "ws_help"}
 
 // ResumeWithApprovals records the user's decisions on pending approvals
 // for the conversation's paused run and continues it, streaming to w.
-func (s *Service) ResumeWithApprovals(ctx context.Context, w *aistream.Writer, convID, userID uuid.UUID, decisions map[string]bool) error {
+func (s *Service) ResumeWithApprovals(ctx context.Context, w *aistream.Writer, convID, userID uuid.UUID, decisions map[string]bool, notes map[string]string) error {
 	run, err := s.DB.LatestRunForConversation(ctx, convID)
 	if err != nil {
 		return errors.New("no run to resume")
@@ -150,7 +210,11 @@ func (s *Service) ResumeWithApprovals(ctx context.Context, w *aistream.Writer, c
 		if approved {
 			status = "approved"
 		}
-		if _, err := s.DB.DecideApprovalByCall(ctx, store.DecideApprovalByCallParams{RunID: run.ID, ToolCallID: callID, Status: status, DecidedBy: uuid.NullUUID{UUID: userID, Valid: true}}); err != nil {
+		var note *string
+		if n := strings.TrimSpace(notes[callID]); n != "" {
+			note = &n
+		}
+		if _, err := s.DB.DecideApprovalByCall(ctx, store.DecideApprovalByCallParams{RunID: run.ID, ToolCallID: callID, Status: status, DecidedBy: uuid.NullUUID{UUID: userID, Valid: true}, Note: note}); err != nil {
 			s.Log.Warn("approval decide", "call", callID, "err", err)
 		}
 	}
@@ -313,22 +377,87 @@ func (s *Service) title(ctx context.Context, convID uuid.UUID) {
 	if len(reply) > 800 {
 		reply = reply[:800]
 	}
-	r, err := s.GW.Complete(ctx, &gateway.Request{
-		Model:     "auto",
-		System:    "You write 3-6 word titles for chat conversations. Reply with the title only, no quotes, no trailing period.",
-		Messages:  []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart("User: " + first + "\n\nAssistant: " + reply + "\n\nTitle:")}}},
-		MaxTokens: 24,
-		Metadata:  gateway.Metadata{ConversationID: convID.String(), TaskClass: gateway.TaskTitle},
-	})
+	title, r, err := generateTitle(ctx, s.GW, convID.String(), first, reply)
 	if err != nil {
 		s.Log.Warn("chat: title generation failed", "err", err)
 		return
 	}
-	title := strings.Trim(strings.TrimSpace(strings.Split(r.Text(), "\n")[0]), `"'.`)
-	if title == "" || len(title) > 80 {
+	if title == "" {
+		s.Log.Warn("chat: title generation gave nothing usable", "conversation", convID, "endpoint", r.EndpointID, "finish", r.FinishReason, "reply", firstLine(r.Text()))
 		return
 	}
 	_ = s.DB.UpdateConversationTitle(ctx, store.UpdateConversationTitleParams{ID: convID, Title: title})
+}
+
+// titleCompleter is the one gateway call generateTitle needs.
+type titleCompleter interface {
+	Complete(ctx context.Context, req *gateway.Request) (*gateway.Response, error)
+}
+
+// titleTokens is the first output budget for a title, reasoning included.
+// A model that thinks before it answers (gpt-oss-20b, first under the
+// title class) spent a 24-token budget on its reasoning and returned
+// nothing; a reply that ran out of tokens or came back empty gets one more
+// try with a lot more room.
+const titleTokens = 400
+
+// generateTitle asks the gateway for a title and returns it cleaned, with
+// the last response for the log when nothing usable came back.
+func generateTitle(ctx context.Context, gw titleCompleter, convID, first, reply string) (string, *gateway.Response, error) {
+	var last *gateway.Response
+	for _, budget := range []int{titleTokens, titleTokens * 4} {
+		r, err := gw.Complete(ctx, &gateway.Request{
+			Model:     "auto",
+			System:    "You write 3-6 word titles for chat conversations. Reply with the title only, no quotes, no trailing period.",
+			Messages:  []gateway.Message{{Role: gateway.RoleUser, Parts: []gateway.Part{gateway.TextPart("User: " + first + "\n\nAssistant: " + reply + "\n\nTitle:")}}},
+			MaxTokens: budget,
+			Metadata:  gateway.Metadata{ConversationID: convID, TaskClass: gateway.TaskTitle},
+		})
+		if err != nil {
+			return "", nil, err
+		}
+		last = r
+		if title := cleanTitle(r.Text()); title != "" {
+			return title, r, nil
+		}
+		if strings.TrimSpace(r.Text()) != "" && r.FinishReason != gateway.FinishLength {
+			break // a reply that is not a title: more room will not fix it
+		}
+	}
+	return "", last, nil
+}
+
+// cleanTitle turns a model's reply into a title: the first non-empty line,
+// without a "Title:" label, surrounding quotes, markdown emphasis or a
+// trailing period, and empty when nothing usable is left or it is too long
+// for a sidebar (80 characters). Local models often add the label or the
+// quotes the prompt asks them not to.
+func cleanTitle(reply string) string {
+	for _, line := range strings.Split(reply, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		t = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(t, "Title:"), "title:"))
+		// Quotes, emphasis, a trailing period, in any order ("**Title**.").
+		t = strings.Trim(t, "\"'`*_#. ")
+		if t == "" || len(t) > 80 {
+			return ""
+		}
+		return t
+	}
+	return ""
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 120 {
+		s = s[:120]
+	}
+	return s
 }
 
 // systemPrompt is the default prompt for a mode. A design conversation
@@ -341,7 +470,7 @@ func systemPrompt(mode string, design *artifacts.DesignContext) string {
 	case "design":
 		base += artifacts.DesignSystemPrompt(design)
 	}
-	base += " When the user asks for a document, web page, diagram, or a file-sized piece of code they will keep, use create_artifact and then describe it in one or two sentences; use update_artifact to revise an existing artifact. Use web_fetch to read a public page when the user gives a URL or asks about something you'd need to look up. If a tool result says a large output was stored as a blob, use read_blob to read more of it only when needed."
+	base += " When the user asks for a document, web page, diagram, or a file-sized piece of code they will keep, use create_artifact and then describe it in one or two sentences; use update_artifact to revise an existing artifact. Use web_fetch to read a public page when the user gives a URL or asks about something you'd need to look up. If a tool result says a large output was stored as a blob, use read_blob to read more of it only when needed. You are the assistant inside ws, a self-hosted AI workspace: when the user asks about ws itself (what it can do, how to use a feature, where a setting lives, how to run or configure it), call ws_help and answer from the documentation it returns, naming the page; if the docs do not cover it, say so rather than guess."
 	return base
 }
 
@@ -589,4 +718,83 @@ func ApprovalDecisions(parts []json.RawMessage) map[string]bool {
 		out[p.ToolCallID] = *p.Approval.Approved
 	}
 	return out
+}
+
+// ApprovalNotes returns the free-text reason the person gave with each
+// approval response, by tool call id. Plan mode uses it to carry an edited
+// plan or a reason for rejecting one.
+func ApprovalNotes(parts []json.RawMessage) map[string]string {
+	out := map[string]string{}
+	for _, r := range parts {
+		var p struct {
+			ToolCallID string `json:"toolCallId"`
+			Approval   *struct {
+				Reason string `json:"reason"`
+			} `json:"approval"`
+		}
+		if json.Unmarshal(r, &p) != nil || p.ToolCallID == "" || p.Approval == nil || p.Approval.Reason == "" {
+			continue
+		}
+		out[p.ToolCallID] = p.Approval.Reason
+	}
+	return out
+}
+
+// partsText is the text of a user message's parts, for recall.
+func partsText(parts []gateway.Part) string {
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Kind == gateway.PartText {
+			b.WriteString(p.Text)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// readDocuments replaces each attached document (PDF, Office, text file)
+// with a text part carrying its extracted, page-marked text, so any model
+// can read it and the message stays small; the original is kept as an
+// attachment. A file that cannot be read becomes a note saying why, so the
+// model can tell the person instead of the turn failing. Images and files
+// of other types pass through unchanged.
+func (s *Service) readDocuments(ctx context.Context, userID, convID uuid.UUID, parts []gateway.Part) []gateway.Part {
+	if s.Documents == nil || userID == uuid.Nil {
+		return parts
+	}
+	out := make([]gateway.Part, 0, len(parts))
+	for _, p := range parts {
+		if p.Kind != gateway.PartFile || len(p.Data) == 0 || !documents.Handles(p.MIME, p.Name) {
+			out = append(out, p)
+			continue
+		}
+		in, err := s.Documents.Ingest(ctx, userID, uuid.NullUUID{UUID: convID, Valid: true}, p.MIME, p.Name, p.Data)
+		if err != nil {
+			s.Log.Warn("chat: document not read", "name", p.Name, "err", err)
+			out = append(out, gateway.TextPart(fmt.Sprintf("[Attached document %s could not be read: %s]", p.Name, documentError(err))))
+			continue
+		}
+		txt := gateway.TextPart(in.Text)
+		if in.Kind == "pdf" && len(p.Data) > 0 {
+			// Keep the PDF itself for models that read it natively (better
+			// than extracted text: layout, figures); the text stands in
+			// for the ones that cannot (gateway.ResolveAlt).
+			out = append(out, p)
+			txt.Alt = true
+		}
+		out = append(out, txt)
+	}
+	return out
+}
+
+func documentError(err error) string {
+	switch {
+	case errors.Is(err, docread.ErrNeedsOCR):
+		return "it has no text layer (a scan) and this server has no OCR service configured"
+	case errors.Is(err, docread.ErrTooBig):
+		return err.Error()
+	case errors.Is(err, docread.ErrUnsupported):
+		return "this kind of file is not supported"
+	}
+	return "the file may be damaged or protected by a password"
 }

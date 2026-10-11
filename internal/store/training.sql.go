@@ -23,7 +23,7 @@ func (q *Queries) CancelFinetuneJob(ctx context.Context, id uuid.UUID) error {
 }
 
 const claimFinetuneJob = `-- name: ClaimFinetuneJob :one
-UPDATE finetune_jobs SET status = 'running', started_at = now() WHERE id = $1 AND status = 'queued' RETURNING id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at
+UPDATE finetune_jobs SET status = 'running', started_at = now() WHERE id = $1 AND status = 'queued' RETURNING id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at, recipe_id, spec
 `
 
 func (q *Queries) ClaimFinetuneJob(ctx context.Context, id uuid.UUID) (FinetuneJob, error) {
@@ -45,13 +45,47 @@ func (q *Queries) ClaimFinetuneJob(ctx context.Context, id uuid.UUID) (FinetuneJ
 		&i.CreatedAt,
 		&i.StartedAt,
 		&i.EndedAt,
+		&i.RecipeID,
+		&i.Spec,
+	)
+	return i, err
+}
+
+const claimRecipeSpec = `-- name: ClaimRecipeSpec :one
+UPDATE training_recipes SET spec_status = 'running', updated_at = now()
+WHERE id = $1 AND spec_status = 'queued' RETURNING id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at
+`
+
+func (q *Queries) ClaimRecipeSpec(ctx context.Context, id uuid.UUID) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, claimRecipeSpec, id)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const createAdapter = `-- name: CreateAdapter :one
-INSERT INTO adapters (name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, endpoint_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at
+INSERT INTO adapters (name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, endpoint_id, recipe_id, system_prompt, rubric)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at, recipe_id, system_prompt, rubric
 `
 
 type CreateAdapterParams struct {
@@ -62,6 +96,9 @@ type CreateAdapterParams struct {
 	BlobKey        string        `json:"blob_key"`
 	Bytes          int64         `json:"bytes"`
 	EndpointID     *string       `json:"endpoint_id"`
+	RecipeID       uuid.NullUUID `json:"recipe_id"`
+	SystemPrompt   string        `json:"system_prompt"`
+	Rubric         string        `json:"rubric"`
 }
 
 func (q *Queries) CreateAdapter(ctx context.Context, arg CreateAdapterParams) (Adapter, error) {
@@ -73,6 +110,9 @@ func (q *Queries) CreateAdapter(ctx context.Context, arg CreateAdapterParams) (A
 		arg.BlobKey,
 		arg.Bytes,
 		arg.EndpointID,
+		arg.RecipeID,
+		arg.SystemPrompt,
+		arg.Rubric,
 	)
 	var i Adapter
 	err := row.Scan(
@@ -90,12 +130,15 @@ func (q *Queries) CreateAdapter(ctx context.Context, arg CreateAdapterParams) (A
 		&i.EndpointID,
 		&i.CreatedAt,
 		&i.EvaluatedAt,
+		&i.RecipeID,
+		&i.SystemPrompt,
+		&i.Rubric,
 	)
 	return i, err
 }
 
 const createDataset = `-- name: CreateDataset :one
-INSERT INTO datasets (owner_id, name, task_class, filters) VALUES ($1, $2, $3, $4) RETURNING id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at
+INSERT INTO datasets (owner_id, name, task_class, filters) VALUES ($1, $2, $3, $4) RETURNING id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report
 `
 
 type CreateDatasetParams struct {
@@ -128,13 +171,18 @@ func (q *Queries) CreateDataset(ctx context.Context, arg CreateDatasetParams) (D
 		&i.Error,
 		&i.CreatedAt,
 		&i.BuiltAt,
+		&i.Kind,
+		&i.Mapping,
+		&i.SourceBlobKey,
+		&i.SourceName,
+		&i.Report,
 	)
 	return i, err
 }
 
 const createFinetuneJob = `-- name: CreateFinetuneJob :one
-INSERT INTO finetune_jobs (owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config)
-VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at
+INSERT INTO finetune_jobs (owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, recipe_id, spec)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at, recipe_id, spec
 `
 
 type CreateFinetuneJobParams struct {
@@ -144,6 +192,8 @@ type CreateFinetuneJobParams struct {
 	BaseEndpointID *string         `json:"base_endpoint_id"`
 	AdapterName    string          `json:"adapter_name"`
 	Config         json.RawMessage `json:"config"`
+	RecipeID       uuid.NullUUID   `json:"recipe_id"`
+	Spec           json.RawMessage `json:"spec"`
 }
 
 func (q *Queries) CreateFinetuneJob(ctx context.Context, arg CreateFinetuneJobParams) (FinetuneJob, error) {
@@ -154,6 +204,8 @@ func (q *Queries) CreateFinetuneJob(ctx context.Context, arg CreateFinetuneJobPa
 		arg.BaseEndpointID,
 		arg.AdapterName,
 		arg.Config,
+		arg.RecipeID,
+		arg.Spec,
 	)
 	var i FinetuneJob
 	err := row.Scan(
@@ -172,6 +224,155 @@ func (q *Queries) CreateFinetuneJob(ctx context.Context, arg CreateFinetuneJobPa
 		&i.CreatedAt,
 		&i.StartedAt,
 		&i.EndedAt,
+		&i.RecipeID,
+		&i.Spec,
+	)
+	return i, err
+}
+
+const createMergedDataset = `-- name: CreateMergedDataset :one
+INSERT INTO datasets (owner_id, name, filters, kind, report, status)
+VALUES ($1, $2, '{}', 'merged', $3, 'building') RETURNING id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report
+`
+
+type CreateMergedDatasetParams struct {
+	OwnerID uuid.UUID       `json:"owner_id"`
+	Name    string          `json:"name"`
+	Report  json.RawMessage `json:"report"`
+}
+
+// The dataset a recipe job builds from the recipe's datasets (M12 cut c).
+func (q *Queries) CreateMergedDataset(ctx context.Context, arg CreateMergedDatasetParams) (Dataset, error) {
+	row := q.db.QueryRow(ctx, createMergedDataset, arg.OwnerID, arg.Name, arg.Report)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.TaskClass,
+		&i.Filters,
+		&i.Status,
+		&i.BlobKey,
+		&i.EvalBlobKey,
+		&i.Bytes,
+		&i.Examples,
+		&i.EvalExamples,
+		&i.Error,
+		&i.CreatedAt,
+		&i.BuiltAt,
+		&i.Kind,
+		&i.Mapping,
+		&i.SourceBlobKey,
+		&i.SourceName,
+		&i.Report,
+	)
+	return i, err
+}
+
+const createRecipe = `-- name: CreateRecipe :one
+
+INSERT INTO training_recipes (owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec_model)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at
+`
+
+type CreateRecipeParams struct {
+	OwnerID        uuid.UUID       `json:"owner_id"`
+	Name           string          `json:"name"`
+	BaseModel      string          `json:"base_model"`
+	BaseEndpointID *string         `json:"base_endpoint_id"`
+	Instructions   string          `json:"instructions"`
+	DatasetIds     []uuid.UUID     `json:"dataset_ids"`
+	Target         string          `json:"target"`
+	Config         json.RawMessage `json:"config"`
+	SpecModel      string          `json:"spec_model"`
+}
+
+// Recipes (M12 cut b).
+func (q *Queries) CreateRecipe(ctx context.Context, arg CreateRecipeParams) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, createRecipe,
+		arg.OwnerID,
+		arg.Name,
+		arg.BaseModel,
+		arg.BaseEndpointID,
+		arg.Instructions,
+		arg.DatasetIds,
+		arg.Target,
+		arg.Config,
+		arg.SpecModel,
+	)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createUploadedDataset = `-- name: CreateUploadedDataset :one
+INSERT INTO datasets (owner_id, name, task_class, filters, kind, mapping, source_blob_key, source_name, bytes)
+VALUES ($1, $2, $3, $4, 'uploaded', $5, $6, $7, $8) RETURNING id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report
+`
+
+type CreateUploadedDatasetParams struct {
+	OwnerID       uuid.UUID       `json:"owner_id"`
+	Name          string          `json:"name"`
+	TaskClass     string          `json:"task_class"`
+	Filters       json.RawMessage `json:"filters"`
+	Mapping       json.RawMessage `json:"mapping"`
+	SourceBlobKey *string         `json:"source_blob_key"`
+	SourceName    *string         `json:"source_name"`
+	Bytes         int64           `json:"bytes"`
+}
+
+func (q *Queries) CreateUploadedDataset(ctx context.Context, arg CreateUploadedDatasetParams) (Dataset, error) {
+	row := q.db.QueryRow(ctx, createUploadedDataset,
+		arg.OwnerID,
+		arg.Name,
+		arg.TaskClass,
+		arg.Filters,
+		arg.Mapping,
+		arg.SourceBlobKey,
+		arg.SourceName,
+		arg.Bytes,
+	)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.TaskClass,
+		&i.Filters,
+		&i.Status,
+		&i.BlobKey,
+		&i.EvalBlobKey,
+		&i.Bytes,
+		&i.Examples,
+		&i.EvalExamples,
+		&i.Error,
+		&i.CreatedAt,
+		&i.BuiltAt,
+		&i.Kind,
+		&i.Mapping,
+		&i.SourceBlobKey,
+		&i.SourceName,
+		&i.Report,
 	)
 	return i, err
 }
@@ -205,6 +406,29 @@ type DeleteMessageRatingParams struct {
 
 func (q *Queries) DeleteMessageRating(ctx context.Context, arg DeleteMessageRatingParams) error {
 	_, err := q.db.Exec(ctx, deleteMessageRating, arg.MessageID, arg.UserID)
+	return err
+}
+
+const deleteRecipe = `-- name: DeleteRecipe :exec
+DELETE FROM training_recipes WHERE id = $1
+`
+
+func (q *Queries) DeleteRecipe(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteRecipe, id)
+	return err
+}
+
+const failRecipeSpec = `-- name: FailRecipeSpec :exec
+UPDATE training_recipes SET spec_status = 'failed', spec_error = $2, updated_at = now() WHERE id = $1
+`
+
+type FailRecipeSpecParams struct {
+	ID        uuid.UUID `json:"id"`
+	SpecError *string   `json:"spec_error"`
+}
+
+func (q *Queries) FailRecipeSpec(ctx context.Context, arg FailRecipeSpecParams) error {
+	_, err := q.db.Exec(ctx, failRecipeSpec, arg.ID, arg.SpecError)
 	return err
 }
 
@@ -258,8 +482,32 @@ func (q *Queries) FinishFinetuneJob(ctx context.Context, arg FinishFinetuneJobPa
 	return err
 }
 
+const finishRecipeSpec = `-- name: FinishRecipeSpec :exec
+UPDATE training_recipes SET spec = $2, edited = $3, spec_draft = $4, spec_used_model = $5, spec_status = 'ready', spec_error = NULL, spec_at = now(), updated_at = now()
+WHERE id = $1
+`
+
+type FinishRecipeSpecParams struct {
+	ID            uuid.UUID       `json:"id"`
+	Spec          json.RawMessage `json:"spec"`
+	Edited        []string        `json:"edited"`
+	SpecDraft     json.RawMessage `json:"spec_draft"`
+	SpecUsedModel *string         `json:"spec_used_model"`
+}
+
+func (q *Queries) FinishRecipeSpec(ctx context.Context, arg FinishRecipeSpecParams) error {
+	_, err := q.db.Exec(ctx, finishRecipeSpec,
+		arg.ID,
+		arg.Spec,
+		arg.Edited,
+		arg.SpecDraft,
+		arg.SpecUsedModel,
+	)
+	return err
+}
+
 const getAdapter = `-- name: GetAdapter :one
-SELECT id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at FROM adapters WHERE id = $1
+SELECT id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at, recipe_id, system_prompt, rubric FROM adapters WHERE id = $1
 `
 
 func (q *Queries) GetAdapter(ctx context.Context, id uuid.UUID) (Adapter, error) {
@@ -280,12 +528,15 @@ func (q *Queries) GetAdapter(ctx context.Context, id uuid.UUID) (Adapter, error)
 		&i.EndpointID,
 		&i.CreatedAt,
 		&i.EvaluatedAt,
+		&i.RecipeID,
+		&i.SystemPrompt,
+		&i.Rubric,
 	)
 	return i, err
 }
 
 const getDataset = `-- name: GetDataset :one
-SELECT id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at FROM datasets WHERE id = $1
+SELECT id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report FROM datasets WHERE id = $1
 `
 
 func (q *Queries) GetDataset(ctx context.Context, id uuid.UUID) (Dataset, error) {
@@ -306,12 +557,17 @@ func (q *Queries) GetDataset(ctx context.Context, id uuid.UUID) (Dataset, error)
 		&i.Error,
 		&i.CreatedAt,
 		&i.BuiltAt,
+		&i.Kind,
+		&i.Mapping,
+		&i.SourceBlobKey,
+		&i.SourceName,
+		&i.Report,
 	)
 	return i, err
 }
 
 const getFinetuneJob = `-- name: GetFinetuneJob :one
-SELECT id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at FROM finetune_jobs WHERE id = $1
+SELECT id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at, recipe_id, spec FROM finetune_jobs WHERE id = $1
 `
 
 func (q *Queries) GetFinetuneJob(ctx context.Context, id uuid.UUID) (FinetuneJob, error) {
@@ -333,12 +589,45 @@ func (q *Queries) GetFinetuneJob(ctx context.Context, id uuid.UUID) (FinetuneJob
 		&i.CreatedAt,
 		&i.StartedAt,
 		&i.EndedAt,
+		&i.RecipeID,
+		&i.Spec,
+	)
+	return i, err
+}
+
+const getRecipe = `-- name: GetRecipe :one
+SELECT id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at FROM training_recipes WHERE id = $1
+`
+
+func (q *Queries) GetRecipe(ctx context.Context, id uuid.UUID) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, getRecipe, id)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const listAdapters = `-- name: ListAdapters :many
-SELECT id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at FROM adapters ORDER BY created_at DESC LIMIT $1
+SELECT id, name, base_model, base_endpoint_id, finetune_job_id, blob_key, bytes, eval_score, baseline_score, eval, promoted, endpoint_id, created_at, evaluated_at, recipe_id, system_prompt, rubric FROM adapters ORDER BY created_at DESC LIMIT $1
 `
 
 func (q *Queries) ListAdapters(ctx context.Context, limit int32) ([]Adapter, error) {
@@ -365,6 +654,9 @@ func (q *Queries) ListAdapters(ctx context.Context, limit int32) ([]Adapter, err
 			&i.EndpointID,
 			&i.CreatedAt,
 			&i.EvaluatedAt,
+			&i.RecipeID,
+			&i.SystemPrompt,
+			&i.Rubric,
 		); err != nil {
 			return nil, err
 		}
@@ -377,7 +669,7 @@ func (q *Queries) ListAdapters(ctx context.Context, limit int32) ([]Adapter, err
 }
 
 const listDatasets = `-- name: ListDatasets :many
-SELECT id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at FROM datasets ORDER BY created_at DESC LIMIT $1
+SELECT id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report FROM datasets ORDER BY created_at DESC LIMIT $1
 `
 
 func (q *Queries) ListDatasets(ctx context.Context, limit int32) ([]Dataset, error) {
@@ -404,6 +696,11 @@ func (q *Queries) ListDatasets(ctx context.Context, limit int32) ([]Dataset, err
 			&i.Error,
 			&i.CreatedAt,
 			&i.BuiltAt,
+			&i.Kind,
+			&i.Mapping,
+			&i.SourceBlobKey,
+			&i.SourceName,
+			&i.Report,
 		); err != nil {
 			return nil, err
 		}
@@ -416,7 +713,7 @@ func (q *Queries) ListDatasets(ctx context.Context, limit int32) ([]Dataset, err
 }
 
 const listFinetuneJobs = `-- name: ListFinetuneJobs :many
-SELECT id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at FROM finetune_jobs ORDER BY created_at DESC LIMIT $1
+SELECT id, owner_id, dataset_id, base_model, base_endpoint_id, adapter_name, config, status, progress, log, adapter_id, error, created_at, started_at, ended_at, recipe_id, spec FROM finetune_jobs ORDER BY created_at DESC LIMIT $1
 `
 
 func (q *Queries) ListFinetuneJobs(ctx context.Context, limit int32) ([]FinetuneJob, error) {
@@ -444,6 +741,8 @@ func (q *Queries) ListFinetuneJobs(ctx context.Context, limit int32) ([]Finetune
 			&i.CreatedAt,
 			&i.StartedAt,
 			&i.EndedAt,
+			&i.RecipeID,
+			&i.Spec,
 		); err != nil {
 			return nil, err
 		}
@@ -476,6 +775,50 @@ func (q *Queries) ListRatingsForConversation(ctx context.Context, conversationID
 			&i.Score,
 			&i.Note,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRecipes = `-- name: ListRecipes :many
+SELECT id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at FROM training_recipes ORDER BY created_at DESC LIMIT $1
+`
+
+func (q *Queries) ListRecipes(ctx context.Context, limit int32) ([]TrainingRecipe, error) {
+	rows, err := q.db.Query(ctx, listRecipes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrainingRecipe{}
+	for rows.Next() {
+		var i TrainingRecipe
+		if err := rows.Scan(
+			&i.ID,
+			&i.OwnerID,
+			&i.Name,
+			&i.BaseModel,
+			&i.BaseEndpointID,
+			&i.Instructions,
+			&i.DatasetIds,
+			&i.Target,
+			&i.Config,
+			&i.Spec,
+			&i.Edited,
+			&i.SpecDraft,
+			&i.SpecModel,
+			&i.SpecStatus,
+			&i.SpecError,
+			&i.SpecUsedModel,
+			&i.SpecAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -538,6 +881,82 @@ func (q *Queries) ListTrainingConversations(ctx context.Context, arg ListTrainin
 	return items, nil
 }
 
+const queueRecipeSpec = `-- name: QueueRecipeSpec :one
+UPDATE training_recipes SET spec_status = 'queued', spec_error = NULL, spec_model = $2, updated_at = now()
+WHERE id = $1 AND spec_status NOT IN ('queued', 'running') RETURNING id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at
+`
+
+type QueueRecipeSpecParams struct {
+	ID        uuid.UUID `json:"id"`
+	SpecModel string    `json:"spec_model"`
+}
+
+// Flesh out was asked for; refused while a run is queued or running.
+func (q *Queries) QueueRecipeSpec(ctx context.Context, arg QueueRecipeSpecParams) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, queueRecipeSpec, arg.ID, arg.SpecModel)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const requeueDataset = `-- name: RequeueDataset :one
+UPDATE datasets SET mapping = $2, status = 'queued', error = NULL
+WHERE id = $1 AND kind = 'uploaded' AND status IN ('ready', 'failed') RETURNING id, owner_id, name, task_class, filters, status, blob_key, eval_blob_key, bytes, examples, eval_examples, error, created_at, built_at, kind, mapping, source_blob_key, source_name, report
+`
+
+type RequeueDatasetParams struct {
+	ID      uuid.UUID       `json:"id"`
+	Mapping json.RawMessage `json:"mapping"`
+}
+
+// Sets a new mapping and queues a rebuild; only a finished build can be redone.
+func (q *Queries) RequeueDataset(ctx context.Context, arg RequeueDatasetParams) (Dataset, error) {
+	row := q.db.QueryRow(ctx, requeueDataset, arg.ID, arg.Mapping)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.TaskClass,
+		&i.Filters,
+		&i.Status,
+		&i.BlobKey,
+		&i.EvalBlobKey,
+		&i.Bytes,
+		&i.Examples,
+		&i.EvalExamples,
+		&i.Error,
+		&i.CreatedAt,
+		&i.BuiltAt,
+		&i.Kind,
+		&i.Mapping,
+		&i.SourceBlobKey,
+		&i.SourceName,
+		&i.Report,
+	)
+	return i, err
+}
+
 const setAdapterEval = `-- name: SetAdapterEval :exec
 UPDATE adapters SET eval_score = $2, baseline_score = $3, eval = $4, evaluated_at = now() WHERE id = $1
 `
@@ -573,6 +992,20 @@ func (q *Queries) SetAdapterPromoted(ctx context.Context, arg SetAdapterPromoted
 	return err
 }
 
+const setDatasetReport = `-- name: SetDatasetReport :exec
+UPDATE datasets SET report = $2 WHERE id = $1
+`
+
+type SetDatasetReportParams struct {
+	ID     uuid.UUID       `json:"id"`
+	Report json.RawMessage `json:"report"`
+}
+
+func (q *Queries) SetDatasetReport(ctx context.Context, arg SetDatasetReportParams) error {
+	_, err := q.db.Exec(ctx, setDatasetReport, arg.ID, arg.Report)
+	return err
+}
+
 const setDatasetStatus = `-- name: SetDatasetStatus :exec
 UPDATE datasets SET status = $2, error = $3 WHERE id = $1
 `
@@ -585,6 +1018,21 @@ type SetDatasetStatusParams struct {
 
 func (q *Queries) SetDatasetStatus(ctx context.Context, arg SetDatasetStatusParams) error {
 	_, err := q.db.Exec(ctx, setDatasetStatus, arg.ID, arg.Status, arg.Error)
+	return err
+}
+
+const setFinetuneDataset = `-- name: SetFinetuneDataset :exec
+UPDATE finetune_jobs SET dataset_id = $2 WHERE id = $1
+`
+
+type SetFinetuneDatasetParams struct {
+	ID        uuid.UUID     `json:"id"`
+	DatasetID uuid.NullUUID `json:"dataset_id"`
+}
+
+// A recipe job learns its dataset when it has merged the recipe's.
+func (q *Queries) SetFinetuneDataset(ctx context.Context, arg SetFinetuneDatasetParams) error {
+	_, err := q.db.Exec(ctx, setFinetuneDataset, arg.ID, arg.DatasetID)
 	return err
 }
 
@@ -603,6 +1051,44 @@ func (q *Queries) SetFinetuneProgress(ctx context.Context, arg SetFinetuneProgre
 	return err
 }
 
+const setRecipeSpec = `-- name: SetRecipeSpec :one
+UPDATE training_recipes SET spec = $2, edited = $3, updated_at = now() WHERE id = $1 RETURNING id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at
+`
+
+type SetRecipeSpecParams struct {
+	ID     uuid.UUID       `json:"id"`
+	Spec   json.RawMessage `json:"spec"`
+	Edited []string        `json:"edited"`
+}
+
+// The owner's hand edit of the spec: the new spec and the keys now marked edited.
+func (q *Queries) SetRecipeSpec(ctx context.Context, arg SetRecipeSpecParams) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, setRecipeSpec, arg.ID, arg.Spec, arg.Edited)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const setTrainingConsent = `-- name: SetTrainingConsent :exec
 
 UPDATE users SET training_consent = $2 WHERE id = $1
@@ -618,6 +1104,61 @@ type SetTrainingConsentParams struct {
 func (q *Queries) SetTrainingConsent(ctx context.Context, arg SetTrainingConsentParams) error {
 	_, err := q.db.Exec(ctx, setTrainingConsent, arg.ID, arg.TrainingConsent)
 	return err
+}
+
+const updateRecipe = `-- name: UpdateRecipe :one
+UPDATE training_recipes SET name = $2, base_model = $3, base_endpoint_id = $4, instructions = $5, dataset_ids = $6, target = $7, config = $8, spec_model = $9, updated_at = now()
+WHERE id = $1 RETURNING id, owner_id, name, base_model, base_endpoint_id, instructions, dataset_ids, target, config, spec, edited, spec_draft, spec_model, spec_status, spec_error, spec_used_model, spec_at, created_at, updated_at
+`
+
+type UpdateRecipeParams struct {
+	ID             uuid.UUID       `json:"id"`
+	Name           string          `json:"name"`
+	BaseModel      string          `json:"base_model"`
+	BaseEndpointID *string         `json:"base_endpoint_id"`
+	Instructions   string          `json:"instructions"`
+	DatasetIds     []uuid.UUID     `json:"dataset_ids"`
+	Target         string          `json:"target"`
+	Config         json.RawMessage `json:"config"`
+	SpecModel      string          `json:"spec_model"`
+}
+
+// The owner's fields; the spec and its bookkeeping have their own queries.
+func (q *Queries) UpdateRecipe(ctx context.Context, arg UpdateRecipeParams) (TrainingRecipe, error) {
+	row := q.db.QueryRow(ctx, updateRecipe,
+		arg.ID,
+		arg.Name,
+		arg.BaseModel,
+		arg.BaseEndpointID,
+		arg.Instructions,
+		arg.DatasetIds,
+		arg.Target,
+		arg.Config,
+		arg.SpecModel,
+	)
+	var i TrainingRecipe
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Name,
+		&i.BaseModel,
+		&i.BaseEndpointID,
+		&i.Instructions,
+		&i.DatasetIds,
+		&i.Target,
+		&i.Config,
+		&i.Spec,
+		&i.Edited,
+		&i.SpecDraft,
+		&i.SpecModel,
+		&i.SpecStatus,
+		&i.SpecError,
+		&i.SpecUsedModel,
+		&i.SpecAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const upsertMessageRating = `-- name: UpsertMessageRating :exec

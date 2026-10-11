@@ -24,13 +24,17 @@ import (
 	"github.com/jking323/ws/internal/chat"
 	"github.com/jking323/ws/internal/config"
 	"github.com/jking323/ws/internal/externalapi"
+	"github.com/jking323/ws/internal/favorites"
 	"github.com/jking323/ws/internal/fleet/rental"
 	"github.com/jking323/ws/internal/gateway"
 	"github.com/jking323/ws/internal/github"
 	"github.com/jking323/ws/internal/jobs"
 	"github.com/jking323/ws/internal/mcpserver"
 	"github.com/jking323/ws/internal/media"
+	"github.com/jking323/ws/internal/memory"
+	"github.com/jking323/ws/internal/notebooks"
 	"github.com/jking323/ws/internal/sandbox"
+	"github.com/jking323/ws/internal/scheduled"
 	"github.com/jking323/ws/internal/sealed"
 	"github.com/jking323/ws/internal/store"
 	"github.com/jking323/ws/internal/store/blob"
@@ -65,6 +69,18 @@ type Server struct {
 	// GitHubWebhookSecret, when set, opens POST /hooks/github for the GitHub
 	// App's deliveries (signed with it), fanned out to repo_push triggers.
 	GitHubWebhookSecret string
+	// Favorites is the member's starred items and saved prompts (PLAN M13);
+	// nil answers 503.
+	Favorites *favorites.Service
+	// Notebooks is the member's research notebooks (PLAN M13); nil answers
+	// 503 on /api/notebooks.
+	Notebooks *notebooks.Service
+	// Scheduled is the member's prompts that run on their own (PLAN M13);
+	// nil answers 503 on /api/scheduled.
+	Scheduled *scheduled.Service
+	// Memory is each member's own memory and card (PLAN M13); nil answers
+	// 503 on /api/memory.
+	Memory *memory.Service
 	// Agents starts and steers long-lived agent runs; nil answers 503 on
 	// the routes that need it.
 	Agents *agents.Service
@@ -118,6 +134,10 @@ func (s *Server) appHandler() http.Handler {
 		trusted = s.Cfg.TrustedProxies
 	}
 	r.Use(trustedRealIP(parsePrefixes(trusted)))
+	// Home or away, from where the request came (locality.go); a request
+	// the tunnel listener has already judged keeps that verdict.
+	r.Use(s.localityMW(s.localityPolicy()))
+	su := s.stepUp()
 	r.Use(s.logging)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(15 * time.Minute)) // long streams
@@ -172,9 +192,16 @@ func (s *Server) appHandler() http.Handler {
 			pr.Get("/projects", s.handleListProjects)
 			pr.Post("/projects", s.handleCreateProject)
 			pr.Get("/projects/{id}", s.handleGetProject)
+			pr.Post("/projects/{id}/archive", s.handleArchiveProject)
+			pr.Post("/projects/{id}/restore", s.handleRestoreProject)
+			pr.Get("/projects/{id}/purge-plan", s.handleProjectPlan)
+			pr.With(su.require(ActProjectDelete)).Post("/projects/{id}/delete-permanently", s.handleDeleteProjectPermanently)
+			pr.Get("/archive", s.handleListArchived)
+			pr.With(su.require(ActConversationDelete)).Post("/archive/delete-all", s.handleDeleteAllArchived)
 			pr.Get("/projects/{id}/conversations", s.handleListConversations)
 			pr.Post("/projects/{id}/conversations", s.handleCreateConversation)
 			pr.Get("/projects/{id}/sandbox", s.handleSandbox)
+			pr.Get("/projects/{id}/sandbox/status", s.handleSandboxStatus)
 			pr.Post("/projects/{id}/sandbox/stop", s.handleSandboxStop)
 			pr.Get("/projects/{id}/fs/tree", s.handleFSTree)
 			pr.Get("/projects/{id}/fs/file", s.handleFSRead)
@@ -186,6 +213,8 @@ func (s *Server) appHandler() http.Handler {
 			pr.Get("/conversations/{id}", s.handleGetConversation)
 			pr.Patch("/conversations/{id}", s.handleUpdateConversation)
 			pr.Delete("/conversations/{id}", s.handleArchiveConversation)
+			pr.Post("/conversations/{id}/restore", s.handleRestoreConversation)
+			pr.With(su.require(ActConversationDelete)).Delete("/conversations/{id}/permanent", s.handleDeleteConversationPermanently)
 			pr.Post("/conversations/{id}/chat", s.handleChat)
 			pr.Get("/conversations/{id}/artifacts", s.handleListArtifacts)
 			pr.Get("/conversations/{id}/runs", s.handleListRuns)
@@ -194,7 +223,7 @@ func (s *Server) appHandler() http.Handler {
 
 			pr.Get("/artifacts/{id}", s.handleGetArtifact)
 			pr.Get("/artifacts/{id}/versions/{v}", s.handleGetArtifact)
-			pr.Get("/artifacts/{id}/export", s.handleExportArtifact)
+			pr.With(su.require(ActExport)).Get("/artifacts/{id}/export", s.handleExportArtifact)
 			pr.Post("/artifacts/{id}/variants", s.handleArtifactVariants)
 
 			// Media (PLAN M6): image and video jobs per project, their
@@ -210,10 +239,19 @@ func (s *Server) appHandler() http.Handler {
 			pr.Get("/agents", s.handleListAgents)
 			pr.Get("/agents/presets", s.handleListPresets)
 			pr.Post("/agents/presets/import", s.handleImportSkill)
+			pr.Post("/agents/presets/import-folder", s.handleImportSkillFolder)
+			pr.Get("/skills", s.handleListShelf)
+			pr.Post("/skills", s.handleApproveSkill)
+			pr.Post("/skills/preview", s.handlePreviewSkill)
+			pr.Post("/skills/bulk/preview", s.handleBulkPreviewSkills)
+			pr.Post("/skills/bulk/approve", s.handleBulkApproveSkills)
+			pr.Delete("/skills/{id}", s.handleDeleteSkill)
 			pr.Post("/agents", s.handleCreateAgent)
 			pr.Get("/agents/{id}", s.handleGetAgent)
 			pr.Put("/agents/{id}", s.handleUpdateAgent)
 			pr.Delete("/agents/{id}", s.handleDeleteAgent)
+			pr.Post("/agents/{id}/skills", s.handleAttachSkill)
+			pr.Delete("/agents/{id}/skills/{name}", s.handleRemoveSkill)
 			pr.Post("/agents/{id}/enabled", s.handleSetAgentEnabled)
 			pr.Post("/agents/{id}/run", s.handleRunAgent)
 			pr.Post("/agents/{id}/triggers", s.handleCreateTrigger)
@@ -227,8 +265,48 @@ func (s *Server) appHandler() http.Handler {
 			pr.Post("/runs/{id}/resume", s.handleResumeRun)
 			pr.Post("/runs/{id}/steer", s.handleSteerRun)
 
+			// Favorites and saved prompts (PLAN M13): the member's own.
+			pr.Get("/favorites", s.handleListFavorites)
+			pr.Post("/favorites", s.handleAddFavorite)
+			pr.Delete("/favorites/{kind}/{ref}", s.handleRemoveFavorite)
+			pr.Get("/saved-prompts", s.handleListSavedPrompts)
+			pr.Post("/saved-prompts", s.handleCreateSavedPrompt)
+			pr.Put("/saved-prompts/{id}", s.handleUpdateSavedPrompt)
+			pr.Delete("/saved-prompts/{id}", s.handleDeleteSavedPrompt)
+
+			// Research notebooks (PLAN M13): the member's own.
+			pr.Get("/notebooks", s.handleListNotebooks)
+			pr.Post("/notebooks", s.handleCreateNotebook)
+			pr.Get("/notebooks/{id}", s.handleGetNotebook)
+			pr.Patch("/notebooks/{id}", s.handleRenameNotebook)
+			pr.Delete("/notebooks/{id}", s.handleDeleteNotebook)
+			pr.Post("/notebooks/{id}/sources", s.handleAddNotebookSource)
+			pr.Get("/notebooks/{id}/sources/{sid}", s.handleGetNotebookSource)
+			pr.Delete("/notebooks/{id}/sources/{sid}", s.handleDeleteNotebookSource)
+			pr.Post("/notebooks/{id}/notes", s.handleAddNotebookNote)
+			pr.Put("/notebooks/{id}/notes/{nid}", s.handleUpdateNotebookNote)
+			pr.Delete("/notebooks/{id}/notes/{nid}", s.handleDeleteNotebookNote)
+			pr.Post("/notebooks/{id}/chat", s.handleNotebookChat)
+
+			// Scheduled prompts (PLAN M13): the member's own.
+			pr.Get("/scheduled", s.handleListScheduled)
+			pr.Post("/scheduled", s.handleCreateScheduled)
+			pr.Put("/scheduled/{id}", s.handleUpdateScheduled)
+			pr.Delete("/scheduled/{id}", s.handleDeleteScheduled)
+			pr.Post("/scheduled/{id}/run", s.handleRunScheduled)
+			pr.Get("/scheduled/{id}/runs", s.handleScheduledRuns)
+
+			// Personal memory (PLAN M13): the member's own, never shared.
+			pr.Get("/memory", s.handleGetMemory)
+			pr.Put("/memory/settings", s.handlePutMemorySettings)
+			pr.Post("/memory", s.handleAddMemory)
+			pr.Delete("/memory", s.handleForgetMemory)
+			pr.Post("/memory/reflect", s.handleReflectMemory)
+			pr.Patch("/memory/{id}", s.handleUpdateMemory)
+			pr.Delete("/memory/{id}", s.handleDeleteUserMemory)
+
 			pr.Get("/keys", s.handleListKeys)
-			pr.Post("/keys", s.handleCreateKey)
+			pr.With(su.require(ActAPIKey)).Post("/keys", s.handleCreateKey)
 			pr.Delete("/keys/{id}", s.handleRevokeKey)
 
 			// Training flywheel (PLAN M10): everyone rates and consents;
@@ -238,8 +316,8 @@ func (s *Server) appHandler() http.Handler {
 			// Bring your own key: a person's own API key for a hosted
 			// provider. Session only (never an API key), write-only.
 			pr.Get("/me/provider-keys", s.handleListProviderKeys)
-			pr.Put("/me/provider-keys/{provider}", s.handlePutProviderKey)
-			pr.Delete("/me/provider-keys/{provider}", s.handleDeleteProviderKey)
+			pr.With(su.require(ActProviderKey)).Put("/me/provider-keys/{provider}", s.handlePutProviderKey)
+			pr.With(su.require(ActProviderKey)).Delete("/me/provider-keys/{provider}", s.handleDeleteProviderKey)
 			pr.Put("/messages/{id}/rating", s.handleRateMessage)
 			pr.Delete("/messages/{id}/rating", s.handleUnrateMessage)
 			pr.Get("/conversations/{id}/ratings", s.handleConversationRatings)
@@ -250,6 +328,8 @@ func (s *Server) appHandler() http.Handler {
 
 			pr.Group(func(ad chi.Router) {
 				ad.Use(requireOwner)
+				// Writes under /admin are step-up gated when away (budgets are their own class).
+				ad.Use(su.requireAdminWrites)
 				ad.Get("/admin/invites", s.handleListInvites)
 				ad.Post("/admin/invites", s.handleCreateInvite)
 				ad.Delete("/admin/invites/{id}", s.handleRevokeInvite)
@@ -261,6 +341,10 @@ func (s *Server) appHandler() http.Handler {
 				ad.Delete("/admin/users/{id}/keys/{keyId}", s.handleAdminRevokeUserKey)
 				ad.Put("/admin/users/{id}/disabled", s.handleSetDisabled)
 				ad.Get("/admin/usage", s.handleUsage)
+				ad.Get("/admin/routing", s.handleGetRouting)
+				ad.Put("/admin/routing", s.handlePutRouting)
+				ad.Get("/admin/failures", s.handleFailures)
+				ad.Post("/admin/failures/clear", s.handleClearFailures)
 				ad.Get("/admin/github", s.handleGitHubStatus)
 				ad.Get("/admin/endpoints", s.handleAdminEndpoints)
 				ad.Put("/admin/providers", s.handleUpsertProvider)
@@ -278,6 +362,7 @@ func (s *Server) appHandler() http.Handler {
 				ad.Get("/admin/policies", s.handleListPolicies)
 				ad.Put("/admin/policies/{name}", s.handlePutPolicy)
 				ad.Delete("/admin/policies/{name}", s.handleDeletePolicy)
+				ad.Get("/admin/spend", s.handleAdminSpend)
 				ad.Get("/admin/budgets", s.handleListBudgets)
 				ad.Put("/admin/budgets", s.handlePutBudget)
 				ad.Delete("/admin/budgets/{id}", s.handleDeleteBudget)

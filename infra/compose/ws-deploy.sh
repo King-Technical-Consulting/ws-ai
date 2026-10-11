@@ -29,6 +29,17 @@ INGRESS="${INGRESS:-}"
 
 log() { printf '%s ws-deploy: %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
+# Only master is deployed. This checkout supplies the compose files and the config the
+# running stack is built from, so a feature branch checked out here (by someone
+# developing in this directory) would reach the live stack: that happened once, on
+# 2026-10-10, when an in-progress compose edit recreated the app. A detached HEAD or
+# any other branch is refused before anything is pulled, pulled or applied.
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$branch" != "master" ]; then
+  log "refusing to deploy: this checkout is on '$branch', not master; switch it back (git checkout master) and work in a separate git worktree. Nothing was pulled or applied"
+  exit 1
+fi
+
 before_repo=$(git rev-parse HEAD)
 if git pull -q --ff-only origin "$(git rev-parse --abbrev-ref HEAD)"; then
   after_repo=$(git rev-parse HEAD)
@@ -41,6 +52,17 @@ image_before=$(docker image inspect "${WS_IMAGE:-ghcr.io/king-technical-consulti
 make -s pull HW="$HW" INGRESS="$INGRESS" >/dev/null 2>&1 || log "pull failed; applying what we have"
 image_after=$(docker image inspect "${WS_IMAGE:-ghcr.io/king-technical-consulting/ws:latest}" --format '{{.Id}}' 2>/dev/null || echo none)
 [ "$image_before" != "$image_after" ] && log "image ${image_before:7:12} -> ${image_after:7:12}"
+
+# The sandbox image is pulled here too, with this host's registry login:
+# the worker pulls it only when it is missing, and without credentials, so
+# a private ghcr package would never arrive and a code project would wait
+# on "sandbox: pulling image" until the ten-minute timeout.
+sandbox_image="${WS_SANDBOX_IMAGE:-$(grep -E '^WS_SANDBOX_IMAGE=' .env 2>/dev/null | cut -d= -f2- || true)}"
+sandbox_image="${sandbox_image:-ghcr.io/king-technical-consulting/ws-sandbox:latest}"
+sb_before=$(docker image inspect "$sandbox_image" --format '{{.Id}}' 2>/dev/null || echo none)
+docker pull -q "$sandbox_image" >/dev/null 2>&1 || log "sandbox image pull failed ($sandbox_image); the worker keeps the one it has"
+sb_after=$(docker image inspect "$sandbox_image" --format '{{.Id}}' 2>/dev/null || echo none)
+[ "$sb_before" != "$sb_after" ] && log "sandbox image ${sb_before:7:12} -> ${sb_after:7:12}"
 
 # `up -d` only recreates containers whose config or image changed.
 out=$(make -s up HW="$HW" INGRESS="$INGRESS" 2>&1) || { log "up failed: $out"; exit 1; }

@@ -46,6 +46,19 @@ type Request struct {
 	Reasoning bool              `json:"reasoning"`
 	ToolAllow []string          `json:"tool_allow,omitempty"` // empty = all registered tools
 	NoTools   bool              `json:"no_tools,omitempty"`
+	// Plan turns on plan mode: the first step of the turn is a written plan
+	// the person approves before any other tool runs (plan.go).
+	Plan bool `json:"plan,omitempty"`
+	// Memory lists what the person's memory put into the system prompt for
+	// this turn, so the UI can show why the model knows something.
+	Memory []MemoryRef `json:"memory,omitempty"`
+}
+
+// MemoryRef is one recalled memory as the client is told about it.
+type MemoryRef struct {
+	ID      string `json:"id"`
+	Kind    string `json:"kind"`
+	Content string `json:"content"`
 }
 
 // StartParams describe a new run.
@@ -57,6 +70,8 @@ type StartParams struct {
 	Request        Request
 	Policies       map[string]Policy // overrides on tool defaults
 	MaxSteps       int
+	// MaxRunUSD stops the run once its ledger cost reaches this; 0 is no cap.
+	MaxRunUSD float64
 }
 
 // Create inserts a run in the queued state.
@@ -70,6 +85,7 @@ func (rt *Runtime) Create(ctx context.Context, p StartParams) (*store.AgentRun, 
 	run, err := rt.DB.CreateRun(ctx, store.CreateRunParams{
 		AgentID: p.AgentID, ConversationID: p.ConversationID, UserID: uuid.NullUUID{UUID: p.UserID, Valid: p.UserID != uuid.Nil},
 		TriggerID: p.TriggerID, Status: "queued", Request: reqJSON, ToolPolicies: polJSON, MaxSteps: int32(p.MaxSteps),
+		MaxRunUsd: p.MaxRunUSD,
 	})
 	if err != nil {
 		return nil, err
@@ -161,7 +177,7 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 	asked := outcome == toolsAsked
 
 	// 2. Step loop
-	for !asked && int(run.StepCount) < int(run.MaxSteps) {
+	for !asked && int(run.StepCount) < int(run.MaxSteps) && !runCapReached(run.CostUsd, run.MaxRunUsd) {
 		if ctx.Err() != nil {
 			// Client went away mid-run. Leave the run running with a fresh
 			// heartbeat; the reaper will hand it to the worker.
@@ -203,6 +219,9 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 			sink.Start(arow.ID.String())
 		}
 		sink.StartStep()
+		if run.StepCount == 0 && len(req.Memory) > 0 {
+			sink.Data("memory", req.Memory, false)
+		}
 
 		seq, _ := rt.DB.NextStepSeq(ctx, run.ID)
 		stepIn, _ := json.Marshal(map[string]any{"selector": req.Selector, "task_class": req.TaskClass})
@@ -228,6 +247,8 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 		cost := rt.cost(resp)
 		_ = rt.DB.BumpRunStep(bg, store.BumpRunStepParams{ID: run.ID, CostUsd: cost})
 		run.StepCount++
+		run.CostUsd += cost
+		capped := runCapReached(run.CostUsd, run.MaxRunUsd)
 		out, _ := json.Marshal(map[string]any{"endpoint": resp.EndpointID, "model": resp.Model, "finish": resp.FinishReason, "cost_usd": cost})
 		usage, _ := json.Marshal(resp.Usage)
 		cp, _ := json.Marshal(map[string]any{"message_seq": arow.Seq, "pending_tool_calls": callIDs(resp.ToolCalls())})
@@ -242,6 +263,14 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 
 		calls := resp.ToolCalls()
 		if len(calls) == 0 {
+			sink.FinishStep()
+			break
+		}
+		if capped {
+			// The run's own cap is spent: the reply stands, the tool calls
+			// it asked for do not run, and the run ends here as done. The
+			// pending calls are left unanswered on purpose; a later run in
+			// the conversation starts from the person's next message.
 			sink.FinishStep()
 			break
 		}
@@ -262,7 +291,10 @@ func (rt *Runtime) drive(ctx context.Context, run *store.AgentRun, sink Sink) (r
 		}
 	}
 
-	if int(run.StepCount) >= int(run.MaxSteps) {
+	if runCapReached(run.CostUsd, run.MaxRunUsd) {
+		msg := fmt.Sprintf("stopped at this run's cap of $%.2f (spent $%.2f)", run.MaxRunUsd, run.CostUsd)
+		sink.Data("notice", map[string]string{"text": msg}, false)
+	} else if int(run.StepCount) >= int(run.MaxSteps) {
 		msg := fmt.Sprintf("stopped after %d steps", run.MaxSteps)
 		sink.Data("notice", map[string]string{"text": msg}, false)
 	}
@@ -359,11 +391,28 @@ func (rt *Runtime) runTools(ctx context.Context, run *store.AgentRun, policies m
 		if a, had := decided[c.ToolCallID]; had {
 			switch a.Status {
 			case "approved":
+				if c.ToolName == ToolSubmitPlan && a.Note != nil && strings.TrimSpace(*a.Note) != "" {
+					// Edit-and-approve: the edited plan is the plan.
+					text := planApprovedPrefix + " with changes. Follow this version, not your original, and call plan_step as each step finishes:\n\n" + *a.Note
+					results = append(results, toolResult(c.ToolCallID, text, false))
+					sink.ToolOutput(c.ToolCallID, text, false, "")
+					continue
+				}
 				// fall through to execution
 			case "denied", "expired":
 				msg := "The user declined this action."
 				if a.Note != nil && *a.Note != "" {
 					msg += " Note: " + *a.Note
+				}
+				if c.ToolName == ToolSubmitPlan {
+					msg = "The user rejected this plan."
+					if a.Note != nil && *a.Note != "" {
+						msg += " Their note: " + *a.Note
+					}
+					msg += " Nothing was run. Do not submit another plan unless they ask."
+					// Rejecting a plan ends the turn, like a question to the
+					// user does: their reply starts the next run.
+					asked = true
 				}
 				results = append(results, toolResult(c.ToolCallID, msg, true))
 				sink.ToolOutput(c.ToolCallID, nil, true, msg)
@@ -560,8 +609,37 @@ func (rt *Runtime) buildRequest(run *store.AgentRun, req Request, history []gate
 	}
 	if !req.NoTools {
 		g.Tools = rt.Tools.Defs(req.ToolAllow)
+		g.Tools = rt.planTools(g, req, history)
 	}
 	return g
+}
+
+// planTools applies plan mode to the advertised tools. Without Request.Plan
+// the plan tools are not offered at all. With it, the model gets only
+// submit_plan until a plan is approved in this turn, then everything plus
+// plan_step. g.System gains the plan instructions in the first phase.
+func (rt *Runtime) planTools(g *gateway.Request, req Request, history []gateway.Message) []gateway.ToolDef {
+	var rest []gateway.ToolDef
+	for _, d := range g.Tools {
+		if !isPlanTool(d.Name) {
+			rest = append(rest, d)
+		}
+	}
+	if !req.Plan || req.NoTools {
+		return rest
+	}
+	submit, ok := rt.Tools.Get(ToolSubmitPlan)
+	if !ok {
+		return rest
+	}
+	if planApproved(history) {
+		if step, ok := rt.Tools.Get(ToolPlanStep); ok {
+			rest = append(rest, step.Def())
+		}
+		return rest
+	}
+	g.System += planSystem(rest)
+	return []gateway.ToolDef{submit.Def()}
 }
 
 func (rt *Runtime) persistAssistant(ctx context.Context, id uuid.UUID, resp *gateway.Response, streamErr error) {
@@ -687,4 +765,10 @@ func userFacing(err error) string {
 		return "Stopped."
 	}
 	return err.Error()
+}
+
+// runCapReached says whether a run's spend has reached its own cap. A cap
+// of zero (or less) is no cap.
+func runCapReached(spent, capUSD float64) bool {
+	return capUSD > 0 && spent >= capUSD
 }
